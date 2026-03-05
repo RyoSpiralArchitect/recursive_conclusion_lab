@@ -154,6 +154,13 @@ python recursive_conclusion_lab.py compare \
 - `templates/script_template.json`（script.json の雛形）
 - `templates/compare_config_template.json`（CLI 引数と JSON の対応のメモ）
 
+## config JSON から実行
+
+```bash
+python recursive_conclusion_lab.py run-config \
+  --config templates/compare_config_template.json
+```
+
 ## ログ
 
 - 各プロバイダごとの詳細ログ: `*.jsonl`

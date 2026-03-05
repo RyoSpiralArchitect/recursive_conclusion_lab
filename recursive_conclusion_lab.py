@@ -286,6 +286,82 @@ def strip_rcl_state(text: str) -> str:
     return visible
 
 
+INBAND_STATE_MAX_CHARS = 8000
+INBAND_INTENT_TEXT_MAX_CHARS = 280
+INBAND_WHY_NOT_NOW_MAX_CHARS = 160
+INBAND_TERMINAL_REASON_MAX_CHARS = 160
+INBAND_CONDITION_MAX_ITEMS = 4
+INBAND_CONDITION_ITEM_MAX_CHARS = 120
+
+
+def truncate_text(value: Any, max_chars: int) -> str:
+    text = compact_text(str(value or ""))
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    suffix = "…"
+    head = text[: max(0, max_chars - len(suffix))].rstrip()
+    return (head + suffix).strip()
+
+
+def truncate_conditions(items: Any) -> list[str]:
+    result: list[str] = []
+    for item in coerce_str_list(items)[:INBAND_CONDITION_MAX_ITEMS]:
+        result.append(truncate_text(item, INBAND_CONDITION_ITEM_MAX_CHARS))
+    return result
+
+
+def deferred_intent_to_inband_dict(intent: DeferredIntent) -> dict[str, Any]:
+    data = intent.to_dict()
+    data["intent"] = truncate_text(data.get("intent"), INBAND_INTENT_TEXT_MAX_CHARS)
+    data["why_not_now"] = truncate_text(data.get("why_not_now"), INBAND_WHY_NOT_NOW_MAX_CHARS)
+    data["terminal_reason"] = truncate_text(
+        data.get("terminal_reason"), INBAND_TERMINAL_REASON_MAX_CHARS
+    )
+    data["trigger"] = truncate_conditions(data.get("trigger"))
+    data["cancel_if"] = truncate_conditions(data.get("cancel_if"))
+    return data
+
+
+def dump_inband_state(state: dict[str, Any]) -> str:
+    return json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_inband_state_payload(
+    intents: list[DeferredIntent],
+    *,
+    version: int = 1,
+    max_chars: int = INBAND_STATE_MAX_CHARS,
+) -> tuple[list[DeferredIntent], dict[str, Any], str]:
+    carried = list(intents)
+
+    def render(current: list[DeferredIntent]) -> tuple[dict[str, Any], str]:
+        state = {"version": int(version or 1), "intents": [deferred_intent_to_inband_dict(i) for i in current]}
+        return state, dump_inband_state(state)
+
+    state, blob = render(carried)
+    if len(blob) <= max_chars:
+        return carried, state, blob
+
+    # Drop terminal intents first (they don't help future planning).
+    carried = [i for i in carried if i.status == "active"]
+    state, blob = render(carried)
+    if len(blob) <= max_chars:
+        return carried, state, blob
+
+    # Last resort: drop lowest-priority active intents until it fits (keep at least one).
+    while len(blob) > max_chars and len(carried) > 1:
+        drop_idx = min(
+            range(len(carried)),
+            key=lambda idx: (carried[idx].priority, carried[idx].created_turn),
+        )
+        carried.pop(drop_idx)
+        state, blob = render(carried)
+
+    return carried, state, blob
+
+
 def require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
@@ -518,8 +594,144 @@ class DummyAdapter(BaseAdapter):
     ) -> ProviderResponse:
         prompt = messages[-1].content if messages else ""
         lower = prompt.lower()
+        system_lower = (system or "").lower()
 
-        if "compress conversation state into a compact memory capsule" in (system or "").lower() or "existing memory capsules:" in lower and "produce one new memory capsule" in lower:
+        if "deferred-intent in-band state" in system_lower and "rcl_state" in system_lower:
+            def parse_int(key: str, default: int) -> int:
+                match = re.search(
+                    rf"{re.escape(key)}\s*:\s*(\d+)", system or "", flags=re.IGNORECASE
+                )
+                if not match:
+                    return default
+                try:
+                    return int(match.group(1))
+                except Exception:
+                    return default
+
+            def parse_str(key: str, default: str) -> str:
+                match = re.search(
+                    rf"{re.escape(key)}\s*:\s*([a-zA-Z0-9_-]+)",
+                    system or "",
+                    flags=re.IGNORECASE,
+                )
+                if not match:
+                    return default
+                return compact_text(match.group(1)).lower() or default
+
+            current_turn = parse_int("Current turn index", 0)
+            next_intent_id = parse_str("next_intent_id", "di-0001")
+            deferred_intent_every = parse_int("deferred_intent_every", 0)
+            deferred_intent_offset = parse_int("deferred_intent_offset", 3)
+            deferred_intent_grace = parse_int("deferred_intent_grace", 2)
+            deferred_intent_limit = parse_int("deferred_intent_limit", 6)
+            deferred_intent_mode = parse_str("deferred_intent_mode", DeferredIntentMode.OBSERVE.value)
+            deferred_intent_strategy = parse_str("deferred_intent_strategy", DeferredIntentStrategy.TRIGGER.value)
+
+            prev_state: dict[str, Any] = {"version": 1, "intents": []}
+            for msg in reversed(messages):
+                if msg.role != "assistant":
+                    continue
+                _, state, _ = split_rcl_state(msg.content)
+                if isinstance(state, dict) and isinstance(state.get("intents"), list):
+                    prev_state = state
+                    break
+
+            intents: list[dict[str, Any]] = []
+            for item in prev_state.get("intents") or []:
+                if isinstance(item, dict):
+                    intents.append(dict(item))
+
+            last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+            existing_ids = {str(i.get("intent_id")) for i in intents if i.get("intent_id")}
+            active_intents = [
+                item
+                for item in intents
+                if compact_text(str(item.get("status", "active"))).lower() == "active"
+            ]
+            eligible_plan_turn = (
+                deferred_intent_every > 0
+                and current_turn != 0
+                and current_turn % deferred_intent_every == 0
+                and len(active_intents) < deferred_intent_limit
+            )
+            if eligible_plan_turn and next_intent_id not in existing_ids:
+                earliest_turn = current_turn + max(1, deferred_intent_offset)
+                if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
+                    latest_turn = earliest_turn
+                else:
+                    latest_turn = earliest_turn + max(0, deferred_intent_grace)
+                intents.append(
+                    {
+                        "intent_id": next_intent_id,
+                        "created_turn": current_turn,
+                        "kind": "proposal",
+                        "intent": (
+                            "Offer a concrete next step grounded in the user’s latest constraints: "
+                            f"{compact_text(last_user)[:120]}"
+                        ),
+                        "why_not_now": "The dialogue is still collecting constraints and timing cues.",
+                        "earliest_turn": earliest_turn,
+                        "latest_turn": latest_turn,
+                        "trigger": ["the user asks for a concrete next step", "enough constraints have accumulated"],
+                        "cancel_if": ["the topic changes", "the user rejects recommendations"],
+                        "confidence": 0.62,
+                        "priority": 0.70,
+                        "status": "active",
+                        "revision_count": 0,
+                        "fire_turn": None,
+                        "terminal_reason": "",
+                    }
+                )
+
+            fired_this_turn: list[str] = []
+            for item in intents:
+                if not isinstance(item, dict):
+                    continue
+                status = compact_text(str(item.get("status", "active"))).lower() or "active"
+                if status != "active":
+                    continue
+                created_turn = coerce_int(item.get("created_turn")) or current_turn
+                earliest = coerce_int(item.get("earliest_turn"))
+                latest = coerce_int(item.get("latest_turn"))
+                if earliest is None:
+                    earliest = created_turn + max(1, deferred_intent_offset)
+                if latest is None:
+                    if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
+                        latest = earliest
+                    else:
+                        latest = earliest + max(0, deferred_intent_grace)
+                if latest < earliest:
+                    latest = earliest
+
+                if current_turn < earliest:
+                    continue
+                if current_turn > latest:
+                    item["status"] = "expired"
+                    item["terminal_reason"] = "Dummy: timing window passed."
+                    continue
+
+                item["status"] = "fired"
+                item["fire_turn"] = current_turn
+                item["terminal_reason"] = "Dummy: fired when window opened."
+                fired_intent_text = compact_text(str(item.get("intent", "")))
+                if fired_intent_text:
+                    fired_this_turn.append(fired_intent_text)
+
+            visible_reply = (
+                "Dummy reply (in-band). I’ll respond to the latest turn concretely.\n"
+                f"Grounding: {compact_text(last_user)[:180]}"
+            )
+            if deferred_intent_mode == DeferredIntentMode.SOFT_FIRE.value and fired_this_turn:
+                fired_block = "\n".join(f"- {text}" for text in fired_this_turn)
+                visible_reply = visible_reply.rstrip() + "\n\nDeferred follow-up:\n" + fired_block
+
+            state_out = {
+                "version": int(coerce_int(prev_state.get("version")) or 1),
+                "intents": intents,
+            }
+            output = visible_reply.rstrip() + f"\n\n{RCL_STATE_OPEN}{json.dumps(state_out, ensure_ascii=False)}{RCL_STATE_CLOSE}"
+
+        elif "compress conversation state into a compact memory capsule" in (system or "").lower() or "existing memory capsules:" in lower and "produce one new memory capsule" in lower:
             recent_lines = [
                 m.content for m in messages[-3:] if m.role in {"user", "assistant"}
             ]
@@ -1468,6 +1680,7 @@ class RecursiveConclusionSession:
         ablation_actions: list[dict[str, Any]] = []
         inband_state: Optional[dict[str, Any]] = None
         inband_state_error: Optional[str] = None
+        inband_state_chars: Optional[int] = None
 
         if self.config.deferred_intent_backend == DeferredIntentBackend.INBAND:
             prev_snapshot = {
@@ -1572,8 +1785,11 @@ class RecursiveConclusionSession:
             intents_raw = state_obj.get("intents")
             if intents_raw is None:
                 intents_raw = state_obj.get("deferred_intents")
-            if not isinstance(intents_raw, list):
+            state_has_intents = isinstance(intents_raw, list)
+            if not state_has_intents:
                 intents_raw = []
+                if state is not None and not inband_state_error:
+                    inband_state_error = "RCL_STATE missing 'intents' list."
 
             parsed_intents: list[DeferredIntent] = []
             for item in intents_raw:
@@ -1622,6 +1838,9 @@ class RecursiveConclusionSession:
                         terminal_reason=compact_text(str(item.get("terminal_reason", ""))),
                     )
                 )
+
+            if state is None or not state_has_intents:
+                parsed_intents = list(self._active_deferred_intents())
 
             # Deduplicate by id (keep last) and enforce a hard cap.
             dedup: dict[str, DeferredIntent] = {}
@@ -1795,19 +2014,44 @@ class RecursiveConclusionSession:
                 else:
                     self.deferred_intents.append(intent)
 
-            carried_ids = {intent.intent_id for intent in parsed_intents}
+            parsed_ids = {intent.intent_id for intent in parsed_intents}
             if (
                 planned_intent
-                and planned_intent.intent_id not in carried_ids
+                and planned_intent.intent_id not in parsed_ids
                 and planned_intent.intent_id not in by_id
             ):
                 self.deferred_intents.append(planned_intent)
 
-            inband_state = {
-                "version": version,
-                "intents": [intent.to_dict() for intent in parsed_intents],
-            }
-            state_blob = json.dumps(inband_state, ensure_ascii=False)
+            carried_intents, inband_state, state_blob = build_inband_state_payload(
+                parsed_intents,
+                version=version,
+                max_chars=INBAND_STATE_MAX_CHARS,
+            )
+            inband_state_chars = len(state_blob)
+            if len(carried_intents) != len(parsed_intents):
+                carried_ids = {intent.intent_id for intent in carried_intents}
+                pruned_ids = sorted(
+                    {
+                        intent.intent_id
+                        for intent in parsed_intents
+                        if intent.intent_id not in carried_ids
+                    }
+                )
+                if pruned_ids:
+                    for intent in self.deferred_intents:
+                        if intent.intent_id in pruned_ids and intent.status == "active":
+                            intent.status = "expired"
+                            intent.terminal_reason = "Dropped by in-band state size limit."
+                    self._log(
+                        "inband_state_prune",
+                        {
+                            "max_chars": INBAND_STATE_MAX_CHARS,
+                            "before_count": len(parsed_intents),
+                            "after_count": len(carried_intents),
+                            "pruned_intent_ids": pruned_ids,
+                            "state_chars": inband_state_chars,
+                        },
+                    )
             assistant_with_state = assistant_text
             if assistant_with_state:
                 assistant_with_state = assistant_with_state.rstrip() + "\n\n"
@@ -1910,6 +2154,7 @@ class RecursiveConclusionSession:
             "deferred_intent_ablation_actions": ablation_actions,
             "inband_state": inband_state,
             "inband_state_error": inband_state_error,
+            "inband_state_chars": inband_state_chars,
             "system_prompt": system_prompt,
             "usage": reply.usage,
             "finish_reason": reply.finish_reason,
@@ -2084,6 +2329,75 @@ def run_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_config(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("Config JSON must be an object.")
+
+    command = data.get("command")
+    if command is None:
+        if "providers" in data:
+            command = "compare"
+        elif "provider" in data and "model" in data:
+            command = "repl"
+    command = str(command or "").strip().lower()
+    if command not in {"compare", "repl"}:
+        raise ValueError(
+            "Config must specify command='compare'|'repl', or include either "
+            "('providers' for compare) or ('provider' and 'model' for repl)."
+        )
+
+    def to_flag(name: str) -> str:
+        return "--" + name.replace("_", "-")
+
+    def extend_from_args_dict(argv: list[str], args_dict: dict[str, Any]) -> None:
+        for key, value in args_dict.items():
+            if value is None:
+                continue
+            flag = to_flag(str(key))
+            if isinstance(value, bool):
+                if value:
+                    argv.append(flag)
+                continue
+            if isinstance(value, list):
+                argv.append(flag)
+                argv.extend(str(item) for item in value)
+                continue
+            argv.extend([flag, str(value)])
+
+    argv: list[str] = [command]
+    if command == "compare":
+        script = data.get("script")
+        providers = data.get("providers")
+        out_dir = data.get("out_dir") or data.get("out-dir")
+        if not script or not isinstance(script, str):
+            raise ValueError("compare config requires string field 'script'.")
+        if not isinstance(providers, list) or not all(isinstance(x, str) for x in providers):
+            raise ValueError("compare config requires list[str] field 'providers'.")
+        argv.extend(["--script", script, "--providers", *providers])
+        if out_dir:
+            argv.extend(["--out-dir", str(out_dir)])
+    else:
+        provider = data.get("provider")
+        model = data.get("model")
+        if not provider or not model:
+            raise ValueError("repl config requires fields 'provider' and 'model'.")
+        argv.extend(["--provider", str(provider), "--model", str(model)])
+        log_path = data.get("log")
+        if log_path:
+            argv.extend(["--log", str(log_path)])
+
+    args_dict = data.get("args") or {}
+    if not isinstance(args_dict, dict):
+        raise ValueError("Field 'args' must be an object if present.")
+    extend_from_args_dict(argv, args_dict)
+
+    parser = build_parser()
+    inner_args = parser.parse_args(argv)
+    return int(inner_args.func(inner_args))
+
+
 def sanitize_filename(text: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", text)
 
@@ -2208,6 +2522,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--out-dir", default="compare_outputs", help="Directory for JSONL logs and summary.")
     compare.set_defaults(func=run_compare)
+
+    run_cfg = sub.add_parser("run-config", help="Run repl/compare from a JSON config file.")
+    run_cfg.add_argument("--config", required=True, help="Path to JSON config (see templates/compare_config_template.json).")
+    run_cfg.set_defaults(func=run_config)
 
     return parser
 

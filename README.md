@@ -83,6 +83,13 @@ Templates:
 - `templates/script_template.json`
 - `templates/compare_config_template.json` (CLI-to-JSON mapping reference)
 
+Run from a JSON config file:
+
+```bash
+python recursive_conclusion_lab.py run-config \
+  --config templates/compare_config_template.json
+```
+
 ## Deferred intents (baseline → full → ablation)
 
 ### Backend

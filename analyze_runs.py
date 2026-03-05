@@ -99,6 +99,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     capsules: list[str] = []
     planned_intents: list[dict[str, Any]] = []
     intent_status_by_id: dict[str, str] = {}
+    inband_prune_events: list[dict[str, Any]] = []
 
     for row in events:
         provider = provider or row.get("provider")
@@ -118,6 +119,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
             for decision in payload.get("decisions") or []:
                 if isinstance(decision, dict) and decision.get("intent_id"):
                     intent_status_by_id[str(decision["intent_id"])] = str(decision.get("status_after", ""))
+        elif et == "inband_state_prune":
+            if isinstance(payload, dict):
+                inband_prune_events.append(payload)
 
     final_assistant = assistant_rows[-1].get("assistant", "") if assistant_rows else ""
     final_user = assistant_rows[-1].get("user", "") if assistant_rows else ""
@@ -253,6 +257,29 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     }
     active_final_count = sum(1 for status in intent_status_by_id.values() if status == "active")
 
+    deferred_intent_backend = None
+    for row in assistant_rows:
+        backend = row.get("deferred_intent_backend")
+        if backend:
+            deferred_intent_backend = str(backend)
+            break
+
+    inband_state_errors = [
+        str(row.get("inband_state_error"))
+        for row in assistant_rows
+        if row.get("inband_state_error")
+    ]
+    inband_state_sizes = [
+        float(row.get("inband_state_chars"))
+        for row in assistant_rows
+        if isinstance(row.get("inband_state_chars"), (int, float))
+    ]
+    pruned_intents_total = 0
+    for item in inband_prune_events:
+        pruned_ids = item.get("pruned_intent_ids") or []
+        if isinstance(pruned_ids, list):
+            pruned_intents_total += sum(1 for x in pruned_ids if x)
+
     final_required = [str(x) for x in (evaluation.get("final_required_keywords") or [])]
     conversation_required = [str(x) for x in (evaluation.get("conversation_required_keywords") or [])]
     final_forbidden = [str(x) for x in (evaluation.get("final_forbidden_keywords") or [])]
@@ -266,6 +293,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "turns": len(assistant_rows),
         "probe_count": len(probes),
         "memory_capsule_count": len(capsules),
+        "deferred_intent_backend": deferred_intent_backend,
         "deferred_intent_plan_count": len(planned_intents),
         "deferred_intent_fire_count": fire_count,
         "deferred_intent_cancel_count": cancel_count,
@@ -288,6 +316,11 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "avg_reply_words": mean_or_none(reply_word_counts),
         "avg_input_tokens": mean_or_none([x for x in input_tokens if x > 0]),
         "avg_output_tokens": mean_or_none([x for x in output_tokens if x > 0]),
+        "inband_state_error_count": len(inband_state_errors),
+        "avg_inband_state_chars": mean_or_none(inband_state_sizes),
+        "max_inband_state_chars": max(inband_state_sizes) if inband_state_sizes else None,
+        "inband_state_prune_count": len(inband_prune_events),
+        "inband_state_pruned_intents_total": pruned_intents_total,
         "final_required_keyword_coverage": keyword_coverage(final_required, final_assistant),
         "conversation_required_keyword_coverage": keyword_coverage(conversation_required, conversation_text),
         "final_forbidden_keyword_hits": keyword_hits(final_forbidden, final_assistant),
@@ -322,6 +355,7 @@ def print_table(rows: list[dict[str, Any]]) -> None:
     cols = [
         "provider",
         "model",
+        "deferred_intent_backend",
         "turns",
         "probe_count",
         "deferred_intent_plan_count",
@@ -329,6 +363,8 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "deferred_intent_realization_rate",
         "avg_deferred_intent_reply_overlap",
         "avg_probe_reply_overlap",
+        "inband_state_error_count",
+        "avg_inband_state_chars",
         "last_turn_alignment",
         "final_required_keyword_coverage",
         "final_forbidden_keyword_hits",
@@ -340,7 +376,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         for c in cols:
             value = row.get(c)
             if isinstance(value, float):
-                display.append(f"{value:.3f}")
+                if c.endswith("_chars"):
+                    display.append(f"{value:.0f}")
+                else:
+                    display.append(f"{value:.3f}")
             elif value is None:
                 display.append("-")
             else:

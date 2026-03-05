@@ -1,0 +1,23 @@
+{
+  "system": "You are a careful research assistant. When the user asks you to hold a suggestion for later, keep it latent and only surface it when explicitly requested.",
+  "turns": [
+    "I'm drafting a research note about deferred intent in LLM dialogues. Important: do NOT propose baselines yet; just ask two clarifying questions.",
+    "We want to measure when a latent intention resurfaces later. Suggest what to log (include event_type and timestamp). Still: no baselines yet.",
+    "Now I'm ready: propose a minimal baseline-vs-full-system comparison and at least one ablation. Use the exact phrase latent intention."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "baseline",
+      "ablation",
+      "latent intention"
+    ],
+    "conversation_required_keywords": [
+      "event_type",
+      "timestamp"
+    ],
+    "final_forbidden_keywords": [
+      "I already proposed baselines earlier",
+      "as requested earlier I already gave baselines"
+    ]
+  }
+}
