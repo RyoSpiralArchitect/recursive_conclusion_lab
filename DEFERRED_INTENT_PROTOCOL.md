@@ -31,6 +31,12 @@
 ### composer
 `soft_fire` 時のみ、due になった intent を system に soft hint として入れ、本文には自然発話として再生成させる。
 
+### latent injection（任意）
+`--deferred-intent-latent-injection active` を使うと、**active な intent を毎ターン system に「非発話の内的意図」**として注入する。
+これにより「まだ fire していない意図（latent intention）が対話の軌道に影響するか」を観測しやすくなる。
+
+注意: これは意図的に“影響”を作る設定なので、`hidden agenda` が強すぎて不自然になるリスクも上がる。
+
 ## 3. 戦略
 
 ### fixed
@@ -84,6 +90,10 @@
 | D. Adaptive soft fire | 2 | soft_fire | adaptive | 3 | 2 |
 
 必要なら既存の `memory capsule` や `conclusion probe` と組み合わせる。
+
+### 補助条件: latent intention ablation（任意）
+latent injection を有効にした上で、`--deferred-intent-ablation delete_planned` に切り替えると、
+**intent planned → deleted** のアブレーションができる（latent intention が本当に効いているかの検証）。
 
 ## 6. タスクファミリー
 
@@ -145,6 +155,39 @@ python recursive_conclusion_lab.py compare \
   --deferred-intent-offset 3 \
   --deferred-intent-grace 2 \
   --out-dir runs/deferred_trigger
+```
+
+### trigger soft fire + latent injection
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --window 8 \
+  --deferred-intent-every 2 \
+  --deferred-intent-mode soft_fire \
+  --deferred-intent-strategy trigger \
+  --deferred-intent-offset 3 \
+  --deferred-intent-grace 2 \
+  --deferred-intent-latent-injection active \
+  --out-dir runs/deferred_latent_trigger
+```
+
+### latent ablation: intent planned → deleted
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --window 8 \
+  --deferred-intent-every 2 \
+  --deferred-intent-mode soft_fire \
+  --deferred-intent-strategy trigger \
+  --deferred-intent-offset 3 \
+  --deferred-intent-grace 2 \
+  --deferred-intent-latent-injection active \
+  --deferred-intent-ablation delete_planned \
+  --out-dir runs/deferred_latent_deleted
 ```
 
 ### adaptive on interrupted agenda

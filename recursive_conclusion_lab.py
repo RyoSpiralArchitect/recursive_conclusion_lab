@@ -94,6 +94,16 @@ class DeferredIntentStrategy(str, Enum):
     ADAPTIVE = "adaptive"
 
 
+class DeferredIntentLatentInjection(str, Enum):
+    OFF = "off"
+    ACTIVE = "active"
+
+
+class DeferredIntentAblation(str, Enum):
+    NONE = "none"
+    DELETE_PLANNED = "delete_planned"
+
+
 @dataclass
 class ExperimentConfig:
     base_system: str = ""
@@ -111,6 +121,8 @@ class ExperimentConfig:
     deferred_intent_offset: int = 3
     deferred_intent_grace: int = 2
     deferred_intent_limit: int = 6
+    deferred_intent_latent_injection: DeferredIntentLatentInjection = DeferredIntentLatentInjection.OFF
+    deferred_intent_ablation: DeferredIntentAblation = DeferredIntentAblation.NONE
     show_probe_outputs: bool = True
     reply_config: GenerationConfig = field(default_factory=GenerationConfig)
     probe_config: GenerationConfig = field(
@@ -955,6 +967,22 @@ class RecursiveConclusionSession:
                 f"{steer_rule}"
             )
 
+        if self.config.deferred_intent_latent_injection == DeferredIntentLatentInjection.ACTIVE:
+            active_intents = [
+                intent
+                for intent in self._active_deferred_intents()
+                if intent.created_turn < self.turn_index
+            ]
+            if active_intents:
+                parts.append(
+                    "Latent deferred utterance intentions (private; do NOT reveal to the user yet):\n"
+                    f"{render_deferred_intents(active_intents)}\n\n"
+                    "Rules:\n"
+                    "- Do not quote, paraphrase, or hint at these intentions.\n"
+                    "- Keep them only as internal planning context.\n"
+                    "- Only realize a deferred intention when it appears in an explicit 'due now' section."
+                )
+
         if (
             self.config.deferred_intent_mode == DeferredIntentMode.SOFT_FIRE
             and due_intents
@@ -1398,7 +1426,46 @@ class RecursiveConclusionSession:
         memory_capsule = self._probe_memory_capsule()
         conclusion = self._probe_conclusion()
         planned_intent = self._probe_deferred_intent_plan()
+        ablation_actions: list[dict[str, Any]] = []
+        if (
+            planned_intent
+            and self.config.deferred_intent_ablation == DeferredIntentAblation.DELETE_PLANNED
+        ):
+            status_before = planned_intent.status
+            planned_intent.status = "canceled"
+            planned_intent.terminal_reason = "Ablation: deleted planned intent immediately."
+            status_after = planned_intent.status
+            action = {
+                "intent_id": planned_intent.intent_id,
+                "action": "cancel",
+                "reason": planned_intent.terminal_reason,
+                "status_before": status_before,
+                "status_after": status_after,
+                "intent": planned_intent.intent,
+                "kind": planned_intent.kind,
+                "created_turn": planned_intent.created_turn,
+                "earliest_turn": planned_intent.earliest_turn,
+                "latest_turn": planned_intent.latest_turn,
+                "priority": planned_intent.priority,
+                "confidence": planned_intent.confidence,
+                "revision_count": planned_intent.revision_count,
+                "updated_intent": None,
+                "ablated": True,
+            }
+            ablation_actions.append(action)
+            self._log(
+                "deferred_intent_ablation",
+                {
+                    "mode": self.config.deferred_intent_ablation.value,
+                    "intent_id": planned_intent.intent_id,
+                    "status_before": status_before,
+                    "status_after": status_after,
+                    "reason": planned_intent.terminal_reason,
+                },
+            )
         due_intents, deferred_actions = self._schedule_deferred_intents()
+        if ablation_actions:
+            deferred_actions = list(deferred_actions) + ablation_actions
 
         system_prompt = self._build_system_prompt(due_intents=due_intents)
         reply = self.adapter.generate(
@@ -1445,6 +1512,9 @@ class RecursiveConclusionSession:
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "due_deferred_intents": due_payloads,
             "deferred_intent_actions": list(action_map.values()),
+            "deferred_intent_latent_injection": self.config.deferred_intent_latent_injection.value,
+            "deferred_intent_ablation": self.config.deferred_intent_ablation.value,
+            "deferred_intent_ablation_actions": ablation_actions,
             "system_prompt": system_prompt,
             "usage": reply.usage,
             "finish_reason": reply.finish_reason,
@@ -1509,6 +1579,10 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         deferred_intent_offset=args.deferred_intent_offset,
         deferred_intent_grace=args.deferred_intent_grace,
         deferred_intent_limit=args.deferred_intent_limit,
+        deferred_intent_latent_injection=DeferredIntentLatentInjection(
+            args.deferred_intent_latent_injection
+        ),
+        deferred_intent_ablation=DeferredIntentAblation(args.deferred_intent_ablation),
         show_probe_outputs=bool(args.show_probes),
         reply_config=GenerationConfig(
             temperature=args.temperature,
@@ -1694,6 +1768,18 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=6,
             help="Maximum number of simultaneously active deferred intents.",
+        )
+        p.add_argument(
+            "--deferred-intent-latent-injection",
+            choices=[m.value for m in DeferredIntentLatentInjection],
+            default=DeferredIntentLatentInjection.OFF.value,
+            help="Whether active deferred intents are injected as latent (private) context every turn.",
+        )
+        p.add_argument(
+            "--deferred-intent-ablation",
+            choices=[m.value for m in DeferredIntentAblation],
+            default=DeferredIntentAblation.NONE.value,
+            help="Ablation mode for deferred intents (e.g., delete planned intents immediately).",
         )
         p.add_argument("--temperature", type=float, default=0.2, help="Temperature for main assistant replies.")
         p.add_argument("--max-tokens", type=int, default=900, help="Max output tokens for main assistant replies.")
