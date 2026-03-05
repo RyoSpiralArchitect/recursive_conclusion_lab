@@ -78,6 +78,11 @@ class SteerStrength(str, Enum):
     STRONG = "strong"
 
 
+class ConclusionSteerInjection(str, Enum):
+    FULL = "full"
+    CONCLUSION_LINE = "conclusion_line"
+
+
 class DeferredIntentMode(str, Enum):
     OBSERVE = "observe"
     SOFT_FIRE = "soft_fire"
@@ -99,6 +104,7 @@ class ExperimentConfig:
     conclusion_every: int = 3
     conclusion_mode: ConclusionMode = ConclusionMode.OBSERVE
     conclusion_steer_strength: SteerStrength = SteerStrength.MEDIUM
+    conclusion_steer_injection: ConclusionSteerInjection = ConclusionSteerInjection.FULL
     deferred_intent_every: int = 0
     deferred_intent_mode: DeferredIntentMode = DeferredIntentMode.OBSERVE
     deferred_intent_strategy: DeferredIntentStrategy = DeferredIntentStrategy.TRIGGER
@@ -226,6 +232,13 @@ def lexical_overlap(a: str, b: str) -> float:
     if not toks_a or not toks_b:
         return 0.0
     return len(toks_a & toks_b) / len(toks_a | toks_b)
+
+
+def extract_conclusion_line(text: str) -> str:
+    match = re.search(r"(?im)^\s*conclusion\s*:\s*(.+?)\s*$", text or "")
+    if not match:
+        return ""
+    return f"CONCLUSION: {match.group(1).strip()}"
 
 
 def require_env(name: str) -> str:
@@ -915,6 +928,11 @@ class RecursiveConclusionSession:
             self.config.conclusion_mode == ConclusionMode.SOFT_STEER
             and self.conclusion_hypotheses
         ):
+            hypothesis = self.conclusion_hypotheses[-1]
+            if self.config.conclusion_steer_injection == ConclusionSteerInjection.CONCLUSION_LINE:
+                injected_hypothesis = extract_conclusion_line(hypothesis) or hypothesis
+            else:
+                injected_hypothesis = hypothesis
             if self.config.conclusion_steer_strength == SteerStrength.WEAK:
                 steer_rule = (
                     "Treat it as a gentle hint. Use it only if it helps; otherwise ignore it."
@@ -933,7 +951,7 @@ class RecursiveConclusionSession:
                 )
             parts.append(
                 "Provisional end-state hypothesis for the conversation:\n"
-                f"{self.conclusion_hypotheses[-1]}\n\n"
+                f"{injected_hypothesis}\n\n"
                 f"{steer_rule}"
             )
 
@@ -1423,6 +1441,7 @@ class RecursiveConclusionSession:
             "memory_capsule": memory_capsule,
             "conclusion_probe": conclusion,
             "conclusion_steer_strength": self.config.conclusion_steer_strength.value,
+            "conclusion_steer_injection": self.config.conclusion_steer_injection.value,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "due_deferred_intents": due_payloads,
             "deferred_intent_actions": list(action_map.values()),
@@ -1483,6 +1502,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         conclusion_every=args.conclusion_every,
         conclusion_mode=ConclusionMode(args.conclusion_mode),
         conclusion_steer_strength=SteerStrength(args.conclusion_steer_strength),
+        conclusion_steer_injection=ConclusionSteerInjection(args.conclusion_steer_injection),
         deferred_intent_every=args.deferred_intent_every,
         deferred_intent_mode=DeferredIntentMode(args.deferred_intent_mode),
         deferred_intent_strategy=DeferredIntentStrategy(args.deferred_intent_strategy),
@@ -1632,6 +1652,12 @@ def build_parser() -> argparse.ArgumentParser:
             choices=[s.value for s in SteerStrength],
             default=SteerStrength.MEDIUM.value,
             help="How strongly the injected conclusion hypothesis should steer the next reply (only affects --conclusion-mode soft_steer).",
+        )
+        p.add_argument(
+            "--conclusion-steer-injection",
+            choices=[i.value for i in ConclusionSteerInjection],
+            default=ConclusionSteerInjection.FULL.value,
+            help="Which parts of the conclusion probe to inject (only affects --conclusion-mode soft_steer).",
         )
         p.add_argument(
             "--deferred-intent-every",

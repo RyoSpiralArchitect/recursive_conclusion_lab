@@ -41,6 +41,7 @@
 - **memory cadence**: `memory_every=2`
 - **probe cadence**: `conclusion_every=2`
 - **steer strength**: `--conclusion-steer-strength medium|strong`（`soft_steer` 時のみ。差が弱いときは `strong` で効果量を上げる）
+- **steer injection**: `--conclusion-steer-injection full|conclusion_line`（`soft_steer` 時のみ。`conclusion_line` は注入ノイズを減らして比較を安定させやすい）
 - **reply temperature**: 0.0 または 0.2
 - **probe temperature**: 0.0 固定
 
@@ -198,6 +199,7 @@ Phase 1 で差が出た設定だけ、OpenAI / Anthropic / Mistral / Gemini / HF
 - `temperature=0.0` vs `temperature=0.2`
 - `observe` vs `soft_steer`
 - `--conclusion-steer-strength medium` vs `--conclusion-steer-strength strong`
+- `--conclusion-steer-injection full` vs `--conclusion-steer-injection conclusion_line`
 
 を切り替えて再確認する。
 
