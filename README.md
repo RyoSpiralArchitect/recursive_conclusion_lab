@@ -1,31 +1,32 @@
 # Recursive Conclusion Lab
 
-複数プロバイダの LLM API を薄い抽象化層で統一しつつ、会話の時間構造を観測するための実験ハーネスです。
+[日本語 README](README.ja.md)
 
-## できること
+Cross-provider experiment harness for observing (and optionally steering) the *time-structure* of LLM dialogue:
 
-1. **Recursive memory capsules**
-   - 会話全体を毎回そのまま再送せず、直近ウィンドウ + 圧縮済みメモリカプセルだけを再帰的にロードします。
+- Recursive **memory capsules** (compressed context you can reload every turn)
+- Periodic **conclusion probes** (predict the likely end-state)
+- **Deferred utterance intents** (plan now, say later)
 
-2. **Periodic conclusion probe**
-   - 数ターンごとに「この対話が最終的にどんな結論へ向かっているか」を side channel で推定します。
-   - `--conclusion-mode soft_steer` にすると、その仮説を次ターンへ soft hint として注入できます。
+## Providers
 
-3. **Deferred utterance intents**
-   - 「今はまだ言わないが、数ターン後に適切なら言う」という将来発話意図を side channel で作ります。
-   - `fixed / trigger / adaptive` の 3 戦略を試せます。
-   - `--deferred-intent-mode soft_fire` にすると、due になった意図を system 側へ自然発火のヒントとして注入できます。
+- `openai` (Responses API)
+- `anthropic` (Messages API)
+- `mistral` (Chat Completions API)
+- `gemini` (generateContent API)
+- `hf` (Inference Providers; OpenAI-compatible chat-completions)
+- `dummy` (local deterministic mock; no API keys)
 
-## 対応プロバイダ
+## Requirements
 
-- `openai`
-- `anthropic`
-- `mistral`
-- `gemini`
-- `hf`
-- `dummy`（API キー不要のローカル擬似プロバイダ）
+- Python 3.9+
+- `requests`
 
-## 必要環境変数
+```bash
+python -m pip install requests
+```
+
+## API keys (set only what you use)
 
 - `OPENAI_API_KEY`
 - `ANTHROPIC_API_KEY`
@@ -33,95 +34,43 @@
 - `GEMINI_API_KEY`
 - `HF_TOKEN`
 
-使うプロバイダに対応するものだけ設定してください。
+## Quick start (REPL)
 
-## インストール
-
-```bash
-pip install requests
-```
-
-## REPL 実行例
-
-### 1) 結論 probe だけ見る
+Observe conclusion probes:
 
 ```bash
 python recursive_conclusion_lab.py repl \
   --provider openai \
-  --model <your_model_id> \
+  --model <model_id> \
   --window 8 \
-  --memory-every 3 \
-  --conclusion-every 3 \
+  --conclusion-every 2 \
   --conclusion-mode observe \
   --show-probes \
-  --log runs/openai_run.jsonl
+  --log runs/openai_observe.jsonl
 ```
 
-### 2) deferred intent を soft fire する
+Steer with the conclusion hypothesis (tunable strength/injection):
 
 ```bash
 python recursive_conclusion_lab.py repl \
   --provider openai \
-  --model <your_model_id> \
+  --model <model_id> \
   --window 8 \
-  --deferred-intent-every 2 \
-  --deferred-intent-mode soft_fire \
-  --deferred-intent-strategy trigger \
-  --deferred-intent-offset 3 \
-  --deferred-intent-grace 2 \
-  --show-probes \
-  --log runs/openai_deferred.jsonl
-```
-
-### 3) ローカル smoke test
-
-```bash
-python recursive_conclusion_lab.py repl \
-  --provider dummy \
-  --model dummy-v1 \
-  --deferred-intent-every 1 \
-  --deferred-intent-mode soft_fire \
+  --conclusion-every 2 \
+  --conclusion-mode soft_steer \
+  --conclusion-steer-strength strong \
+  --conclusion-steer-injection conclusion_line \
   --show-probes
 ```
 
-## compare 実行例
+## Scripted comparisons
 
-`script.json` は次のどちらかの形式です。
-
-### 1) ただの配列
-
-```json
-[
-  "長期記憶を入れた会話エージェントを考えたい。",
-  "数ターンごとに結論を先取りさせると何が起こる？",
-  "その実験条件を設計して。"
-]
-```
-
-### 2) system + turns + evaluation
-
-```json
-{
-  "system": "You are a careful research assistant.",
-  "turns": [
-    "長期記憶を入れた会話エージェントを考えたい。",
-    "数ターンごとに結論を先取りさせると何が起こる？",
-    "その実験条件を設計して。"
-  ],
-  "evaluation": {
-    "final_required_keywords": ["baseline"],
-    "conversation_required_keywords": [],
-    "final_forbidden_keywords": []
-  }
-}
-```
-
-### 結論 probe 比較
+Run the same script across providers:
 
 ```bash
 python recursive_conclusion_lab.py compare \
   --script protocol_scripts/convergent_protocol.json \
-  --providers openai=<openai_model> anthropic=<anthropic_model> \
+  --providers openai=<model_id> anthropic=<model_id> \
   --window 8 \
   --memory-every 2 \
   --conclusion-every 2 \
@@ -129,12 +78,40 @@ python recursive_conclusion_lab.py compare \
   --out-dir compare_outputs/conclusion
 ```
 
-### deferred intent 比較
+Templates:
+
+- `templates/script_template.json`
+- `templates/compare_config_template.json` (CLI-to-JSON mapping reference)
+
+## Deferred intents (baseline → full → ablation)
+
+### Backend
+
+- `external` (default): explicit planner/scheduler probes (more controlled, more API calls).
+- `inband`: the assistant carries deferred-intent state by appending a hidden `<RCL_STATE>...</RCL_STATE>` JSON block to each reply (more portable, fewer moving parts).
+
+Enable in-band deferred intents:
 
 ```bash
 python recursive_conclusion_lab.py compare \
   --script protocol_scripts/gather_then_recommend.json \
-  --providers openai=<openai_model> \
+  --providers openai=<model_id> \
+  --window 8 \
+  --deferred-intent-backend inband \
+  --deferred-intent-every 2 \
+  --deferred-intent-mode soft_fire \
+  --deferred-intent-strategy trigger \
+  --deferred-intent-offset 3 \
+  --deferred-intent-grace 2 \
+  --out-dir compare_outputs/deferred_inband_trigger
+```
+
+Trigger-based deferred intents (soft fire):
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
   --window 8 \
   --deferred-intent-every 2 \
   --deferred-intent-mode soft_fire \
@@ -144,40 +121,48 @@ python recursive_conclusion_lab.py compare \
   --out-dir compare_outputs/deferred_trigger
 ```
 
-## ログ
+Latent injection (intents influence the trajectory before they are due):
 
-- 各プロバイダごとの詳細ログ: `*.jsonl`
-- 集約サマリ: `summary.json`
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --window 8 \
+  --deferred-intent-every 2 \
+  --deferred-intent-mode soft_fire \
+  --deferred-intent-strategy trigger \
+  --deferred-intent-offset 3 \
+  --deferred-intent-grace 2 \
+  --deferred-intent-latent-injection active \
+  --out-dir compare_outputs/deferred_latent
+```
 
-主なイベント種別:
-- `memory_capsule`
-- `conclusion_probe`
-- `deferred_intent_plan`
-- `deferred_intent_decision`
-- `assistant_reply`
+Ablation (intent planned → deleted immediately):
 
-## analyze_runs.py
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --window 8 \
+  --deferred-intent-every 2 \
+  --deferred-intent-mode soft_fire \
+  --deferred-intent-strategy trigger \
+  --deferred-intent-offset 3 \
+  --deferred-intent-grace 2 \
+  --deferred-intent-latent-injection active \
+  --deferred-intent-ablation delete_planned \
+  --out-dir compare_outputs/deferred_latent_deleted
+```
+
+## Analyze logs
 
 ```bash
 python analyze_runs.py \
   --log-dir compare_outputs/deferred_trigger \
-  --script protocol_scripts/gather_then_recommend.json \
-  --out compare_outputs/deferred_trigger/analysis.json
+  --script protocol_scripts/gather_then_recommend.json
 ```
 
-主な出力指標:
-- `avg_probe_reply_overlap`
-- `avg_conclusion_stability`
-- `deferred_intent_plan_count`
-- `deferred_intent_fire_count`
-- `deferred_intent_realization_rate`
-- `avg_deferred_intent_reply_overlap`
-- `deferred_intent_premature_fire_count`
-- `deferred_intent_stale_fire_count`
+## Protocol docs
 
-## 最初に見るとおもしろい差分
-
-- `observe` vs `soft_steer` で結論仮説が収束にどう効くか
-- `fixed` vs `trigger` vs `adaptive` で deferred intent の自然さがどう変わるか
-- `gather_then_recommend` で「早すぎる提案」が減るか
-- `interrupted_agenda` で保持した意図をちゃんと cancel できるか
+- `EXPERIMENT_PROTOCOL.md` (JP)
+- `DEFERRED_INTENT_PROTOCOL.md` (JP)

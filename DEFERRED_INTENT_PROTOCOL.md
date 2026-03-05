@@ -14,6 +14,27 @@
 
 ## 2. モジュール構成
 
+### backend（external vs inband）
+
+- `external`（デフォルト）: planner / scheduler を別プローブ呼び出しで実行（より制御しやすいが API 呼び出しが増える）。
+- `inband`: assistant の返信末尾に隠し状態 `<RCL_STATE>...</RCL_STATE>`（JSON）を付けて、意図状態を会話内で自己保持させる（可搬性↑ / 複雑さ↓）。
+
+例（inband）:
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --window 8 \
+  --deferred-intent-backend inband \
+  --deferred-intent-every 2 \
+  --deferred-intent-mode soft_fire \
+  --deferred-intent-strategy trigger \
+  --deferred-intent-offset 3 \
+  --deferred-intent-grace 2 \
+  --out-dir runs/deferred_inband_trigger
+```
+
 ### planner
 現在の会話から「あとで言う候補」を 1 件だけ作る。
 

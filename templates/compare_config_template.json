@@ -1,0 +1,33 @@
+{
+  "script": "protocol_scripts/convergent_protocol.json",
+  "providers": [
+    "openai=<model_id>",
+    "anthropic=<model_id>"
+  ],
+  "out_dir": "compare_outputs/example_run",
+  "args": {
+    "system": "",
+    "window": 8,
+    "memory_every": 2,
+    "memory_limit": 4,
+    "memory_words": 140,
+    "conclusion_every": 2,
+    "conclusion_mode": "soft_steer",
+    "conclusion_steer_strength": "strong",
+    "conclusion_steer_injection": "conclusion_line",
+    "deferred_intent_every": 2,
+    "deferred_intent_mode": "soft_fire",
+    "deferred_intent_strategy": "trigger",
+    "deferred_intent_offset": 3,
+    "deferred_intent_grace": 2,
+    "deferred_intent_limit": 6,
+    "deferred_intent_backend": "external",
+    "deferred_intent_latent_injection": "off",
+    "deferred_intent_ablation": "none",
+    "temperature": 0.2,
+    "max_tokens": 900,
+    "probe_max_tokens": 220,
+    "timeout": 120,
+    "show_probes": true
+  }
+}

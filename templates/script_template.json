@@ -1,0 +1,14 @@
+{
+  "system": "You are a careful research assistant.",
+  "turns": [
+    "Turn 1: state the task and success criteria.",
+    "Turn 2: add constraints or a direction change.",
+    "Turn 3: request an operational, concrete output."
+  ],
+  "evaluation": {
+    "final_required_keywords": [],
+    "conversation_required_keywords": [],
+    "final_forbidden_keywords": []
+  }
+}
+

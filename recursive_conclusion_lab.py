@@ -94,6 +94,11 @@ class DeferredIntentStrategy(str, Enum):
     ADAPTIVE = "adaptive"
 
 
+class DeferredIntentBackend(str, Enum):
+    EXTERNAL = "external"
+    INBAND = "inband"
+
+
 class DeferredIntentLatentInjection(str, Enum):
     OFF = "off"
     ACTIVE = "active"
@@ -121,6 +126,7 @@ class ExperimentConfig:
     deferred_intent_offset: int = 3
     deferred_intent_grace: int = 2
     deferred_intent_limit: int = 6
+    deferred_intent_backend: DeferredIntentBackend = DeferredIntentBackend.EXTERNAL
     deferred_intent_latent_injection: DeferredIntentLatentInjection = DeferredIntentLatentInjection.OFF
     deferred_intent_ablation: DeferredIntentAblation = DeferredIntentAblation.NONE
     show_probe_outputs: bool = True
@@ -191,7 +197,8 @@ def compact_text(text: str) -> str:
 def render_messages(messages: Iterable[ChatMessage]) -> str:
     chunks: list[str] = []
     for idx, msg in enumerate(messages, start=1):
-        chunks.append(f"{idx:02d}. {msg.role.upper()}: {msg.content}")
+        content = strip_rcl_state(msg.content)
+        chunks.append(f"{idx:02d}. {msg.role.upper()}: {content}")
     return "\n".join(chunks) if chunks else "(empty)"
 
 
@@ -251,6 +258,32 @@ def extract_conclusion_line(text: str) -> str:
     if not match:
         return ""
     return f"CONCLUSION: {match.group(1).strip()}"
+
+
+RCL_STATE_OPEN = "<RCL_STATE>"
+RCL_STATE_CLOSE = "</RCL_STATE>"
+
+
+def split_rcl_state(text: str) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
+    raw = text or ""
+    start = raw.rfind(RCL_STATE_OPEN)
+    end = raw.rfind(RCL_STATE_CLOSE)
+    if start == -1 or end == -1 or end < start:
+        return raw.strip(), None, None
+    visible = raw[:start].rstrip()
+    blob = raw[start + len(RCL_STATE_OPEN) : end].strip()
+    try:
+        data = json.loads(blob)
+    except Exception as exc:
+        return visible, None, f"Invalid RCL_STATE JSON: {exc}"
+    if not isinstance(data, dict):
+        return visible, None, "RCL_STATE must be a JSON object."
+    return visible, data, None
+
+
+def strip_rcl_state(text: str) -> str:
+    visible, _, _ = split_rcl_state(text)
+    return visible
 
 
 def require_env(name: str) -> str:
@@ -967,7 +1000,11 @@ class RecursiveConclusionSession:
                 f"{steer_rule}"
             )
 
-        if self.config.deferred_intent_latent_injection == DeferredIntentLatentInjection.ACTIVE:
+        if (
+            self.config.deferred_intent_backend != DeferredIntentBackend.INBAND
+            and self.config.deferred_intent_latent_injection
+            == DeferredIntentLatentInjection.ACTIVE
+        ):
             active_intents = [
                 intent
                 for intent in self._active_deferred_intents()
@@ -1425,57 +1462,412 @@ class RecursiveConclusionSession:
 
         memory_capsule = self._probe_memory_capsule()
         conclusion = self._probe_conclusion()
-        planned_intent = self._probe_deferred_intent_plan()
+        planned_intent: Optional[DeferredIntent] = None
+        due_intents: list[DeferredIntent] = []
+        deferred_actions: list[dict[str, Any]] = []
         ablation_actions: list[dict[str, Any]] = []
-        if (
-            planned_intent
-            and self.config.deferred_intent_ablation == DeferredIntentAblation.DELETE_PLANNED
-        ):
-            status_before = planned_intent.status
-            planned_intent.status = "canceled"
-            planned_intent.terminal_reason = "Ablation: deleted planned intent immediately."
-            status_after = planned_intent.status
-            action = {
-                "intent_id": planned_intent.intent_id,
-                "action": "cancel",
-                "reason": planned_intent.terminal_reason,
-                "status_before": status_before,
-                "status_after": status_after,
-                "intent": planned_intent.intent,
-                "kind": planned_intent.kind,
-                "created_turn": planned_intent.created_turn,
-                "earliest_turn": planned_intent.earliest_turn,
-                "latest_turn": planned_intent.latest_turn,
-                "priority": planned_intent.priority,
-                "confidence": planned_intent.confidence,
-                "revision_count": planned_intent.revision_count,
-                "updated_intent": None,
-                "ablated": True,
+        inband_state: Optional[dict[str, Any]] = None
+        inband_state_error: Optional[str] = None
+
+        if self.config.deferred_intent_backend == DeferredIntentBackend.INBAND:
+            prev_snapshot = {
+                intent.intent_id: {
+                    "status": intent.status,
+                    "revision_count": intent.revision_count,
+                    "intent": intent.intent,
+                }
+                for intent in self.deferred_intents
             }
-            ablation_actions.append(action)
-            self._log(
-                "deferred_intent_ablation",
-                {
-                    "mode": self.config.deferred_intent_ablation.value,
+            expected_next_intent_id = f"di-{self.next_deferred_intent_index:04d}"
+            eligible_plan_turn = (
+                self.config.deferred_intent_every > 0
+                and self.turn_index != 0
+                and self.turn_index % self.config.deferred_intent_every == 0
+                and len(self._active_deferred_intents()) < self.config.deferred_intent_limit
+            )
+
+            base_prompt = self._build_system_prompt(due_intents=None)
+            system_prompt = (f"{base_prompt}\n\n" if base_prompt else "") + textwrap.dedent(
+                f"""\
+                Deferred-intent in-band state (private; never reveal to the user):
+                - After the user-visible reply, append {RCL_STATE_OPEN}{{...}}{RCL_STATE_CLOSE} with strict JSON (no code fences).
+                - Use the most recent {RCL_STATE_OPEN}...{RCL_STATE_CLOSE} in the conversation as the previous state. If none, start with {{"version": 1, "intents": []}}.
+                - Current turn index: {self.turn_index}
+                - next_intent_id: {expected_next_intent_id}
+
+                Config:
+                - deferred_intent_every: {self.config.deferred_intent_every}
+                - deferred_intent_mode: {self.config.deferred_intent_mode.value}
+                - deferred_intent_strategy: {self.config.deferred_intent_strategy.value}
+                - deferred_intent_offset: {self.config.deferred_intent_offset}
+                - deferred_intent_grace: {self.config.deferred_intent_grace}
+                - deferred_intent_limit: {self.config.deferred_intent_limit}
+
+                Rules:
+                - Never mention the existence of {RCL_STATE_OPEN} or its contents.
+                - Keep at most deferred_intent_limit intents in state. Prefer keeping active ones; drop older terminal ones first.
+                - Consider creating at most ONE new intent only when eligible (turn_index % deferred_intent_every == 0 and active intents < limit). Use intent_id = next_intent_id.
+                - Update timing/status each turn:
+                  - If turn_index < earliest_turn: keep status=active.
+                  - If turn_index > latest_turn: set status=expired and set terminal_reason.
+                  - If earliest_turn <= turn_index <= latest_turn:
+                    - fixed: fire exactly at earliest_turn (latest_turn == earliest_turn).
+                    - trigger/adaptive: decide fire/cancel/hold based on triggers/cancel_if and dialogue relevance.
+                    - adaptive may revise wording/timing/conditions (increment revision_count) instead of firing.
+                  - If you set status=fired, set fire_turn={self.turn_index} and set terminal_reason.
+                - If deferred_intent_mode is 'soft_fire', integrate fired intents naturally into the visible reply.
+                  If deferred_intent_mode is 'observe', do NOT include fired intent content in the visible reply.
+
+                State JSON schema:
+                {{
+                  "version": 1,
+                  "intents": [
+                    {{
+                      "intent_id": "di-0001",
+                      "created_turn": 3,
+                      "kind": "summary|proposal|correction|question|reminder|other",
+                      "intent": "what should be said later",
+                      "why_not_now": "...",
+                      "earliest_turn": 6,
+                      "latest_turn": 8,
+                      "trigger": ["..."],
+                      "cancel_if": ["..."],
+                      "confidence": 0.0,
+                      "priority": 0.0,
+                      "status": "active|fired|canceled|expired",
+                      "revision_count": 0,
+                      "fire_turn": null,
+                      "terminal_reason": ""
+                    }}
+                  ]
+                }}
+                """
+            ).strip()
+
+            messages = self._recent_window()
+            if self.config.recent_window_messages == 1:
+                prev_assistant = next(
+                    (m for m in reversed(self.history[:-1]) if m.role == "assistant"),
+                    None,
+                )
+                if prev_assistant is not None:
+                    messages = [prev_assistant, self.history[-1]]
+
+            reply = self.adapter.generate(
+                system=system_prompt or None,
+                messages=messages,
+                config=self.config.reply_config,
+            )
+
+            assistant_raw = reply.text.strip()
+            assistant_text, state, state_error = split_rcl_state(assistant_raw)
+            assistant_text = assistant_text.strip()
+            if state is None and state_error is None:
+                inband_state_error = "Missing RCL_STATE block."
+            else:
+                inband_state_error = state_error
+
+            state_obj = state if isinstance(state, dict) else {}
+            version = coerce_int(state_obj.get("version") or state_obj.get("v")) or 1
+            intents_raw = state_obj.get("intents")
+            if intents_raw is None:
+                intents_raw = state_obj.get("deferred_intents")
+            if not isinstance(intents_raw, list):
+                intents_raw = []
+
+            parsed_intents: list[DeferredIntent] = []
+            for item in intents_raw:
+                if not isinstance(item, dict):
+                    continue
+                intent_id = compact_text(str(item.get("intent_id", "")))
+                intent_text = compact_text(str(item.get("intent", "")))
+                if not intent_id or not intent_text:
+                    continue
+
+                created_turn = coerce_int(item.get("created_turn")) or self.turn_index
+                kind = compact_text(str(item.get("kind", "other"))) or "other"
+                why_not_now = compact_text(str(item.get("why_not_now", "")))
+                earliest_turn = coerce_int(item.get("earliest_turn"))
+                latest_turn = coerce_int(item.get("latest_turn"))
+                if earliest_turn is None:
+                    earliest_turn = created_turn + max(1, self.config.deferred_intent_offset)
+                if latest_turn is None:
+                    if self.config.deferred_intent_strategy == DeferredIntentStrategy.FIXED:
+                        latest_turn = earliest_turn
+                    else:
+                        latest_turn = earliest_turn + max(0, self.config.deferred_intent_grace)
+                if latest_turn < earliest_turn:
+                    latest_turn = earliest_turn
+
+                status = compact_text(str(item.get("status", "active"))).lower() or "active"
+                if status not in {"active", "fired", "canceled", "expired"}:
+                    status = "active"
+
+                parsed_intents.append(
+                    DeferredIntent(
+                        intent_id=intent_id,
+                        created_turn=created_turn,
+                        kind=kind,
+                        intent=intent_text,
+                        why_not_now=why_not_now,
+                        earliest_turn=earliest_turn,
+                        latest_turn=latest_turn,
+                        trigger=coerce_str_list(item.get("trigger")),
+                        cancel_if=coerce_str_list(item.get("cancel_if")),
+                        confidence=clamp01(item.get("confidence"), default=0.0),
+                        priority=clamp01(item.get("priority"), default=0.5),
+                        status=status,
+                        revision_count=coerce_int(item.get("revision_count")) or 0,
+                        fire_turn=coerce_int(item.get("fire_turn")),
+                        terminal_reason=compact_text(str(item.get("terminal_reason", ""))),
+                    )
+                )
+
+            # Deduplicate by id (keep last) and enforce a hard cap.
+            dedup: dict[str, DeferredIntent] = {}
+            for intent in parsed_intents:
+                dedup[intent.intent_id] = intent
+            parsed_intents = list(dedup.values())
+            if len(parsed_intents) > self.config.deferred_intent_limit:
+                def sort_key(intent: DeferredIntent) -> tuple[int, int, float]:
+                    status_rank = 0 if intent.status == "active" else 1
+                    return (status_rank, -intent.created_turn, -intent.priority)
+
+                parsed_intents = sorted(parsed_intents, key=sort_key)[: self.config.deferred_intent_limit]
+
+            new_candidates = [i for i in parsed_intents if i.intent_id not in prev_snapshot]
+            if new_candidates:
+                planned_intent = max(new_candidates, key=lambda i: i.created_turn)
+
+            if eligible_plan_turn or planned_intent:
+                self._log(
+                    "deferred_intent_plan",
+                    {
+                        "intent_id": planned_intent.intent_id if planned_intent else None,
+                        "created": bool(planned_intent),
+                        "intent": planned_intent.to_dict() if planned_intent else None,
+                        "raw_plan": {"backend": "inband", "eligible": eligible_plan_turn},
+                        "usage": None,
+                        "finish_reason": None,
+                        "request_id": None,
+                    },
+                )
+
+            if (
+                planned_intent
+                and self.config.deferred_intent_ablation == DeferredIntentAblation.DELETE_PLANNED
+            ):
+                status_before = planned_intent.status
+                planned_intent.status = "canceled"
+                planned_intent.terminal_reason = (
+                    "Ablation: deleted planned intent immediately (in-band backend)."
+                )
+                status_after = planned_intent.status
+                action = {
                     "intent_id": planned_intent.intent_id,
+                    "action": "cancel",
+                    "reason": planned_intent.terminal_reason,
                     "status_before": status_before,
                     "status_after": status_after,
+                    "intent": planned_intent.intent,
+                    "kind": planned_intent.kind,
+                    "created_turn": planned_intent.created_turn,
+                    "earliest_turn": planned_intent.earliest_turn,
+                    "latest_turn": planned_intent.latest_turn,
+                    "priority": planned_intent.priority,
+                    "confidence": planned_intent.confidence,
+                    "revision_count": planned_intent.revision_count,
+                    "updated_intent": None,
+                    "ablated": True,
+                }
+                ablation_actions.append(action)
+                self._log(
+                    "deferred_intent_ablation",
+                    {
+                        "mode": self.config.deferred_intent_ablation.value,
+                        "intent_id": planned_intent.intent_id,
+                        "status_before": status_before,
+                        "status_after": status_after,
+                        "reason": planned_intent.terminal_reason,
+                    },
+                )
+                # Do not carry the planned intent forward in-band.
+                parsed_intents = [
+                    intent
+                    for intent in parsed_intents
+                    if intent.intent_id != planned_intent.intent_id
+                ]
+
+            numeric_ids = []
+            for intent in parsed_intents + ([planned_intent] if planned_intent else []):
+                match = re.fullmatch(r"di-(\d+)", intent.intent_id)
+                if match:
+                    numeric_ids.append(int(match.group(1)))
+            if numeric_ids:
+                self.next_deferred_intent_index = max(
+                    self.next_deferred_intent_index, max(numeric_ids) + 1
+                )
+
+            # Derive decisions from status transitions.
+            decisions: list[dict[str, Any]] = []
+            for intent in parsed_intents:
+                prev = prev_snapshot.get(intent.intent_id)
+                status_before = str(prev.get("status")) if prev is not None else "active"
+                action = "hold"
+                updated_intent = None
+                if status_before != intent.status:
+                    if intent.status == "fired":
+                        action = "fire"
+                    elif intent.status == "canceled":
+                        action = "cancel"
+                    elif intent.status == "expired":
+                        action = "expire"
+                    else:
+                        action = "revise"
+                        updated_intent = intent.to_dict()
+                else:
+                    if prev is not None and intent.revision_count > int(prev.get("revision_count") or 0):
+                        action = "revise"
+                        updated_intent = intent.to_dict()
+
+                if action == "fire":
+                    due_intents.append(intent)
+
+                if action in {"fire", "cancel", "expire"}:
+                    reason = intent.terminal_reason or "In-band terminal transition."
+                elif action == "revise":
+                    reason = "In-band revision."
+                else:
+                    reason = "In-band hold."
+
+                decisions.append(
+                    {
+                        "intent_id": intent.intent_id,
+                        "action": action,
+                        "reason": reason,
+                        "status_before": status_before,
+                        "status_after": intent.status,
+                        "intent": intent.intent,
+                        "kind": intent.kind,
+                        "created_turn": intent.created_turn,
+                        "earliest_turn": intent.earliest_turn,
+                        "latest_turn": intent.latest_turn,
+                        "priority": intent.priority,
+                        "confidence": intent.confidence,
+                        "revision_count": intent.revision_count,
+                        "updated_intent": updated_intent,
+                    }
+                )
+
+            if decisions:
+                self._log(
+                    "deferred_intent_decision",
+                    {
+                        "strategy": self.config.deferred_intent_strategy.value,
+                        "decisions": decisions,
+                        "scheduler_raw": "inband",
+                        "usage": None,
+                        "finish_reason": None,
+                        "request_id": None,
+                    },
+                )
+
+            deferred_actions = decisions + ablation_actions
+
+            # Mirror the latest in-band state locally for analysis (best-effort).
+            by_id = {intent.intent_id: intent for intent in self.deferred_intents}
+            for intent in parsed_intents:
+                if intent.intent_id in by_id:
+                    existing = by_id[intent.intent_id]
+                    existing.kind = intent.kind
+                    existing.intent = intent.intent
+                    existing.why_not_now = intent.why_not_now
+                    existing.earliest_turn = intent.earliest_turn
+                    existing.latest_turn = intent.latest_turn
+                    existing.trigger = intent.trigger
+                    existing.cancel_if = intent.cancel_if
+                    existing.confidence = intent.confidence
+                    existing.priority = intent.priority
+                    existing.status = intent.status
+                    existing.revision_count = intent.revision_count
+                    existing.fire_turn = intent.fire_turn
+                    existing.terminal_reason = intent.terminal_reason
+                else:
+                    self.deferred_intents.append(intent)
+
+            carried_ids = {intent.intent_id for intent in parsed_intents}
+            if (
+                planned_intent
+                and planned_intent.intent_id not in carried_ids
+                and planned_intent.intent_id not in by_id
+            ):
+                self.deferred_intents.append(planned_intent)
+
+            inband_state = {
+                "version": version,
+                "intents": [intent.to_dict() for intent in parsed_intents],
+            }
+            state_blob = json.dumps(inband_state, ensure_ascii=False)
+            assistant_with_state = assistant_text
+            if assistant_with_state:
+                assistant_with_state = assistant_with_state.rstrip() + "\n\n"
+            assistant_with_state += f"{RCL_STATE_OPEN}{state_blob}{RCL_STATE_CLOSE}"
+            self.history.append(ChatMessage(role="assistant", content=assistant_with_state))
+        else:
+            planned_intent = self._probe_deferred_intent_plan()
+            if (
+                planned_intent
+                and self.config.deferred_intent_ablation
+                == DeferredIntentAblation.DELETE_PLANNED
+            ):
+                status_before = planned_intent.status
+                planned_intent.status = "canceled"
+                planned_intent.terminal_reason = (
+                    "Ablation: deleted planned intent immediately."
+                )
+                status_after = planned_intent.status
+                action = {
+                    "intent_id": planned_intent.intent_id,
+                    "action": "cancel",
                     "reason": planned_intent.terminal_reason,
-                },
+                    "status_before": status_before,
+                    "status_after": status_after,
+                    "intent": planned_intent.intent,
+                    "kind": planned_intent.kind,
+                    "created_turn": planned_intent.created_turn,
+                    "earliest_turn": planned_intent.earliest_turn,
+                    "latest_turn": planned_intent.latest_turn,
+                    "priority": planned_intent.priority,
+                    "confidence": planned_intent.confidence,
+                    "revision_count": planned_intent.revision_count,
+                    "updated_intent": None,
+                    "ablated": True,
+                }
+                ablation_actions.append(action)
+                self._log(
+                    "deferred_intent_ablation",
+                    {
+                        "mode": self.config.deferred_intent_ablation.value,
+                        "intent_id": planned_intent.intent_id,
+                        "status_before": status_before,
+                        "status_after": status_after,
+                        "reason": planned_intent.terminal_reason,
+                    },
+                )
+
+            due_intents, deferred_actions = self._schedule_deferred_intents()
+            if ablation_actions:
+                deferred_actions = list(deferred_actions) + ablation_actions
+
+            system_prompt = self._build_system_prompt(due_intents=due_intents)
+            reply = self.adapter.generate(
+                system=system_prompt or None,
+                messages=self._recent_window(),
+                config=self.config.reply_config,
             )
-        due_intents, deferred_actions = self._schedule_deferred_intents()
-        if ablation_actions:
-            deferred_actions = list(deferred_actions) + ablation_actions
 
-        system_prompt = self._build_system_prompt(due_intents=due_intents)
-        reply = self.adapter.generate(
-            system=system_prompt or None,
-            messages=self._recent_window(),
-            config=self.config.reply_config,
-        )
-
-        assistant_text = reply.text.strip()
-        self.history.append(ChatMessage(role="assistant", content=assistant_text))
+            assistant_text = reply.text.strip()
+            self.history.append(ChatMessage(role="assistant", content=assistant_text))
 
         overlap = 0.0
         if conclusion:
@@ -1512,9 +1904,12 @@ class RecursiveConclusionSession:
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "due_deferred_intents": due_payloads,
             "deferred_intent_actions": list(action_map.values()),
+            "deferred_intent_backend": self.config.deferred_intent_backend.value,
             "deferred_intent_latent_injection": self.config.deferred_intent_latent_injection.value,
             "deferred_intent_ablation": self.config.deferred_intent_ablation.value,
             "deferred_intent_ablation_actions": ablation_actions,
+            "inband_state": inband_state,
+            "inband_state_error": inband_state_error,
             "system_prompt": system_prompt,
             "usage": reply.usage,
             "finish_reason": reply.finish_reason,
@@ -1579,6 +1974,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         deferred_intent_offset=args.deferred_intent_offset,
         deferred_intent_grace=args.deferred_intent_grace,
         deferred_intent_limit=args.deferred_intent_limit,
+        deferred_intent_backend=DeferredIntentBackend(args.deferred_intent_backend),
         deferred_intent_latent_injection=DeferredIntentLatentInjection(
             args.deferred_intent_latent_injection
         ),
@@ -1768,6 +2164,15 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=6,
             help="Maximum number of simultaneously active deferred intents.",
+        )
+        p.add_argument(
+            "--deferred-intent-backend",
+            choices=[m.value for m in DeferredIntentBackend],
+            default=DeferredIntentBackend.EXTERNAL.value,
+            help=(
+                "Deferred-intent backend: 'external' uses explicit planner/scheduler probes; "
+                "'inband' stores state in a hidden RCL_STATE block carried in the dialogue."
+            ),
         )
         p.add_argument(
             "--deferred-intent-latent-injection",
