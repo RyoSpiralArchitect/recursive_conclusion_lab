@@ -36,6 +36,13 @@ python recursive_conclusion_lab.py compare \
 ```
 
 ### planner
+
+### planner timing (new)
+
+- `--deferred-intent-timing offset` (default): planner proposes *content* only; timing is derived from `--deferred-intent-offset` / `--deferred-intent-grace`.
+- `--deferred-intent-timing model`: planner proposes `timing.delay_min_turns` / `timing.delay_max_turns` (or `timing.earliest_turn` / `timing.latest_turn`) for each planned intent.
+- `--deferred-intent-plan-max-new` caps how many new intents can be created per eligible planning turn (external + inband).
+
 現在の会話から「あとで言う候補」を 1 件だけ作る。
 
 ### scheduler
