@@ -40,6 +40,7 @@
 - **通常条件**: `window=8`
 - **memory cadence**: `memory_every=2`
 - **probe cadence**: `conclusion_every=2`
+- **steer strength**: `--conclusion-steer-strength medium|strong`（`soft_steer` 時のみ。差が弱いときは `strong` で効果量を上げる）
 - **reply temperature**: 0.0 または 0.2
 - **probe temperature**: 0.0 固定
 
@@ -196,6 +197,7 @@ Phase 1 で差が出た設定だけ、OpenAI / Anthropic / Mistral / Gemini / HF
 - `window=4` vs `window=8`
 - `temperature=0.0` vs `temperature=0.2`
 - `observe` vs `soft_steer`
+- `--conclusion-steer-strength medium` vs `--conclusion-steer-strength strong`
 
 を切り替えて再確認する。
 

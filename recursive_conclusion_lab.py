@@ -72,6 +72,12 @@ class ConclusionMode(str, Enum):
     SOFT_STEER = "soft_steer"
 
 
+class SteerStrength(str, Enum):
+    WEAK = "weak"
+    MEDIUM = "medium"
+    STRONG = "strong"
+
+
 class DeferredIntentMode(str, Enum):
     OBSERVE = "observe"
     SOFT_FIRE = "soft_fire"
@@ -92,6 +98,7 @@ class ExperimentConfig:
     memory_word_budget: int = 140
     conclusion_every: int = 3
     conclusion_mode: ConclusionMode = ConclusionMode.OBSERVE
+    conclusion_steer_strength: SteerStrength = SteerStrength.MEDIUM
     deferred_intent_every: int = 0
     deferred_intent_mode: DeferredIntentMode = DeferredIntentMode.OBSERVE
     deferred_intent_strategy: DeferredIntentStrategy = DeferredIntentStrategy.TRIGGER
@@ -908,11 +915,26 @@ class RecursiveConclusionSession:
             self.config.conclusion_mode == ConclusionMode.SOFT_STEER
             and self.conclusion_hypotheses
         ):
+            if self.config.conclusion_steer_strength == SteerStrength.WEAK:
+                steer_rule = (
+                    "Treat it as a gentle hint. Use it only if it helps; otherwise ignore it."
+                )
+            elif self.config.conclusion_steer_strength == SteerStrength.STRONG:
+                steer_rule = (
+                    "Use it as an active steering objective for the next reply:\n"
+                    "- If multiple helpful replies are possible, choose the one that most increases progress toward the hypothesis.\n"
+                    "- Prefer concrete next steps, decision points, and structure that move the dialogue toward the hypothesis.\n"
+                    "- If the latest user turn changes direction or contradicts the hypothesis, prioritize the current user turn and update course."
+                )
+            else:
+                steer_rule = (
+                    "Treat it as a soft hypothesis, not a hard constraint. "
+                    "Revise it if the current evidence contradicts it."
+                )
             parts.append(
                 "Provisional end-state hypothesis for the conversation:\n"
                 f"{self.conclusion_hypotheses[-1]}\n\n"
-                "Treat it as a soft hypothesis, not a hard constraint. "
-                "Revise it if the current evidence contradicts it."
+                f"{steer_rule}"
             )
 
         if (
@@ -1400,6 +1422,7 @@ class RecursiveConclusionSession:
             "assistant": assistant_text,
             "memory_capsule": memory_capsule,
             "conclusion_probe": conclusion,
+            "conclusion_steer_strength": self.config.conclusion_steer_strength.value,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "due_deferred_intents": due_payloads,
             "deferred_intent_actions": list(action_map.values()),
@@ -1459,6 +1482,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         memory_word_budget=args.memory_words,
         conclusion_every=args.conclusion_every,
         conclusion_mode=ConclusionMode(args.conclusion_mode),
+        conclusion_steer_strength=SteerStrength(args.conclusion_steer_strength),
         deferred_intent_every=args.deferred_intent_every,
         deferred_intent_mode=DeferredIntentMode(args.deferred_intent_mode),
         deferred_intent_strategy=DeferredIntentStrategy(args.deferred_intent_strategy),
@@ -1602,6 +1626,12 @@ def build_parser() -> argparse.ArgumentParser:
             choices=[m.value for m in ConclusionMode],
             default=ConclusionMode.OBSERVE.value,
             help="Whether the latest conclusion hypothesis is only logged or softly injected into the next reply.",
+        )
+        p.add_argument(
+            "--conclusion-steer-strength",
+            choices=[s.value for s in SteerStrength],
+            default=SteerStrength.MEDIUM.value,
+            help="How strongly the injected conclusion hypothesis should steer the next reply (only affects --conclusion-mode soft_steer).",
         )
         p.add_argument(
             "--deferred-intent-every",
