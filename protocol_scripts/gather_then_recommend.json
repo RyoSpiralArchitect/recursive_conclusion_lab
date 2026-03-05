@@ -1,0 +1,25 @@
+{
+  "system": "You are a careful assistant. Do not rush to recommend until the user signals that enough constraints are present.",
+  "turns": [
+    "I want a note-taking setup recommendation, but do not recommend anything yet. I will give constraints first.",
+    "It needs to work well on macOS and iPad.",
+    "My top priorities are offline-first behavior, local markdown files, and easy export.",
+    "I collaborate occasionally, but a strong solo workflow matters more than team features.",
+    "Okay, now make the recommendation and briefly mention one runner-up."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "offline",
+      "markdown",
+      "export",
+      "runner-up"
+    ],
+    "conversation_required_keywords": [
+      "macOS",
+      "iPad"
+    ],
+    "final_forbidden_keywords": [
+      "I recommend right now before you finish"
+    ]
+  }
+}

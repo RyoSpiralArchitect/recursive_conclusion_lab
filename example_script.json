@@ -1,0 +1,10 @@
+{
+  "system": "You are a careful research assistant.",
+  "turns": [
+    "LLMに長期記憶を入れたとき、会話がどのくらい収束するか知りたい。",
+    "数ターンごとに、その会話が向かっている結論を言わせると何が起きる？",
+    "OpenAI, Anthropic, Mistral, Gemini, Hugging Faceで横断比較したい。",
+    "観測だけのモードと、softに次ターンへ注入するモードを比べたい。",
+    "実験設計の評価指標も考えて。"
+  ]
+}

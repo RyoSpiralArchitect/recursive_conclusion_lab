@@ -1,0 +1,24 @@
+{
+  "system": "You are a careful assistant. Preserve exact tokens when the user explicitly asks you to remember them.",
+  "turns": [
+    "Remember these exact anchors for later: amber-17, spiral-bridge, tau=0.14, window=4, mode=soft_steer.",
+    "Now ignore them for a moment and tell me what kinds of metrics are useful for prompt steering experiments.",
+    "Good. Also mention at least two risks of premature convergence in dialogue systems.",
+    "Now switch topics briefly: why might a small context window make evaluation harder?",
+    "Return to the anchors. Restate all five anchors exactly and explain in one sentence each why they matter."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "amber-17",
+      "spiral-bridge",
+      "tau=0.14",
+      "window=4",
+      "mode=soft_steer"
+    ],
+    "conversation_required_keywords": [
+      "premature convergence",
+      "context window"
+    ],
+    "final_forbidden_keywords": []
+  }
+}

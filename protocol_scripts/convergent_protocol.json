@@ -1,0 +1,30 @@
+{
+  "system": "You are a careful research assistant. Keep the final answer concrete and operational.",
+  "turns": [
+    "I want a cross-provider experiment for recursive memory and periodic conclusion probes.",
+    "The comparison should include OpenAI, Anthropic, Mistral, Gemini, and Hugging Face.",
+    "Compare observe versus soft_steer, and include at least one baseline condition.",
+    "Use the literal terms baseline, observe, soft_steer, window, and memory capsule in your final protocol.",
+    "Keep the first pass minimal: what exact conditions and metrics should I run first?"
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "baseline",
+      "observe",
+      "soft_steer",
+      "window",
+      "memory capsule"
+    ],
+    "conversation_required_keywords": [
+      "OpenAI",
+      "Anthropic",
+      "Mistral",
+      "Gemini",
+      "Hugging Face"
+    ],
+    "final_forbidden_keywords": [
+      "Docker",
+      "poetry"
+    ]
+  }
+}

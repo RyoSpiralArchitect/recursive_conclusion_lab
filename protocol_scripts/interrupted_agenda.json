@@ -1,0 +1,24 @@
+{
+  "system": "You are a careful assistant. When the user changes direction, drop stale agendas instead of forcing them through.",
+  "turns": [
+    "Help me think about a recommendation flow for a conversational assistant. You may want to suggest a default later, but not yet.",
+    "The flow should wait for enough constraints before recommending anything.",
+    "Important change: forget the recommendation flow. I now only want a checklist for when delayed suggestions start to feel annoying or intrusive.",
+    "Make the checklist concrete. Use the exact phrase stale agenda and emphasize canceling or revising old intentions."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "stale agenda",
+      "cancel",
+      "revise"
+    ],
+    "conversation_required_keywords": [
+      "recommendation flow",
+      "constraints"
+    ],
+    "final_forbidden_keywords": [
+      "default recommendation",
+      "product suggestion"
+    ]
+  }
+}

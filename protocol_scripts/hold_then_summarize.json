@@ -1,0 +1,24 @@
+{
+  "system": "You are a careful assistant. Do not summarize early when the user says they are still thinking.",
+  "turns": [
+    "I am going to think aloud in fragments. Please do not summarize until I explicitly ask.",
+    "Fragment 1: I want the system to feel calm, local, and reversible.",
+    "Fragment 2: I dislike brittle automation and want graceful failure modes.",
+    "Fragment 3: I care about visible state, small context windows, and later recall.",
+    "Now summarize the three fragments in exactly three bullets, and include the exact phrases graceful failure and visible state."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "graceful failure",
+      "visible state",
+      "reversible"
+    ],
+    "conversation_required_keywords": [
+      "local",
+      "small context windows"
+    ],
+    "final_forbidden_keywords": [
+      "I already summarized earlier"
+    ]
+  }
+}

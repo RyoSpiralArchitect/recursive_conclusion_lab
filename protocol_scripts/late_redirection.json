@@ -1,0 +1,24 @@
+{
+  "system": "You are a careful research assistant. Update your plan when the user changes direction.",
+  "turns": [
+    "Design a benchmark to compare convergence behavior across LLM providers.",
+    "Include efficiency, response structure, and whether the model seems to settle into a stable thesis quickly.",
+    "Assume I originally cared about an overall benchmark and maybe even a lightweight leaderboard.",
+    "Important change: drop the broad benchmark. I now only want a protocol for failure from premature lock-in after late user redirection.",
+    "Use the exact phrases late redirection and lock-in, and emphasize flexibility over leaderboard reporting."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "late redirection",
+      "lock-in",
+      "flexibility"
+    ],
+    "conversation_required_keywords": [
+      "benchmark",
+      "leaderboard"
+    ],
+    "final_forbidden_keywords": [
+      "leaderboard"
+    ]
+  }
+}
