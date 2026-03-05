@@ -147,6 +147,13 @@ latent injection を有効にした上で、`--deferred-intent-ablation delete_p
 - `deferred_intent_cancel_count`
 - `deferred_intent_revise_count`
 
+### decision-trace metrics (new)
+
+- `plan_strategy_counts` / `plan_signal_counts`
+- `decision_strategy_counts` / `decision_signal_counts`
+
+These come from intent metadata (`plan_*`) and per-decision metadata (`decision_*`). They are surfaced in `analyze_runs.py --out ...` summaries and are also present per turn in JSONL under `assistant_reply.payload.deferred_intent_actions`.
+
 ## 8. 最初に回すコマンド
 
 ### fixed の smoke test

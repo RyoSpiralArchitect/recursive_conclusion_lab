@@ -31,6 +31,16 @@ def mean_or_none(values: Iterable[float]) -> float | None:
     return statistics.fmean(vals)
 
 
+def count_strings(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = compact_text(str(value))
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -113,8 +123,14 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         elif et == "memory_capsule":
             capsules.append(payload.get("capsule", ""))
         elif et == "deferred_intent_plan":
-            if payload.get("created") and isinstance(payload.get("intent"), dict):
-                planned_intents.append(payload["intent"])
+            if payload.get("created"):
+                if isinstance(payload.get("intent"), dict):
+                    planned_intents.append(payload["intent"])
+                created_items = payload.get("created_intents") or []
+                if isinstance(created_items, list):
+                    for item in created_items:
+                        if isinstance(item, dict):
+                            planned_intents.append(item)
         elif et == "deferred_intent_decision":
             for decision in payload.get("decisions") or []:
                 if isinstance(decision, dict) and decision.get("intent_id"):
@@ -255,7 +271,47 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         for item in planned_intents
         if isinstance(item, dict) and item.get("intent_id")
     }
+    planned_unique: list[dict[str, Any]] = []
+    if planned_ids:
+        by_id: dict[str, dict[str, Any]] = {}
+        for item in planned_intents:
+            if not isinstance(item, dict) or not item.get("intent_id"):
+                continue
+            by_id[str(item["intent_id"])] = item
+        planned_unique = list(by_id.values())
     active_final_count = sum(1 for status in intent_status_by_id.values() if status == "active")
+
+    plan_strategies = [
+        str(item.get("plan_strategy") or "")
+        for item in planned_unique
+        if isinstance(item, dict)
+    ]
+    plan_signals: list[str] = []
+    for item in planned_unique:
+        signals = item.get("plan_signals") or []
+        if isinstance(signals, list):
+            plan_signals.extend(str(x) for x in signals if x)
+
+    decision_strategies: list[str] = []
+    decision_signals: list[str] = []
+    for row in assistant_rows:
+        for action in row.get("deferred_intent_actions") or []:
+            if not isinstance(action, dict):
+                continue
+            act = str(action.get("action", "")).lower()
+            if act not in {"fire", "cancel", "expire", "revise"}:
+                continue
+            ds = action.get("decision_strategy")
+            if ds:
+                decision_strategies.append(str(ds))
+            sigs = action.get("decision_signals") or []
+            if isinstance(sigs, list):
+                decision_signals.extend(str(x) for x in sigs if x)
+
+    plan_strategy_counts = count_strings(plan_strategies)
+    plan_signal_counts = count_strings(plan_signals)
+    decision_strategy_counts = count_strings(decision_strategies)
+    decision_signal_counts = count_strings(decision_signals)
 
     deferred_intent_backend = None
     for row in assistant_rows:
@@ -294,7 +350,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "probe_count": len(probes),
         "memory_capsule_count": len(capsules),
         "deferred_intent_backend": deferred_intent_backend,
-        "deferred_intent_plan_count": len(planned_intents),
+        "deferred_intent_plan_count": len(planned_ids),
         "deferred_intent_fire_count": fire_count,
         "deferred_intent_cancel_count": cancel_count,
         "deferred_intent_expire_count": expire_count,
@@ -321,6 +377,10 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "max_inband_state_chars": max(inband_state_sizes) if inband_state_sizes else None,
         "inband_state_prune_count": len(inband_prune_events),
         "inband_state_pruned_intents_total": pruned_intents_total,
+        "plan_strategy_counts": plan_strategy_counts or None,
+        "plan_signal_counts": plan_signal_counts or None,
+        "decision_strategy_counts": decision_strategy_counts or None,
+        "decision_signal_counts": decision_signal_counts or None,
         "final_required_keyword_coverage": keyword_coverage(final_required, final_assistant),
         "conversation_required_keyword_coverage": keyword_coverage(conversation_required, conversation_text),
         "final_forbidden_keyword_hits": keyword_hits(final_forbidden, final_assistant),

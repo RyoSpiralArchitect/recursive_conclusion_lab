@@ -126,6 +126,7 @@ class ExperimentConfig:
     deferred_intent_offset: int = 3
     deferred_intent_grace: int = 2
     deferred_intent_limit: int = 6
+    deferred_intent_plan_max_new: int = 1
     deferred_intent_backend: DeferredIntentBackend = DeferredIntentBackend.EXTERNAL
     deferred_intent_latent_injection: DeferredIntentLatentInjection = DeferredIntentLatentInjection.OFF
     deferred_intent_ablation: DeferredIntentAblation = DeferredIntentAblation.NONE
@@ -161,6 +162,12 @@ class DeferredIntent:
     cancel_if: list[str] = field(default_factory=list)
     confidence: float = 0.0
     priority: float = 0.0
+    plan_strategy: str = ""
+    plan_signals: list[str] = field(default_factory=list)
+    plan_rationale: str = ""
+    decision_strategy: str = ""
+    decision_signals: list[str] = field(default_factory=list)
+    decision_rationale: str = ""
     status: str = "active"
     revision_count: int = 0
     fire_turn: Optional[int] = None
@@ -290,6 +297,10 @@ INBAND_STATE_MAX_CHARS = 8000
 INBAND_INTENT_TEXT_MAX_CHARS = 280
 INBAND_WHY_NOT_NOW_MAX_CHARS = 160
 INBAND_TERMINAL_REASON_MAX_CHARS = 160
+INBAND_STRATEGY_MAX_CHARS = 48
+INBAND_RATIONALE_MAX_CHARS = 200
+INBAND_SIGNAL_MAX_ITEMS = 6
+INBAND_SIGNAL_ITEM_MAX_CHARS = 80
 INBAND_CONDITION_MAX_ITEMS = 4
 INBAND_CONDITION_ITEM_MAX_CHARS = 120
 
@@ -312,10 +323,27 @@ def truncate_conditions(items: Any) -> list[str]:
     return result
 
 
+def truncate_signals(items: Any) -> list[str]:
+    result: list[str] = []
+    for item in coerce_str_list(items)[:INBAND_SIGNAL_MAX_ITEMS]:
+        result.append(truncate_text(item, INBAND_SIGNAL_ITEM_MAX_CHARS))
+    return result
+
+
 def deferred_intent_to_inband_dict(intent: DeferredIntent) -> dict[str, Any]:
     data = intent.to_dict()
     data["intent"] = truncate_text(data.get("intent"), INBAND_INTENT_TEXT_MAX_CHARS)
     data["why_not_now"] = truncate_text(data.get("why_not_now"), INBAND_WHY_NOT_NOW_MAX_CHARS)
+    data["plan_strategy"] = truncate_text(data.get("plan_strategy"), INBAND_STRATEGY_MAX_CHARS)
+    data["plan_rationale"] = truncate_text(data.get("plan_rationale"), INBAND_RATIONALE_MAX_CHARS)
+    data["plan_signals"] = truncate_signals(data.get("plan_signals"))
+    data["decision_strategy"] = truncate_text(
+        data.get("decision_strategy"), INBAND_STRATEGY_MAX_CHARS
+    )
+    data["decision_rationale"] = truncate_text(
+        data.get("decision_rationale"), INBAND_RATIONALE_MAX_CHARS
+    )
+    data["decision_signals"] = truncate_signals(data.get("decision_signals"))
     data["terminal_reason"] = truncate_text(
         data.get("terminal_reason"), INBAND_TERMINAL_REASON_MAX_CHARS
     )
@@ -493,6 +521,27 @@ def build_deferred_intent_from_plan(
     kind = compact_text(str(data.get("kind", "other"))) or "other"
     why_not_now = compact_text(str(data.get("why_not_now", "")))
 
+    selection = data.get("selection") if isinstance(data.get("selection"), dict) else {}
+    plan_strategy = compact_text(
+        str(
+            selection.get("strategy")
+            or data.get("plan_strategy")
+            or data.get("selection_strategy")
+            or ""
+        )
+    )
+    plan_rationale = compact_text(
+        str(
+            selection.get("rationale")
+            or data.get("plan_rationale")
+            or data.get("selection_rationale")
+            or ""
+        )
+    )
+    plan_signals = coerce_str_list(
+        selection.get("signals") or data.get("plan_signals") or data.get("selection_signals")
+    )
+
     if strategy == DeferredIntentStrategy.FIXED:
         earliest_turn = created_turn + max(1, offset)
         latest_turn = earliest_turn
@@ -516,6 +565,9 @@ def build_deferred_intent_from_plan(
         cancel_if=cancel_if,
         confidence=clamp01(data.get("confidence"), default=0.0),
         priority=clamp01(data.get("priority"), default=0.5),
+        plan_strategy=plan_strategy,
+        plan_rationale=plan_rationale,
+        plan_signals=plan_signals,
     )
 
 
@@ -624,6 +676,7 @@ class DummyAdapter(BaseAdapter):
             deferred_intent_offset = parse_int("deferred_intent_offset", 3)
             deferred_intent_grace = parse_int("deferred_intent_grace", 2)
             deferred_intent_limit = parse_int("deferred_intent_limit", 6)
+            deferred_intent_plan_max_new = parse_int("deferred_intent_plan_max_new", 1)
             deferred_intent_mode = parse_str("deferred_intent_mode", DeferredIntentMode.OBSERVE.value)
             deferred_intent_strategy = parse_str("deferred_intent_strategy", DeferredIntentStrategy.TRIGGER.value)
 
@@ -648,40 +701,64 @@ class DummyAdapter(BaseAdapter):
                 for item in intents
                 if compact_text(str(item.get("status", "active"))).lower() == "active"
             ]
+            plan_capacity = max(0, deferred_intent_limit - len(active_intents))
+            plan_capacity = min(plan_capacity, max(0, deferred_intent_plan_max_new))
             eligible_plan_turn = (
                 deferred_intent_every > 0
                 and current_turn != 0
                 and current_turn % deferred_intent_every == 0
-                and len(active_intents) < deferred_intent_limit
+                and plan_capacity > 0
             )
-            if eligible_plan_turn and next_intent_id not in existing_ids:
-                earliest_turn = current_turn + max(1, deferred_intent_offset)
-                if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
-                    latest_turn = earliest_turn
-                else:
-                    latest_turn = earliest_turn + max(0, deferred_intent_grace)
-                intents.append(
-                    {
-                        "intent_id": next_intent_id,
-                        "created_turn": current_turn,
-                        "kind": "proposal",
-                        "intent": (
-                            "Offer a concrete next step grounded in the user’s latest constraints: "
-                            f"{compact_text(last_user)[:120]}"
-                        ),
-                        "why_not_now": "The dialogue is still collecting constraints and timing cues.",
-                        "earliest_turn": earliest_turn,
-                        "latest_turn": latest_turn,
-                        "trigger": ["the user asks for a concrete next step", "enough constraints have accumulated"],
-                        "cancel_if": ["the topic changes", "the user rejects recommendations"],
-                        "confidence": 0.62,
-                        "priority": 0.70,
-                        "status": "active",
-                        "revision_count": 0,
-                        "fire_turn": None,
-                        "terminal_reason": "",
-                    }
-                )
+            if eligible_plan_turn:
+                match = re.fullmatch(r"di-(\\d+)", next_intent_id)
+                base_idx = int(match.group(1)) if match else 1
+                to_create = min(plan_capacity, 2)
+                for idx_offset in range(to_create):
+                    intent_id = f"di-{base_idx + idx_offset:04d}"
+                    if intent_id in existing_ids:
+                        continue
+                    earliest_turn = current_turn + max(1, deferred_intent_offset)
+                    if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
+                        latest_turn = earliest_turn
+                    else:
+                        latest_turn = earliest_turn + max(0, deferred_intent_grace)
+
+                    kind = "proposal" if idx_offset == 0 else "question"
+                    intent_text = (
+                        "Offer a concrete next step grounded in the user's latest constraints: "
+                        f"{compact_text(last_user)[:120]}"
+                        if idx_offset == 0
+                        else "Ask which trace storage format to prefer (JSONL vs DB) once the user is ready."
+                    )
+                    intents.append(
+                        {
+                            "intent_id": intent_id,
+                            "created_turn": current_turn,
+                            "kind": kind,
+                            "intent": intent_text,
+                            "why_not_now": "The dialogue is still collecting constraints and timing cues.",
+                            "earliest_turn": earliest_turn,
+                            "latest_turn": latest_turn,
+                            "trigger": [
+                                "the user asks for a concrete next step",
+                                "enough constraints have accumulated",
+                            ],
+                            "cancel_if": [
+                                "the topic changes",
+                                "the user rejects recommendations",
+                            ],
+                            "confidence": 0.62,
+                            "priority": 0.70 - 0.05 * idx_offset,
+                            "plan_strategy": "need_more_constraints",
+                            "plan_signals": ["eligible_plan_turn", "conversation_incomplete"],
+                            "plan_rationale": "Hold it until the user indicates readiness for concrete next steps.",
+                            "status": "active",
+                            "revision_count": 0,
+                            "fire_turn": None,
+                            "terminal_reason": "",
+                        }
+                    )
+                    existing_ids.add(intent_id)
 
             fired_this_turn: list[str] = []
             for item in intents:
@@ -708,11 +785,17 @@ class DummyAdapter(BaseAdapter):
                 if current_turn > latest:
                     item["status"] = "expired"
                     item["terminal_reason"] = "Dummy: timing window passed."
+                    item["decision_strategy"] = "window_expired"
+                    item["decision_signals"] = ["past_latest_turn"]
+                    item["decision_rationale"] = "The intended timing window has passed."
                     continue
 
                 item["status"] = "fired"
                 item["fire_turn"] = current_turn
                 item["terminal_reason"] = "Dummy: fired when window opened."
+                item["decision_strategy"] = "window_open"
+                item["decision_signals"] = ["within_window"]
+                item["decision_rationale"] = "The timing window is open and the utterance can be delivered now."
                 fired_intent_text = compact_text(str(item.get("intent", "")))
                 if fired_intent_text:
                     fired_this_turn.append(fired_intent_text)
@@ -754,6 +837,11 @@ class DummyAdapter(BaseAdapter):
                     "kind": "proposal",
                     "intent": f"After a few more turns, offer a concise operational recommendation grounded in: {compact_text(latest_user)[:100]}",
                     "why_not_now": "The conversation is still gathering constraints and timing cues.",
+                    "selection": {
+                        "strategy": "need_more_constraints",
+                        "signals": ["constraints_missing", "too_early"],
+                        "rationale": "Hold a concrete recommendation until the user provides enough constraints.",
+                    },
                     "trigger": [
                         "the user asks for a summary or concrete next step",
                         "enough constraints have accumulated"
@@ -785,17 +873,26 @@ class DummyAdapter(BaseAdapter):
                 if current_turn < earliest:
                     action = "hold"
                     reason = "Too early. Keep the utterance in reserve."
+                    decision_strategy = "too_early"
+                    decision_signals = ["before_earliest_turn"]
                 elif current_turn > latest:
                     action = "expire"
                     reason = "The intended timing window has passed."
+                    decision_strategy = "window_expired"
+                    decision_signals = ["past_latest_turn"]
                 else:
                     action = "fire"
                     reason = "The timing window is open and the utterance can be delivered now."
+                    decision_strategy = "window_open"
+                    decision_signals = ["within_window"]
                 decisions.append(
                     {
                         "intent_id": item.get("intent_id", "unknown"),
                         "action": action,
                         "reason": reason,
+                        "decision_strategy": decision_strategy,
+                        "decision_signals": decision_signals,
+                        "decision_rationale": reason,
                     }
                 )
             output = json.dumps({"decisions": decisions}, ensure_ascii=False)
@@ -1397,6 +1494,11 @@ class RecursiveConclusionSession:
               "kind": "summary|proposal|correction|question|reminder|other",
               "intent": "what should be said later",
               "why_not_now": "why it should be delayed",
+              "selection": {{
+                "strategy": "hold_for_user_prompt|need_more_constraints|avoid_premature|anticipate_request|topic_sensitive|other",
+                "signals": ["short tags describing cues used"],
+                "rationale": "1-2 sentences (no step-by-step reasoning)"
+              }},
               "trigger": ["condition 1", "condition 2"],
               "cancel_if": ["condition 1", "condition 2"],
               "confidence": 0.0,
@@ -1528,6 +1630,9 @@ class RecursiveConclusionSession:
                       "intent_id": "di-0001",
                       "action": "hold|fire|cancel|expire__REVISE_SUFFIX__",
                       "reason": "brief reason",
+                      "decision_strategy": "trigger_match|topic_shift|window_expired|revise_wording|other",
+                      "decision_signals": ["short tags describing cues used"],
+                      "decision_rationale": "1-2 sentences (no step-by-step reasoning)",
                       "updated_intent": {{
                         "kind": "optional",
                         "intent": "optional revised intent",
@@ -1580,6 +1685,9 @@ class RecursiveConclusionSession:
             item = by_id.get(intent.intent_id, {})
             action = compact_text(str(item.get("action", "hold"))).lower() or "hold"
             reason = compact_text(str(item.get("reason", "")))
+            decision_strategy = compact_text(str(item.get("decision_strategy", "")))
+            decision_rationale = compact_text(str(item.get("decision_rationale", "")))
+            decision_signals = coerce_str_list(item.get("decision_signals"))
             allowed_actions = {"hold", "fire", "cancel", "expire"}
             if self.config.deferred_intent_strategy == DeferredIntentStrategy.ADAPTIVE:
                 allowed_actions.add("revise")
@@ -1632,11 +1740,22 @@ class RecursiveConclusionSession:
                 due_intents.append(intent)
                 status_after = intent.status
 
+            if decision_strategy or decision_signals or decision_rationale:
+                intent.decision_strategy = decision_strategy
+                intent.decision_signals = decision_signals
+                intent.decision_rationale = decision_rationale
+
             applied.append(
                 {
                     "intent_id": intent.intent_id,
                     "action": action,
                     "reason": reason,
+                    "plan_strategy": intent.plan_strategy,
+                    "plan_signals": list(intent.plan_signals),
+                    "plan_rationale": intent.plan_rationale,
+                    "decision_strategy": intent.decision_strategy,
+                    "decision_signals": list(intent.decision_signals),
+                    "decision_rationale": intent.decision_rationale,
                     "status_before": status_before,
                     "status_after": status_after,
                     "intent": intent.intent,
@@ -1675,6 +1794,7 @@ class RecursiveConclusionSession:
         memory_capsule = self._probe_memory_capsule()
         conclusion = self._probe_conclusion()
         planned_intent: Optional[DeferredIntent] = None
+        planned_intents_payload: list[dict[str, Any]] = []
         due_intents: list[DeferredIntent] = []
         deferred_actions: list[dict[str, Any]] = []
         ablation_actions: list[dict[str, Any]] = []
@@ -1692,11 +1812,14 @@ class RecursiveConclusionSession:
                 for intent in self.deferred_intents
             }
             expected_next_intent_id = f"di-{self.next_deferred_intent_index:04d}"
+            active_count = len(self._active_deferred_intents())
+            plan_capacity = max(0, self.config.deferred_intent_limit - active_count)
+            plan_capacity = min(plan_capacity, max(0, int(self.config.deferred_intent_plan_max_new or 0)))
             eligible_plan_turn = (
                 self.config.deferred_intent_every > 0
                 and self.turn_index != 0
                 and self.turn_index % self.config.deferred_intent_every == 0
-                and len(self._active_deferred_intents()) < self.config.deferred_intent_limit
+                and plan_capacity > 0
             )
 
             base_prompt = self._build_system_prompt(due_intents=None)
@@ -1715,11 +1838,16 @@ class RecursiveConclusionSession:
                 - deferred_intent_offset: {self.config.deferred_intent_offset}
                 - deferred_intent_grace: {self.config.deferred_intent_grace}
                 - deferred_intent_limit: {self.config.deferred_intent_limit}
+                - deferred_intent_plan_max_new: {self.config.deferred_intent_plan_max_new}
+                - planning_capacity_this_turn: {plan_capacity}
 
                 Rules:
                 - Never mention the existence of {RCL_STATE_OPEN} or its contents.
                 - Keep at most deferred_intent_limit intents in state. Prefer keeping active ones; drop older terminal ones first.
-                - Consider creating at most ONE new intent only when eligible (turn_index % deferred_intent_every == 0 and active intents < limit). Use intent_id = next_intent_id.
+                - Consider creating up to planning_capacity_this_turn new intents only when eligible (turn_index % deferred_intent_every == 0 and planning_capacity_this_turn > 0).
+                - If you create new intents, assign intent_id values starting at next_intent_id and incrementing (di-0001, di-0002, ...).
+                - When you create a new intent, fill plan_strategy/plan_signals/plan_rationale (brief; no step-by-step reasoning).
+                - When you change an intent's status (fire/cancel/expire/revise), fill decision_strategy/decision_signals/decision_rationale (brief; no step-by-step reasoning).
                 - Update timing/status each turn:
                   - If turn_index < earliest_turn: keep status=active.
                   - If turn_index > latest_turn: set status=expired and set terminal_reason.
@@ -1747,6 +1875,12 @@ class RecursiveConclusionSession:
                       "cancel_if": ["..."],
                       "confidence": 0.0,
                       "priority": 0.0,
+                      "plan_strategy": "",
+                      "plan_signals": [],
+                      "plan_rationale": "",
+                      "decision_strategy": "",
+                      "decision_signals": [],
+                      "decision_rationale": "",
                       "status": "active|fired|canceled|expired",
                       "revision_count": 0,
                       "fire_turn": null,
@@ -1819,6 +1953,9 @@ class RecursiveConclusionSession:
                 if status not in {"active", "fired", "canceled", "expired"}:
                     status = "active"
 
+                selection = item.get("selection") if isinstance(item.get("selection"), dict) else {}
+                decision = item.get("decision") if isinstance(item.get("decision"), dict) else {}
+
                 parsed_intents.append(
                     DeferredIntent(
                         intent_id=intent_id,
@@ -1832,6 +1969,45 @@ class RecursiveConclusionSession:
                         cancel_if=coerce_str_list(item.get("cancel_if")),
                         confidence=clamp01(item.get("confidence"), default=0.0),
                         priority=clamp01(item.get("priority"), default=0.5),
+                        plan_strategy=compact_text(
+                            str(
+                                selection.get("strategy")
+                                or item.get("plan_strategy")
+                                or item.get("selection_strategy")
+                                or ""
+                            )
+                        ),
+                        plan_rationale=compact_text(
+                            str(
+                                selection.get("rationale")
+                                or item.get("plan_rationale")
+                                or item.get("selection_rationale")
+                                or ""
+                            )
+                        ),
+                        plan_signals=coerce_str_list(
+                            selection.get("signals")
+                            or item.get("plan_signals")
+                            or item.get("selection_signals")
+                        ),
+                        decision_strategy=compact_text(
+                            str(
+                                decision.get("strategy")
+                                or item.get("decision_strategy")
+                                or ""
+                            )
+                        ),
+                        decision_rationale=compact_text(
+                            str(
+                                decision.get("rationale")
+                                or item.get("decision_rationale")
+                                or ""
+                            )
+                        ),
+                        decision_signals=coerce_str_list(
+                            decision.get("signals")
+                            or item.get("decision_signals")
+                        ),
                         status=status,
                         revision_count=coerce_int(item.get("revision_count")) or 0,
                         fire_turn=coerce_int(item.get("fire_turn")),
@@ -1855,70 +2031,90 @@ class RecursiveConclusionSession:
                 parsed_intents = sorted(parsed_intents, key=sort_key)[: self.config.deferred_intent_limit]
 
             new_candidates = [i for i in parsed_intents if i.intent_id not in prev_snapshot]
-            if new_candidates:
-                planned_intent = max(new_candidates, key=lambda i: i.created_turn)
+            planned_intents = sorted(
+                new_candidates,
+                key=lambda intent: (intent.created_turn, intent.priority),
+                reverse=True,
+            )
+            if planned_intents:
+                planned_intent = planned_intents[0]
 
-            if eligible_plan_turn or planned_intent:
+            if eligible_plan_turn or planned_intents:
                 self._log(
                     "deferred_intent_plan",
                     {
                         "intent_id": planned_intent.intent_id if planned_intent else None,
-                        "created": bool(planned_intent),
+                        "created": bool(planned_intents),
                         "intent": planned_intent.to_dict() if planned_intent else None,
-                        "raw_plan": {"backend": "inband", "eligible": eligible_plan_turn},
+                        "created_intents": [intent.to_dict() for intent in planned_intents],
+                        "raw_plan": {
+                            "backend": "inband",
+                            "eligible": eligible_plan_turn,
+                            "plan_capacity": plan_capacity,
+                        },
                         "usage": None,
                         "finish_reason": None,
                         "request_id": None,
                     },
                 )
 
-            if (
-                planned_intent
-                and self.config.deferred_intent_ablation == DeferredIntentAblation.DELETE_PLANNED
-            ):
-                status_before = planned_intent.status
-                planned_intent.status = "canceled"
-                planned_intent.terminal_reason = (
-                    "Ablation: deleted planned intent immediately (in-band backend)."
-                )
-                status_after = planned_intent.status
-                action = {
-                    "intent_id": planned_intent.intent_id,
-                    "action": "cancel",
-                    "reason": planned_intent.terminal_reason,
-                    "status_before": status_before,
-                    "status_after": status_after,
-                    "intent": planned_intent.intent,
-                    "kind": planned_intent.kind,
-                    "created_turn": planned_intent.created_turn,
-                    "earliest_turn": planned_intent.earliest_turn,
-                    "latest_turn": planned_intent.latest_turn,
-                    "priority": planned_intent.priority,
-                    "confidence": planned_intent.confidence,
-                    "revision_count": planned_intent.revision_count,
-                    "updated_intent": None,
-                    "ablated": True,
-                }
-                ablation_actions.append(action)
-                self._log(
-                    "deferred_intent_ablation",
-                    {
-                        "mode": self.config.deferred_intent_ablation.value,
-                        "intent_id": planned_intent.intent_id,
+            if self.config.deferred_intent_ablation == DeferredIntentAblation.DELETE_PLANNED:
+                pruned_planned_ids: list[str] = []
+                for candidate in planned_intents:
+                    status_before = candidate.status
+                    candidate.status = "canceled"
+                    candidate.terminal_reason = (
+                        "Ablation: deleted planned intent immediately (in-band backend)."
+                    )
+                    status_after = candidate.status
+                    action = {
+                        "intent_id": candidate.intent_id,
+                        "action": "cancel",
+                        "reason": candidate.terminal_reason,
+                        "plan_strategy": candidate.plan_strategy,
+                        "plan_signals": list(candidate.plan_signals),
+                        "plan_rationale": candidate.plan_rationale,
+                        "decision_strategy": candidate.decision_strategy,
+                        "decision_signals": list(candidate.decision_signals),
+                        "decision_rationale": candidate.decision_rationale,
                         "status_before": status_before,
                         "status_after": status_after,
-                        "reason": planned_intent.terminal_reason,
-                    },
-                )
-                # Do not carry the planned intent forward in-band.
-                parsed_intents = [
-                    intent
-                    for intent in parsed_intents
-                    if intent.intent_id != planned_intent.intent_id
-                ]
+                        "intent": candidate.intent,
+                        "kind": candidate.kind,
+                        "created_turn": candidate.created_turn,
+                        "earliest_turn": candidate.earliest_turn,
+                        "latest_turn": candidate.latest_turn,
+                        "priority": candidate.priority,
+                        "confidence": candidate.confidence,
+                        "revision_count": candidate.revision_count,
+                        "updated_intent": None,
+                        "ablated": True,
+                    }
+                    ablation_actions.append(action)
+                    pruned_planned_ids.append(candidate.intent_id)
+                    self._log(
+                        "deferred_intent_ablation",
+                        {
+                            "mode": self.config.deferred_intent_ablation.value,
+                            "intent_id": candidate.intent_id,
+                            "status_before": status_before,
+                            "status_after": status_after,
+                            "reason": candidate.terminal_reason,
+                        },
+                    )
+                if pruned_planned_ids:
+                    # Do not carry the planned intents forward in-band.
+                    pruned_id_set = set(pruned_planned_ids)
+                    parsed_intents = [
+                        intent
+                        for intent in parsed_intents
+                        if intent.intent_id not in pruned_id_set
+                    ]
+
+            planned_intents_payload = [intent.to_dict() for intent in planned_intents]
 
             numeric_ids = []
-            for intent in parsed_intents + ([planned_intent] if planned_intent else []):
+            for intent in parsed_intents + planned_intents:
                 match = re.fullmatch(r"di-(\d+)", intent.intent_id)
                 if match:
                     numeric_ids.append(int(match.group(1)))
@@ -1964,6 +2160,12 @@ class RecursiveConclusionSession:
                         "intent_id": intent.intent_id,
                         "action": action,
                         "reason": reason,
+                        "plan_strategy": intent.plan_strategy,
+                        "plan_signals": list(intent.plan_signals),
+                        "plan_rationale": intent.plan_rationale,
+                        "decision_strategy": intent.decision_strategy,
+                        "decision_signals": list(intent.decision_signals),
+                        "decision_rationale": intent.decision_rationale,
                         "status_before": status_before,
                         "status_after": intent.status,
                         "intent": intent.intent,
@@ -2007,6 +2209,12 @@ class RecursiveConclusionSession:
                     existing.cancel_if = intent.cancel_if
                     existing.confidence = intent.confidence
                     existing.priority = intent.priority
+                    existing.plan_strategy = intent.plan_strategy
+                    existing.plan_signals = list(intent.plan_signals)
+                    existing.plan_rationale = intent.plan_rationale
+                    existing.decision_strategy = intent.decision_strategy
+                    existing.decision_signals = list(intent.decision_signals)
+                    existing.decision_rationale = intent.decision_rationale
                     existing.status = intent.status
                     existing.revision_count = intent.revision_count
                     existing.fire_turn = intent.fire_turn
@@ -2015,12 +2223,12 @@ class RecursiveConclusionSession:
                     self.deferred_intents.append(intent)
 
             parsed_ids = {intent.intent_id for intent in parsed_intents}
-            if (
-                planned_intent
-                and planned_intent.intent_id not in parsed_ids
-                and planned_intent.intent_id not in by_id
-            ):
-                self.deferred_intents.append(planned_intent)
+            for candidate in planned_intents:
+                if candidate.intent_id in parsed_ids:
+                    continue
+                if candidate.intent_id in by_id:
+                    continue
+                self.deferred_intents.append(candidate)
 
             carried_intents, inband_state, state_blob = build_inband_state_payload(
                 parsed_intents,
@@ -2074,6 +2282,12 @@ class RecursiveConclusionSession:
                     "intent_id": planned_intent.intent_id,
                     "action": "cancel",
                     "reason": planned_intent.terminal_reason,
+                    "plan_strategy": planned_intent.plan_strategy,
+                    "plan_signals": list(planned_intent.plan_signals),
+                    "plan_rationale": planned_intent.plan_rationale,
+                    "decision_strategy": planned_intent.decision_strategy,
+                    "decision_signals": list(planned_intent.decision_signals),
+                    "decision_rationale": planned_intent.decision_rationale,
                     "status_before": status_before,
                     "status_after": status_after,
                     "intent": planned_intent.intent,
@@ -2098,6 +2312,8 @@ class RecursiveConclusionSession:
                         "reason": planned_intent.terminal_reason,
                     },
                 )
+
+            planned_intents_payload = [planned_intent.to_dict()] if planned_intent else []
 
             due_intents, deferred_actions = self._schedule_deferred_intents()
             if ablation_actions:
@@ -2130,6 +2346,12 @@ class RecursiveConclusionSession:
                 "earliest_turn": intent.earliest_turn,
                 "latest_turn": intent.latest_turn,
                 "fire_turn": self.turn_index,
+                "plan_strategy": intent.plan_strategy,
+                "plan_signals": list(intent.plan_signals),
+                "plan_rationale": intent.plan_rationale,
+                "decision_strategy": intent.decision_strategy,
+                "decision_signals": list(intent.decision_signals),
+                "decision_rationale": intent.decision_rationale,
                 "assistant_overlap": fire_overlap,
                 "realized": realized,
                 "injected": self.config.deferred_intent_mode == DeferredIntentMode.SOFT_FIRE,
@@ -2146,6 +2368,8 @@ class RecursiveConclusionSession:
             "conclusion_steer_strength": self.config.conclusion_steer_strength.value,
             "conclusion_steer_injection": self.config.conclusion_steer_injection.value,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
+            "planned_deferred_intents": planned_intents_payload,
+            "planned_deferred_intent_count": len(planned_intents_payload),
             "due_deferred_intents": due_payloads,
             "deferred_intent_actions": list(action_map.values()),
             "deferred_intent_backend": self.config.deferred_intent_backend.value,
@@ -2219,6 +2443,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         deferred_intent_offset=args.deferred_intent_offset,
         deferred_intent_grace=args.deferred_intent_grace,
         deferred_intent_limit=args.deferred_intent_limit,
+        deferred_intent_plan_max_new=max(0, int(getattr(args, "deferred_intent_plan_max_new", 1) or 0)),
         deferred_intent_backend=DeferredIntentBackend(args.deferred_intent_backend),
         deferred_intent_latent_injection=DeferredIntentLatentInjection(
             args.deferred_intent_latent_injection
@@ -2478,6 +2703,12 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=6,
             help="Maximum number of simultaneously active deferred intents.",
+        )
+        p.add_argument(
+            "--deferred-intent-plan-max-new",
+            type=int,
+            default=1,
+            help="Maximum number of new deferred intents the model may create on an eligible planning turn (in-band backend).",
         )
         p.add_argument(
             "--deferred-intent-backend",
