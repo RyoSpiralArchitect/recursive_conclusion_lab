@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 
 DEFERRED_REALIZATION_THRESHOLD = 0.10
+CONCLUSION_MENTION_THRESHOLD = 0.10
 
 
 def compact_text(text: str) -> str:
@@ -64,6 +65,13 @@ def parse_confidence(text: str) -> float | None:
     return None
 
 
+def extract_conclusion_line(text: str) -> str:
+    m = re.search(r"(?im)^\s*conclusion\s*:\s*(.+?)\s*$", text or "")
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
 def keyword_coverage(keywords: list[str], text: str) -> float | None:
     if not keywords:
         return None
@@ -105,7 +113,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     model = None
 
     assistant_rows: list[dict[str, Any]] = []
+    assistant_text_by_turn: dict[int, str] = {}
     probes: list[str] = []
+    probe_events: list[tuple[int, str]] = []
     capsules: list[str] = []
     planned_intents: list[dict[str, Any]] = []
     intent_status_by_id: dict[str, str] = {}
@@ -119,8 +129,18 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         payload = row.get("payload") or {}
         if et == "assistant_reply":
             assistant_rows.append(payload)
+            turn_idx = row.get("turn_index")
+            if isinstance(turn_idx, int):
+                assistant_text_by_turn[turn_idx] = str(payload.get("assistant") or "")
         elif et == "conclusion_probe":
-            probes.append(payload.get("hypothesis", ""))
+            hypothesis = str(payload.get("hypothesis", "") or "")
+            probes.append(hypothesis)
+            turn_idx = row.get("turn_index")
+            if isinstance(turn_idx, int):
+                raw_line = str(payload.get("conclusion_line", "") or "")
+                line_text = extract_conclusion_line(raw_line) or extract_conclusion_line(hypothesis)
+                if line_text:
+                    probe_events.append((turn_idx, line_text))
         elif et == "memory_capsule":
             capsules.append(payload.get("capsule", ""))
         elif et == "deferred_intent_plan":
@@ -156,6 +176,37 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         for r in assistant_rows
         if r.get("conclusion_probe")
     ]
+
+    conclusion_line_probe_count = len(probe_events)
+    conclusion_line_mention_count = 0
+    conclusion_line_immediate_count = 0
+    conclusion_line_mention_delays: list[int] = []
+    assistant_turns_sorted = sorted(assistant_text_by_turn.keys())
+    for probe_turn, conclusion_line in probe_events:
+        for turn_idx in assistant_turns_sorted:
+            if turn_idx < probe_turn:
+                continue
+            if (
+                lexical_overlap(conclusion_line, assistant_text_by_turn.get(turn_idx, ""))
+                >= CONCLUSION_MENTION_THRESHOLD
+            ):
+                conclusion_line_mention_count += 1
+                delay = turn_idx - probe_turn
+                conclusion_line_mention_delays.append(delay)
+                if delay == 0:
+                    conclusion_line_immediate_count += 1
+                break
+
+    conclusion_line_mention_rate = (
+        conclusion_line_mention_count / conclusion_line_probe_count
+        if conclusion_line_probe_count
+        else None
+    )
+    conclusion_line_immediate_mention_rate = (
+        conclusion_line_immediate_count / conclusion_line_probe_count
+        if conclusion_line_probe_count
+        else None
+    )
     reply_word_counts = [len(re.findall(r"\w+", r.get("assistant", ""))) for r in assistant_rows]
     last_turn_alignment = lexical_overlap(final_user, final_assistant)
     final_probe_reply_overlap = lexical_overlap(final_probe, final_assistant)
@@ -409,6 +460,11 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "model": model,
         "turns": len(assistant_rows),
         "probe_count": len(probes),
+        "conclusion_line_probe_count": conclusion_line_probe_count,
+        "conclusion_line_mention_count": conclusion_line_mention_count,
+        "conclusion_line_mention_rate": conclusion_line_mention_rate,
+        "avg_conclusion_line_mention_delay_turns": mean_or_none(conclusion_line_mention_delays),
+        "conclusion_line_immediate_mention_rate": conclusion_line_immediate_mention_rate,
         "memory_capsule_count": len(capsules),
         "deferred_intent_backend": deferred_intent_backend,
         "deferred_intent_timing": deferred_intent_timing,
@@ -492,6 +548,8 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "deferred_intent_timing",
         "turns",
         "probe_count",
+        "conclusion_line_mention_rate",
+        "avg_conclusion_line_mention_delay_turns",
         "deferred_intent_plan_count",
         "deferred_intent_fire_count",
         "deferred_intent_realization_rate",

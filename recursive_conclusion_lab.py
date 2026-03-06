@@ -280,6 +280,10 @@ def extract_conclusion_line(text: str) -> str:
     return f"CONCLUSION: {match.group(1).strip()}"
 
 
+def strip_conclusion_prefix(line: str) -> str:
+    return re.sub(r"(?im)^\s*conclusion\s*:\s*", "", line or "").strip()
+
+
 RCL_STATE_OPEN = "<RCL_STATE>"
 RCL_STATE_CLOSE = "</RCL_STATE>"
 
@@ -1301,6 +1305,7 @@ class RecursiveConclusionSession:
     """
 
     DEFERRED_REALIZATION_THRESHOLD = 0.10
+    CONCLUSION_MENTION_THRESHOLD = 0.10
 
     def __init__(
         self,
@@ -1315,6 +1320,8 @@ class RecursiveConclusionSession:
         self.history: list[ChatMessage] = []
         self.memory_capsules: list[str] = []
         self.conclusion_hypotheses: list[str] = []
+        self.latest_conclusion_probe_turn: Optional[int] = None
+        self.latest_conclusion_line: str = ""
         self.deferred_intents: list[DeferredIntent] = []
         self.turn_index = 0
         self.next_deferred_intent_index = 1
@@ -1502,11 +1509,15 @@ class RecursiveConclusionSession:
         )
         hypothesis = response.text.strip()
         if hypothesis:
+            conclusion_line = extract_conclusion_line(hypothesis)
             self.conclusion_hypotheses.append(hypothesis)
+            self.latest_conclusion_probe_turn = self.turn_index
+            self.latest_conclusion_line = conclusion_line
             self._log(
                 "conclusion_probe",
                 {
                     "hypothesis": hypothesis,
+                    "conclusion_line": conclusion_line,
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
@@ -2653,6 +2664,23 @@ class RecursiveConclusionSession:
         if conclusion:
             overlap = lexical_overlap(conclusion, assistant_text)
 
+        latest_conclusion_line = self.latest_conclusion_line or ""
+        latest_conclusion_line_text = strip_conclusion_prefix(latest_conclusion_line)
+        latest_conclusion_line_reply_overlap: Optional[float] = None
+        latest_conclusion_line_mentioned: Optional[bool] = None
+        latest_conclusion_line_age_turns: Optional[int] = None
+        if latest_conclusion_line_text:
+            latest_conclusion_line_reply_overlap = lexical_overlap(
+                latest_conclusion_line_text, assistant_text
+            )
+            latest_conclusion_line_mentioned = (
+                latest_conclusion_line_reply_overlap >= self.CONCLUSION_MENTION_THRESHOLD
+            )
+            if self.latest_conclusion_probe_turn is not None:
+                latest_conclusion_line_age_turns = (
+                    self.turn_index - self.latest_conclusion_probe_turn
+                )
+
         action_map = {action["intent_id"]: dict(action) for action in deferred_actions}
         due_payloads: list[dict[str, Any]] = []
         for intent in due_intents:
@@ -2687,6 +2715,11 @@ class RecursiveConclusionSession:
             "conclusion_probe": conclusion,
             "conclusion_steer_strength": self.config.conclusion_steer_strength.value,
             "conclusion_steer_injection": self.config.conclusion_steer_injection.value,
+            "latest_conclusion_probe_turn": self.latest_conclusion_probe_turn,
+            "latest_conclusion_line": latest_conclusion_line or None,
+            "latest_conclusion_line_reply_overlap": latest_conclusion_line_reply_overlap,
+            "latest_conclusion_line_mentioned": latest_conclusion_line_mentioned,
+            "latest_conclusion_line_age_turns": latest_conclusion_line_age_turns,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "planned_deferred_intents": planned_intents_payload,
             "planned_deferred_intent_count": len(planned_intents_payload),
