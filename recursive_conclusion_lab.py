@@ -83,6 +83,11 @@ class ConclusionSteerInjection(str, Enum):
     CONCLUSION_LINE = "conclusion_line"
 
 
+class DelayedMentionMode(str, Enum):
+    OBSERVE = "observe"
+    SOFT_FIRE = "soft_fire"
+
+
 class DeferredIntentMode(str, Enum):
     OBSERVE = "observe"
     SOFT_FIRE = "soft_fire"
@@ -130,6 +135,11 @@ class ExperimentConfig:
     conclusion_mode: ConclusionMode = ConclusionMode.OBSERVE
     conclusion_steer_strength: SteerStrength = SteerStrength.MEDIUM
     conclusion_steer_injection: ConclusionSteerInjection = ConclusionSteerInjection.FULL
+    delayed_mention_every: int = 0
+    delayed_mention_item_limit: int = 3
+    delayed_mention_mode: DelayedMentionMode = DelayedMentionMode.OBSERVE
+    delayed_mention_fire_prob: float = 0.35
+    delayed_mention_fire_max_items: int = 2
     deferred_intent_every: int = 0
     deferred_intent_mode: DeferredIntentMode = DeferredIntentMode.OBSERVE
     deferred_intent_strategy: DeferredIntentStrategy = DeferredIntentStrategy.TRIGGER
@@ -192,6 +202,31 @@ class DeferredIntent:
     def summary_line(self) -> str:
         window = f"t{self.earliest_turn}..t{self.latest_turn}"
         return f"[{self.intent_id} {self.status} {window}] {self.intent}"
+
+
+@dataclass
+class DelayedMentionItem:
+    item_id: str
+    created_turn: int
+    kind: str
+    text: str
+    keywords: list[str] = field(default_factory=list)
+    earliest_turn: int = 0
+    latest_turn: int = 0
+    likelihood: float = 0.0
+    delay_strategy: str = ""
+    delay_signals: list[str] = field(default_factory=list)
+    delay_rationale: str = ""
+    status: str = "active"
+    mention_turn: Optional[int] = None
+    terminal_reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    def summary_line(self) -> str:
+        window = f"t{self.earliest_turn}..t{self.latest_turn}"
+        return f"[{self.item_id} {self.kind} {self.status} {window}] {self.text}"
 
 
 # ----------------------------
@@ -999,8 +1034,44 @@ class DummyAdapter(BaseAdapter):
                 CONCLUSION: The dialogue is converging toward a concrete experiment design with explicit instrumentation and comparison conditions.
                 CONFIDENCE: 0.74
                 EVIDENCE: The recent turns emphasize recursive memory, periodic probes, and operational evaluation. Latest user turn: {final_user[:120]}
+                KEYWORDS: instrumentation; baseline comparison; deferred mention; metrics; firing window
+                MENTION_DELAY_MIN_TURNS: 2
+                MENTION_DELAY_MAX_TURNS: 4
+                MENTION_LIKELIHOOD: 0.55
+                DELAY_STRATEGY: build_context
+                DELAY_SIGNALS: constraints_missing, user_not_ready, need_one_more_turn
+                DELAY_RATIONALE: Hold the conclusion until after 1-2 more constraint-gathering turns.
                 """
             ).strip()
+        elif "delayed mention planner" in system_lower:
+            last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+            payload = {
+                "items": [
+                    {
+                        "kind": "constraint",
+                        "text": "Confirm whether we should optimize for portability (single-file) or extensibility (multi-module) before adding more components.",
+                        "keywords": ["portability", "single-file", "extensibility"],
+                        "mention_delay_min_turns": 1,
+                        "mention_delay_max_turns": 3,
+                        "mention_likelihood": 0.60,
+                        "delay_strategy": "gather_constraints",
+                        "delay_signals": ["needs_choice", "design_branching"],
+                        "delay_rationale": f"Ask after a bit more context. Latest user: {compact_text(last_user)[:60]}",
+                    },
+                    {
+                        "kind": "option",
+                        "text": "Consider adding a probabilistic soft-fire nudge inside the predicted mention window to increase mention reliability without forcing exact wording.",
+                        "keywords": ["soft-fire", "probabilistic", "mention window"],
+                        "mention_delay_min_turns": 2,
+                        "mention_delay_max_turns": 4,
+                        "mention_likelihood": 0.52,
+                        "delay_strategy": "build_context",
+                        "delay_signals": ["timing_sensitive", "avoid_oversteer"],
+                        "delay_rationale": "Mention it once the experiment metrics are in place.",
+                    },
+                ]
+            }
+            output = json.dumps(payload, ensure_ascii=False)
         elif "deferred utterance planner" in (system or "").lower() or ("create_intent" in lower and "why_not_now" in lower and "deferred utterance" in lower):
             latest_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
             timing = None
@@ -1076,6 +1147,16 @@ class DummyAdapter(BaseAdapter):
                 "Dummy reply. I would answer the latest user turn concretely, "
                 f"grounding on: {last_user[:180]}"
             )
+            delayed = []
+            if system_lower and "delayed mention targets are due now" in system_lower:
+                for line in (system or "").splitlines():
+                    match = re.match(r"\s*-\s*\[(dm-[^\]]+)\]\s*(.+)\s*$", line)
+                    if match:
+                        delayed.append(match.group(2).strip())
+            if delayed:
+                output = output.rstrip() + "\n\nDelayed mentions (simulated):\n" + "\n".join(
+                    f"- {text}" for text in delayed
+                )
 
         return ProviderResponse(
             provider=self.provider_name,
@@ -1439,9 +1520,11 @@ class RecursiveConclusionSession:
         self.latest_conclusion_delay_strategy: str = ""
         self.latest_conclusion_delay_signals: list[str] = []
         self.latest_conclusion_delay_rationale: str = ""
+        self.delayed_mentions: list[DelayedMentionItem] = []
         self.deferred_intents: list[DeferredIntent] = []
         self.turn_index = 0
         self.next_deferred_intent_index = 1
+        self.next_delayed_mention_index = 1
         self.deferred_intent_plan_probe_calls = 0
         self._deferred_intent_plan_compact_ok = False
         self._deferred_intent_scheduler_compact_ok = False
@@ -1454,7 +1537,22 @@ class RecursiveConclusionSession:
     def _active_deferred_intents(self) -> list[DeferredIntent]:
         return [intent for intent in self.deferred_intents if intent.status == "active"]
 
-    def _build_system_prompt(self, *, due_intents: Optional[list[DeferredIntent]] = None) -> str:
+    def _active_delayed_mentions(self) -> list[DelayedMentionItem]:
+        return [item for item in self.delayed_mentions if item.status == "active"]
+
+    def _due_delayed_mentions(self) -> list[DelayedMentionItem]:
+        return [
+            item
+            for item in self._active_delayed_mentions()
+            if item.earliest_turn <= self.turn_index <= item.latest_turn
+        ]
+
+    def _build_system_prompt(
+        self,
+        *,
+        due_intents: Optional[list[DeferredIntent]] = None,
+        injected_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
+    ) -> str:
         parts: list[str] = []
         base = compact_text(self.config.base_system)
         if base:
@@ -1529,6 +1627,22 @@ class RecursiveConclusionSession:
                 f"{bullets}\n\n"
                 "Realize them naturally instead of quoting them verbatim. "
                 "If the latest user turn conflicts with a deferred utterance, prioritize the current evidence."
+            )
+
+        if (
+            self.config.delayed_mention_mode == DelayedMentionMode.SOFT_FIRE
+            and injected_delayed_mentions
+        ):
+            bullets = "\n".join(
+                f"- [{item.item_id}] {item.text}" for item in injected_delayed_mentions
+            )
+            parts.append(
+                "Some delayed mention targets are due now. If they fit the current turn, weave them into the reply naturally.\n"
+                f"{bullets}\n\n"
+                "Rules:\n"
+                "- Do not quote the bullets verbatim; rephrase naturally.\n"
+                "- Do not mention that you were instructed or that these are 'due'.\n"
+                "- If the latest user turn conflicts, prioritize the user."
             )
 
         return "\n\n".join(parts).strip()
@@ -1685,6 +1799,64 @@ class RecursiveConclusionSession:
             self.latest_conclusion_delay_strategy = delay_strategy
             self.latest_conclusion_delay_signals = delay_signals
             self.latest_conclusion_delay_rationale = delay_rationale
+
+            conclusion_text = strip_conclusion_prefix(conclusion_line)
+            dm_min = mention_delay_min_turns if mention_delay_min_turns is not None else 1
+            dm_max = mention_delay_max_turns if mention_delay_max_turns is not None else dm_min + 2
+            dm_min = max(0, int(dm_min))
+            dm_max = max(dm_min, int(dm_max))
+            conclusion_plan_item: Optional[DelayedMentionItem] = None
+            if conclusion_text:
+                existing = next(
+                    (
+                        item
+                        for item in self.delayed_mentions
+                        if item.status == "active" and item.kind == "conclusion"
+                    ),
+                    None,
+                )
+                if existing is None:
+                    item_id = f"dm-{self.next_delayed_mention_index:04d}"
+                    self.next_delayed_mention_index += 1
+                    conclusion_plan_item = DelayedMentionItem(
+                        item_id=item_id,
+                        created_turn=self.turn_index,
+                        kind="conclusion",
+                        text=conclusion_text,
+                        keywords=keywords,
+                        earliest_turn=self.turn_index + dm_min,
+                        latest_turn=self.turn_index + dm_max,
+                        likelihood=float(mention_likelihood or 0.0),
+                        delay_strategy=delay_strategy,
+                        delay_signals=list(delay_signals),
+                        delay_rationale=delay_rationale,
+                        status="active",
+                    )
+                    self.delayed_mentions.append(conclusion_plan_item)
+                    self._log(
+                        "delayed_mention_plan",
+                        {
+                            "source": "conclusion_probe",
+                            "created": True,
+                            "item": conclusion_plan_item.to_dict(),
+                        },
+                    )
+                else:
+                    existing.text = conclusion_text
+                    existing.keywords = list(keywords)
+                    existing.likelihood = float(mention_likelihood or 0.0)
+                    existing.delay_strategy = delay_strategy
+                    existing.delay_signals = list(delay_signals)
+                    existing.delay_rationale = delay_rationale
+                    conclusion_plan_item = existing
+                    self._log(
+                        "delayed_mention_plan",
+                        {
+                            "source": "conclusion_probe",
+                            "created": False,
+                            "item": conclusion_plan_item.to_dict(),
+                        },
+                    )
             self._log(
                 "conclusion_probe",
                 {
@@ -1708,12 +1880,151 @@ class RecursiveConclusionSession:
                     "delay_strategy": delay_strategy,
                     "delay_signals": delay_signals,
                     "delay_rationale": delay_rationale,
+                    "delayed_mention_item_id": (
+                        conclusion_plan_item.item_id if conclusion_plan_item else None
+                    ),
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
                 },
             )
         return hypothesis or None
+
+    def _probe_delayed_mentions(self) -> list[DelayedMentionItem]:
+        if self.config.delayed_mention_every <= 0:
+            return []
+        if self.turn_index == 0 or self.turn_index % self.config.delayed_mention_every != 0:
+            return []
+        if self.config.delayed_mention_item_limit <= 0:
+            return []
+
+        limit = max(0, int(self.config.delayed_mention_item_limit))
+        source = textwrap.dedent(
+            f"""\
+            Memory capsules:
+            {render_capsules(self.memory_capsules)}
+
+            Recent dialogue window:
+            {render_messages(self._recent_window())}
+
+            Identify up to {limit} "delayed mention targets" that the assistant is likely to bring up later,
+            but should NOT mention immediately. These are not tasks; they are items that become relevant later.
+
+            Return STRICT JSON (no markdown, no code fences):
+            {{
+              "items": [
+                {{
+                  "kind": "caveat|definition|option|constraint|conclusion|other",
+                  "text": "<what to mention later (1-2 sentences max)>",
+                  "keywords": ["<3-5 distinctive phrases>"],
+                  "mention_delay_min_turns": <int>,
+                  "mention_delay_max_turns": <int>,
+                  "mention_likelihood": <0.00-1.00>,
+                  "delay_strategy": "<short label>",
+                  "delay_signals": ["<2-6 short tags>"],
+                  "delay_rationale": "<=140 chars; no chain-of-thought>"
+                }}
+              ]
+            }}
+            """
+        ).strip()
+
+        response = self.adapter.generate(
+            system=(
+                "Delayed mention planner. You observe dialogue trajectory and propose future mention targets. "
+                "Do not answer the user directly."
+            ),
+            messages=[ChatMessage(role="user", content=source)],
+            config=self.config.probe_config,
+        )
+        raw = (response.text or "").strip()
+        parsed = extract_json_value(raw)
+        if not isinstance(parsed, dict):
+            self._log(
+                "delayed_mention_plan_error",
+                {
+                    "error": "Planner output was not a JSON object.",
+                    "raw": raw,
+                    "usage": response.usage,
+                    "finish_reason": response.finish_reason,
+                    "request_id": response.request_id,
+                },
+            )
+            return []
+        items_raw = parsed.get("items")
+        if not isinstance(items_raw, list):
+            self._log(
+                "delayed_mention_plan_error",
+                {
+                    "error": "JSON must contain list field 'items'.",
+                    "raw": raw,
+                    "parsed_type": type(parsed.get("items")).__name__,
+                    "usage": response.usage,
+                    "finish_reason": response.finish_reason,
+                    "request_id": response.request_id,
+                },
+            )
+            return []
+
+        created: list[DelayedMentionItem] = []
+        for item_raw in items_raw[:limit]:
+            if not isinstance(item_raw, dict):
+                continue
+            text = compact_text(str(item_raw.get("text") or ""))
+            if not text:
+                continue
+            kind = truncate_text(item_raw.get("kind") or "other", 24) or "other"
+            keywords = coerce_str_list(item_raw.get("keywords"))
+            keywords = [truncate_text(x, 64) for x in keywords if x][:5]
+
+            delay_min = coerce_int(item_raw.get("mention_delay_min_turns"))
+            delay_max = coerce_int(item_raw.get("mention_delay_max_turns"))
+            if delay_min is None:
+                delay_min = 1
+            if delay_max is None:
+                delay_max = delay_min + 2
+            delay_min = max(0, int(delay_min))
+            delay_max = max(delay_min, int(delay_max))
+
+            likelihood = clamp01(item_raw.get("mention_likelihood"), default=0.0)
+            delay_strategy = truncate_text(item_raw.get("delay_strategy") or "", 48)
+            delay_signals = coerce_str_list(item_raw.get("delay_signals"))
+            delay_signals = [truncate_text(x, 80) for x in delay_signals if x][:6]
+            delay_rationale = truncate_text(item_raw.get("delay_rationale") or "", 160)
+
+            item_id = f"dm-{self.next_delayed_mention_index:04d}"
+            self.next_delayed_mention_index += 1
+            item = DelayedMentionItem(
+                item_id=item_id,
+                created_turn=self.turn_index,
+                kind=kind,
+                text=text,
+                keywords=keywords,
+                earliest_turn=self.turn_index + delay_min,
+                latest_turn=self.turn_index + delay_max,
+                likelihood=likelihood,
+                delay_strategy=delay_strategy,
+                delay_signals=delay_signals,
+                delay_rationale=delay_rationale,
+                status="active",
+            )
+            self.delayed_mentions.append(item)
+            created.append(item)
+
+        self._log(
+            "delayed_mention_plan",
+            {
+                "source": "delayed_mention_probe",
+                "created": bool(created),
+                "created_items": [item.to_dict() for item in created],
+                "created_count": len(created),
+                "raw": raw,
+                "usage": response.usage,
+                "finish_reason": response.finish_reason,
+                "request_id": response.request_id,
+            },
+        )
+        return created
 
     def _probe_deferred_intent_plans(self) -> list[DeferredIntent]:
         if self.turn_index == 0:
@@ -2211,6 +2522,40 @@ class RecursiveConclusionSession:
 
         memory_capsule = self._probe_memory_capsule()
         conclusion = self._probe_conclusion()
+        planned_delayed_mentions = self._probe_delayed_mentions()
+        due_delayed_mentions = self._due_delayed_mentions()
+        injected_delayed_mentions: list[DelayedMentionItem] = []
+        delayed_mention_fire_prob = max(
+            0.0, min(1.0, float(self.config.delayed_mention_fire_prob or 0.0))
+        )
+        delayed_mention_fire_max_items = max(0, int(self.config.delayed_mention_fire_max_items or 0))
+        delayed_mention_injection_draws: list[dict[str, Any]] = []
+        if (
+            self.config.delayed_mention_mode == DelayedMentionMode.SOFT_FIRE
+            and due_delayed_mentions
+            and delayed_mention_fire_max_items > 0
+            and delayed_mention_fire_prob > 0.0
+        ):
+            due_sorted = sorted(
+                due_delayed_mentions,
+                key=lambda item: (item.latest_turn, item.earliest_turn, item.item_id),
+            )
+            for item in due_sorted:
+                if len(injected_delayed_mentions) >= delayed_mention_fire_max_items:
+                    break
+                draw = random.random()
+                inject = draw < delayed_mention_fire_prob
+                delayed_mention_injection_draws.append(
+                    {
+                        "item_id": item.item_id,
+                        "kind": item.kind,
+                        "draw": draw,
+                        "prob": delayed_mention_fire_prob,
+                        "inject": inject,
+                    }
+                )
+                if inject:
+                    injected_delayed_mentions.append(item)
         planned_intent: Optional[DeferredIntent] = None
         planned_intents_payload: list[dict[str, Any]] = []
         due_intents: list[DeferredIntent] = []
@@ -2254,7 +2599,10 @@ class RecursiveConclusionSession:
             if eligible_plan_turn:
                 self.deferred_intent_plan_probe_calls += 1
 
-            base_prompt = self._build_system_prompt(due_intents=None)
+            base_prompt = self._build_system_prompt(
+                due_intents=None,
+                injected_delayed_mentions=injected_delayed_mentions,
+            )
             prev_assistant = next(
                 (m for m in reversed(self.history[:-1]) if m.role == "assistant"),
                 None,
@@ -2840,7 +3188,10 @@ class RecursiveConclusionSession:
             if ablation_actions:
                 deferred_actions = list(deferred_actions) + ablation_actions
 
-            system_prompt = self._build_system_prompt(due_intents=due_intents)
+            system_prompt = self._build_system_prompt(
+                due_intents=due_intents,
+                injected_delayed_mentions=injected_delayed_mentions,
+            )
             reply = self.adapter.generate(
                 system=system_prompt or None,
                 messages=self._recent_window(),
@@ -2911,6 +3262,72 @@ class RecursiveConclusionSession:
                     + self.latest_conclusion_mention_delay_max_turns
                 )
 
+        injected_delayed_mention_ids = {item.item_id for item in injected_delayed_mentions}
+        delayed_mention_actions: list[dict[str, Any]] = []
+        for item in self.delayed_mentions:
+            if item.status != "active":
+                continue
+            overlap_score = lexical_overlap(item.text, assistant_text)
+            hits = keyword_hits(item.keywords, assistant_text) if item.keywords else None
+            required_hits: Optional[int] = None
+            keyword_mentioned = False
+            if item.keywords:
+                required_hits = max(
+                    self.CONCLUSION_KEYWORD_MENTION_MIN_HITS,
+                    (len(item.keywords) + 1) // 2,
+                )
+                keyword_mentioned = (hits or 0) >= required_hits
+            mentioned = (
+                overlap_score >= self.CONCLUSION_MENTION_THRESHOLD or keyword_mentioned
+            )
+            if mentioned:
+                item.status = "mentioned"
+                item.mention_turn = self.turn_index
+                item.terminal_reason = "Mentioned in assistant reply."
+                action = {
+                    "item_id": item.item_id,
+                    "kind": item.kind,
+                    "action": "mention",
+                    "status_before": "active",
+                    "status_after": item.status,
+                    "text": item.text,
+                    "created_turn": item.created_turn,
+                    "earliest_turn": item.earliest_turn,
+                    "latest_turn": item.latest_turn,
+                    "mention_turn": item.mention_turn,
+                    "delay_turns": (item.mention_turn or 0) - item.created_turn,
+                    "within_window": item.earliest_turn <= self.turn_index <= item.latest_turn,
+                    "assistant_overlap": overlap_score,
+                    "keyword_hits": hits,
+                    "keyword_required_hits": required_hits,
+                    "injected": item.item_id in injected_delayed_mention_ids,
+                }
+                delayed_mention_actions.append(action)
+                self._log("delayed_mention_action", dict(action))
+            elif self.turn_index > item.latest_turn:
+                item.status = "expired"
+                item.terminal_reason = "Mention window passed."
+                action = {
+                    "item_id": item.item_id,
+                    "kind": item.kind,
+                    "action": "expire",
+                    "status_before": "active",
+                    "status_after": item.status,
+                    "text": item.text,
+                    "created_turn": item.created_turn,
+                    "earliest_turn": item.earliest_turn,
+                    "latest_turn": item.latest_turn,
+                    "mention_turn": None,
+                    "delay_turns": None,
+                    "within_window": False,
+                    "assistant_overlap": overlap_score,
+                    "keyword_hits": hits,
+                    "keyword_required_hits": required_hits,
+                    "injected": item.item_id in injected_delayed_mention_ids,
+                }
+                delayed_mention_actions.append(action)
+                self._log("delayed_mention_action", dict(action))
+
         action_map = {action["intent_id"]: dict(action) for action in deferred_actions}
         due_payloads: list[dict[str, Any]] = []
         for intent in due_intents:
@@ -2963,6 +3380,41 @@ class RecursiveConclusionSession:
             "latest_conclusion_plan_strategy": self.latest_conclusion_delay_strategy or None,
             "latest_conclusion_plan_signals": list(self.latest_conclusion_delay_signals or [])
             or None,
+            "planned_delayed_mentions": (
+                [item.to_dict() for item in planned_delayed_mentions]
+                if planned_delayed_mentions
+                else []
+            ),
+            "planned_delayed_mention_count": len(planned_delayed_mentions),
+            "due_delayed_mentions": [
+                {
+                    "item_id": item.item_id,
+                    "kind": item.kind,
+                    "created_turn": item.created_turn,
+                    "earliest_turn": item.earliest_turn,
+                    "latest_turn": item.latest_turn,
+                    "likelihood": item.likelihood,
+                    "text": truncate_text(item.text, 140),
+                }
+                for item in due_delayed_mentions
+            ],
+            "injected_delayed_mentions": [
+                {
+                    "item_id": item.item_id,
+                    "kind": item.kind,
+                    "created_turn": item.created_turn,
+                    "earliest_turn": item.earliest_turn,
+                    "latest_turn": item.latest_turn,
+                    "likelihood": item.likelihood,
+                    "text": truncate_text(item.text, 140),
+                }
+                for item in injected_delayed_mentions
+            ],
+            "delayed_mention_actions": delayed_mention_actions,
+            "delayed_mention_mode": self.config.delayed_mention_mode.value,
+            "delayed_mention_fire_prob": delayed_mention_fire_prob,
+            "delayed_mention_fire_max_items": delayed_mention_fire_max_items,
+            "delayed_mention_injection_draws": delayed_mention_injection_draws,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "planned_deferred_intents": planned_intents_payload,
             "planned_deferred_intent_count": len(planned_intents_payload),
@@ -3037,6 +3489,15 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         conclusion_mode=ConclusionMode(args.conclusion_mode),
         conclusion_steer_strength=SteerStrength(args.conclusion_steer_strength),
         conclusion_steer_injection=ConclusionSteerInjection(args.conclusion_steer_injection),
+        delayed_mention_every=getattr(args, "delayed_mention_every", 0),
+        delayed_mention_item_limit=max(0, int(getattr(args, "delayed_mention_item_limit", 3) or 0)),
+        delayed_mention_mode=DelayedMentionMode(
+            getattr(args, "delayed_mention_mode", DelayedMentionMode.OBSERVE.value)
+        ),
+        delayed_mention_fire_prob=float(getattr(args, "delayed_mention_fire_prob", 0.35) or 0.0),
+        delayed_mention_fire_max_items=max(
+            0, int(getattr(args, "delayed_mention_fire_max_items", 2) or 0)
+        ),
         deferred_intent_every=args.deferred_intent_every,
         deferred_intent_mode=DeferredIntentMode(args.deferred_intent_mode),
         deferred_intent_strategy=DeferredIntentStrategy(args.deferred_intent_strategy),
@@ -3290,6 +3751,36 @@ def build_parser() -> argparse.ArgumentParser:
             choices=[i.value for i in ConclusionSteerInjection],
             default=ConclusionSteerInjection.FULL.value,
             help="Which parts of the conclusion probe to inject (only affects --conclusion-mode soft_steer).",
+        )
+        p.add_argument(
+            "--delayed-mention-every",
+            type=int,
+            default=0,
+            help="Probe for delayed mention targets every N user turns. 0 disables.",
+        )
+        p.add_argument(
+            "--delayed-mention-item-limit",
+            type=int,
+            default=3,
+            help="Maximum number of delayed mention targets to plan per probe.",
+        )
+        p.add_argument(
+            "--delayed-mention-mode",
+            choices=[m.value for m in DelayedMentionMode],
+            default=DelayedMentionMode.OBSERVE.value,
+            help="Whether delayed mention targets are only observed or softly fired into due turns.",
+        )
+        p.add_argument(
+            "--delayed-mention-fire-prob",
+            type=float,
+            default=0.35,
+            help="Per-item probability of injecting a due delayed-mention hint (only affects --delayed-mention-mode soft_fire).",
+        )
+        p.add_argument(
+            "--delayed-mention-fire-max-items",
+            type=int,
+            default=2,
+            help="Maximum number of due delayed-mention hints to inject per turn (only affects --delayed-mention-mode soft_fire).",
         )
         p.add_argument(
             "--deferred-intent-every",

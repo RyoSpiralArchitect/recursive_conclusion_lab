@@ -108,6 +108,12 @@
 9. **conclusion_plan_within_window_rate**  
    probe が出す observe-only の言及プラン（`mention_delay_min_turns` / `mention_delay_max_turns`）に対して、実際の言及遅延がウィンドウ内に収まった割合。
 
+10. **delayed_mention_nonconclusion_mention_rate / delayed_mention_within_window_rate**  
+   追加の delayed mention probe が列挙した（結論以外の）「言及遅延ターゲット」が、どの程度言及され、かつ予測ウィンドウ内で言及されたか。
+
+11. **delayed_mention_injected_on_mention_rate**  
+   `--delayed-mention-mode soft_fire` を有効にしたとき、mention が起きたターンで実際にヒント注入が行われていた割合（=注入が言及と同時に起きた近似）。
+
 ### 5.2 スクリプト評価 spec から計算する指標
 
 `script.json` に `evaluation` セクションを足し、以下を計算する。

@@ -188,6 +188,33 @@ python recursive_conclusion_lab.py run-config \
 
 `analyze_runs.py` で planned-vs-actual の指標（例: `conclusion_plan_within_window_rate`）を出力します。
 
+### 言及遅延ターゲット（複数候補; 任意）
+
+結論だけでなく、LLM 自身に「いまは言わず、後で言及すべき項目」を列挙させてログ化できます。
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --delayed-mention-every 2 \
+  --delayed-mention-item-limit 3
+```
+
+予定ウィンドウ内での probabilistic な soft-fire（強制せずヒントを出す）も可能です。
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --delayed-mention-every 2 \
+  --delayed-mention-mode soft_fire \
+  --delayed-mention-fire-prob 0.35 \
+  --delayed-mention-fire-max-items 2
+```
+
+`delayed_mention_plan` / `delayed_mention_action` を記録し、`analyze_runs.py` で
+`delayed_mention_nonconclusion_mention_rate` / `delayed_mention_within_window_rate` なども出力します。
+
 ```bash
 python analyze_runs.py \
   --log-dir compare_outputs/deferred_trigger \

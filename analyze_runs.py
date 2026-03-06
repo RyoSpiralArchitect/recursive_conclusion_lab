@@ -117,6 +117,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     probes: list[str] = []
     probe_events: list[tuple[int, str]] = []
     probe_plan_events: list[dict[str, Any]] = []
+    delayed_mention_plans: list[dict[str, Any]] = []
+    delayed_mention_actions: list[dict[str, Any]] = []
+    delayed_mention_plan_error_count = 0
     capsules: list[str] = []
     planned_intents: list[dict[str, Any]] = []
     intent_status_by_id: dict[str, str] = {}
@@ -181,6 +184,20 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         elif et == "inband_state_prune":
             if isinstance(payload, dict):
                 inband_prune_events.append(payload)
+        elif et == "delayed_mention_plan":
+            if isinstance(payload, dict):
+                if isinstance(payload.get("item"), dict):
+                    delayed_mention_plans.append(payload["item"])
+                created_items = payload.get("created_items") or []
+                if isinstance(created_items, list):
+                    for item in created_items:
+                        if isinstance(item, dict):
+                            delayed_mention_plans.append(item)
+        elif et == "delayed_mention_plan_error":
+            delayed_mention_plan_error_count += 1
+        elif et == "delayed_mention_action":
+            if isinstance(payload, dict):
+                delayed_mention_actions.append(payload)
 
     final_assistant = assistant_rows[-1].get("assistant", "") if assistant_rows else ""
     final_user = assistant_rows[-1].get("user", "") if assistant_rows else ""
@@ -571,6 +588,94 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
 
     conversation_text = "\n".join(r.get("assistant", "") for r in assistant_rows)
 
+    delayed_mention_by_id: dict[str, dict[str, Any]] = {}
+    for item in delayed_mention_plans:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("item_id")
+        if not item_id:
+            continue
+        delayed_mention_by_id[str(item_id)] = item
+    delayed_mention_unique = list(delayed_mention_by_id.values())
+    delayed_mention_planned_count = len(delayed_mention_unique)
+    delayed_mention_planned_nonconclusion_count = sum(
+        1
+        for item in delayed_mention_unique
+        if str(item.get("kind") or "").strip().lower() != "conclusion"
+    )
+
+    mention_actions = [
+        act
+        for act in delayed_mention_actions
+        if isinstance(act, dict) and str(act.get("action") or "").lower() == "mention"
+    ]
+    expire_actions = [
+        act
+        for act in delayed_mention_actions
+        if isinstance(act, dict) and str(act.get("action") or "").lower() == "expire"
+    ]
+    delayed_mention_mentioned_count = len(mention_actions)
+    delayed_mention_expired_count = len(expire_actions)
+    delayed_mention_mentioned_nonconclusion_count = sum(
+        1
+        for act in mention_actions
+        if str(act.get("kind") or "").strip().lower() != "conclusion"
+    )
+    delayed_mention_within_window_count = sum(
+        1 for act in mention_actions if act.get("within_window") is True
+    )
+    delayed_mention_early_count = 0
+    delayed_mention_late_count = 0
+    delayed_mention_delays: list[int] = []
+    delayed_mention_injected_on_mention_count = 0
+    for act in mention_actions:
+        mt = act.get("mention_turn")
+        et = act.get("earliest_turn")
+        lt = act.get("latest_turn")
+        if isinstance(mt, int) and isinstance(et, int) and mt < et:
+            delayed_mention_early_count += 1
+        if isinstance(mt, int) and isinstance(lt, int) and mt > lt:
+            delayed_mention_late_count += 1
+        delay = act.get("delay_turns")
+        if isinstance(delay, int):
+            delayed_mention_delays.append(delay)
+        if act.get("injected") is True:
+            delayed_mention_injected_on_mention_count += 1
+
+    delayed_mention_mention_rate = (
+        delayed_mention_mentioned_count / delayed_mention_planned_count
+        if delayed_mention_planned_count
+        else None
+    )
+    delayed_mention_nonconclusion_mention_rate = (
+        delayed_mention_mentioned_nonconclusion_count / delayed_mention_planned_nonconclusion_count
+        if delayed_mention_planned_nonconclusion_count
+        else None
+    )
+    delayed_mention_within_window_rate = (
+        delayed_mention_within_window_count / delayed_mention_planned_count
+        if delayed_mention_planned_count
+        else None
+    )
+    delayed_mention_injected_on_mention_rate = (
+        delayed_mention_injected_on_mention_count / delayed_mention_mentioned_count
+        if delayed_mention_mentioned_count
+        else None
+    )
+
+    delayed_mention_strategies = [
+        str(item.get("delay_strategy") or "")
+        for item in delayed_mention_unique
+        if isinstance(item, dict)
+    ]
+    delayed_mention_signals: list[str] = []
+    for item in delayed_mention_unique:
+        sigs = item.get("delay_signals") or []
+        if isinstance(sigs, list):
+            delayed_mention_signals.extend(str(x) for x in sigs if x)
+    delayed_mention_strategy_counts = count_strings(delayed_mention_strategies)
+    delayed_mention_signal_counts = count_strings(delayed_mention_signals)
+
     result = {
         "file": str(path),
         "provider": provider,
@@ -596,6 +701,20 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
             planned_conclusion_window_widths
         ),
         "avg_conclusion_mention_likelihood": mean_or_none(conclusion_mention_likelihoods),
+        "delayed_mention_plan_error_count": delayed_mention_plan_error_count,
+        "delayed_mention_planned_count": delayed_mention_planned_count,
+        "delayed_mention_planned_nonconclusion_count": delayed_mention_planned_nonconclusion_count,
+        "delayed_mention_mentioned_count": delayed_mention_mentioned_count,
+        "delayed_mention_expired_count": delayed_mention_expired_count,
+        "delayed_mention_mention_rate": delayed_mention_mention_rate,
+        "delayed_mention_nonconclusion_mention_rate": delayed_mention_nonconclusion_mention_rate,
+        "delayed_mention_within_window_rate": delayed_mention_within_window_rate,
+        "avg_delayed_mention_delay_turns": mean_or_none(delayed_mention_delays),
+        "delayed_mention_early_count": delayed_mention_early_count,
+        "delayed_mention_late_count": delayed_mention_late_count,
+        "delayed_mention_injected_on_mention_rate": delayed_mention_injected_on_mention_rate,
+        "delayed_mention_strategy_counts": delayed_mention_strategy_counts or None,
+        "delayed_mention_signal_counts": delayed_mention_signal_counts or None,
         "memory_capsule_count": len(capsules),
         "deferred_intent_backend": deferred_intent_backend,
         "deferred_intent_timing": deferred_intent_timing,
@@ -684,6 +803,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "conclusion_line_mention_rate",
         "conclusion_any_mention_rate",
         "conclusion_plan_within_window_rate",
+        "delayed_mention_planned_nonconclusion_count",
+        "delayed_mention_nonconclusion_mention_rate",
+        "delayed_mention_within_window_rate",
+        "delayed_mention_injected_on_mention_rate",
         "avg_conclusion_line_mention_delay_turns",
         "avg_conclusion_any_mention_delay_turns",
         "deferred_intent_plan_count",

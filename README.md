@@ -186,6 +186,33 @@ Each `conclusion_probe` also emits an observe-only “mention plan” (not injec
 
 `analyze_runs.py` reports planned-vs-actual metrics like `conclusion_plan_within_window_rate`.
 
+### Delayed mention targets (multi-item; optional)
+
+Enable an additional probe where the LLM chooses **which items** should be mentioned later (not immediately):
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --delayed-mention-every 2 \
+  --delayed-mention-item-limit 3
+```
+
+Optional soft-fire (probabilistic) hinting inside each planned window:
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/gather_then_recommend.json \
+  --providers openai=<model_id> \
+  --delayed-mention-every 2 \
+  --delayed-mention-mode soft_fire \
+  --delayed-mention-fire-prob 0.35 \
+  --delayed-mention-fire-max-items 2
+```
+
+This logs `delayed_mention_plan` / `delayed_mention_action` events and adds analyzer columns like:
+`delayed_mention_nonconclusion_mention_rate`, `delayed_mention_within_window_rate`.
+
 ```bash
 python analyze_runs.py \
   --log-dir compare_outputs/deferred_trigger \
