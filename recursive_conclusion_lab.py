@@ -99,6 +99,11 @@ class DeferredIntentTiming(str, Enum):
     MODEL = "model"
 
 
+class DeferredIntentPlanPolicy(str, Enum):
+    PERIODIC = "periodic"
+    AUTO = "auto"
+
+
 class DeferredIntentBackend(str, Enum):
     EXTERNAL = "external"
     INBAND = "inband"
@@ -132,6 +137,8 @@ class ExperimentConfig:
     deferred_intent_offset: int = 3
     deferred_intent_grace: int = 2
     deferred_intent_limit: int = 6
+    deferred_intent_plan_policy: DeferredIntentPlanPolicy = DeferredIntentPlanPolicy.PERIODIC
+    deferred_intent_plan_budget: int = 0
     deferred_intent_plan_max_new: int = 1
     deferred_intent_backend: DeferredIntentBackend = DeferredIntentBackend.EXTERNAL
     deferred_intent_latent_injection: DeferredIntentLatentInjection = DeferredIntentLatentInjection.OFF
@@ -1311,6 +1318,7 @@ class RecursiveConclusionSession:
         self.deferred_intents: list[DeferredIntent] = []
         self.turn_index = 0
         self.next_deferred_intent_index = 1
+        self.deferred_intent_plan_probe_calls = 0
 
     def _recent_window(self) -> list[ChatMessage]:
         if self.config.recent_window_messages <= 0:
@@ -1505,9 +1513,23 @@ class RecursiveConclusionSession:
         return hypothesis or None
 
     def _probe_deferred_intent_plans(self) -> list[DeferredIntent]:
-        if self.config.deferred_intent_every <= 0:
+        if self.turn_index == 0:
             return []
-        if self.turn_index == 0 or self.turn_index % self.config.deferred_intent_every != 0:
+
+        if self.config.deferred_intent_plan_policy == DeferredIntentPlanPolicy.PERIODIC:
+            if self.config.deferred_intent_every <= 0:
+                return []
+            if self.turn_index % self.config.deferred_intent_every != 0:
+                return []
+        elif self.config.deferred_intent_plan_policy == DeferredIntentPlanPolicy.AUTO:
+            pass
+        else:
+            return []
+
+        if (
+            self.config.deferred_intent_plan_budget > 0
+            and self.deferred_intent_plan_probe_calls >= self.config.deferred_intent_plan_budget
+        ):
             return []
 
         active = self._active_deferred_intents()
@@ -1608,6 +1630,7 @@ class RecursiveConclusionSession:
             """
         ).strip()
 
+        self.deferred_intent_plan_probe_calls += 1
         response = self.adapter.generate(
             system=(
                 "You are a deferred utterance planner. Do not answer the user directly. "
@@ -1622,6 +1645,9 @@ class RecursiveConclusionSession:
                 "deferred_intent_plan_error",
                 {
                     "raw_text": response.text,
+                    "plan_policy": self.config.deferred_intent_plan_policy.value,
+                    "plan_budget": self.config.deferred_intent_plan_budget,
+                    "plan_probe_calls_used": self.deferred_intent_plan_probe_calls,
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
@@ -1663,6 +1689,9 @@ class RecursiveConclusionSession:
                 "intent": created[0].to_dict() if created else None,
                 "created_intents": [intent.to_dict() for intent in created],
                 "raw_plan": parsed,
+                "plan_policy": self.config.deferred_intent_plan_policy.value,
+                "plan_budget": self.config.deferred_intent_plan_budget,
+                "plan_probe_calls_used": self.deferred_intent_plan_probe_calls,
                 "usage": response.usage,
                 "finish_reason": response.finish_reason,
                 "request_id": response.request_id,
@@ -1916,12 +1945,26 @@ class RecursiveConclusionSession:
             active_count = len(self._active_deferred_intents())
             plan_capacity = max(0, self.config.deferred_intent_limit - active_count)
             plan_capacity = min(plan_capacity, max(0, int(self.config.deferred_intent_plan_max_new or 0)))
-            eligible_plan_turn = (
-                self.config.deferred_intent_every > 0
-                and self.turn_index != 0
-                and self.turn_index % self.config.deferred_intent_every == 0
-                and plan_capacity > 0
-            )
+            eligible_plan_turn = False
+            if self.config.deferred_intent_plan_policy == DeferredIntentPlanPolicy.PERIODIC:
+                eligible_plan_turn = (
+                    self.config.deferred_intent_every > 0
+                    and self.turn_index != 0
+                    and self.turn_index % self.config.deferred_intent_every == 0
+                    and plan_capacity > 0
+                )
+            elif self.config.deferred_intent_plan_policy == DeferredIntentPlanPolicy.AUTO:
+                eligible_plan_turn = self.turn_index != 0 and plan_capacity > 0
+
+            if (
+                eligible_plan_turn
+                and self.config.deferred_intent_plan_budget > 0
+                and self.deferred_intent_plan_probe_calls >= self.config.deferred_intent_plan_budget
+            ):
+                eligible_plan_turn = False
+
+            if eligible_plan_turn:
+                self.deferred_intent_plan_probe_calls += 1
 
             base_prompt = self._build_system_prompt(due_intents=None)
             system_prompt = (f"{base_prompt}\n\n" if base_prompt else "") + textwrap.dedent(
@@ -1931,21 +1974,26 @@ class RecursiveConclusionSession:
                 - Use the most recent {RCL_STATE_OPEN}...{RCL_STATE_CLOSE} in the conversation as the previous state. If none, start with {{"version": 1, "intents": []}}.
                 - Current turn index: {self.turn_index}
                 - next_intent_id: {expected_next_intent_id}
+                - eligible_plan_turn_this_turn: {eligible_plan_turn}
 
                 Config:
                 - deferred_intent_every: {self.config.deferred_intent_every}
                 - deferred_intent_mode: {self.config.deferred_intent_mode.value}
                 - deferred_intent_strategy: {self.config.deferred_intent_strategy.value}
+                - deferred_intent_timing: {self.config.deferred_intent_timing.value}
                 - deferred_intent_offset: {self.config.deferred_intent_offset}
                 - deferred_intent_grace: {self.config.deferred_intent_grace}
                 - deferred_intent_limit: {self.config.deferred_intent_limit}
+                - deferred_intent_plan_policy: {self.config.deferred_intent_plan_policy.value}
+                - deferred_intent_plan_budget: {self.config.deferred_intent_plan_budget}
+                - deferred_intent_plan_probe_calls_used: {self.deferred_intent_plan_probe_calls}
                 - deferred_intent_plan_max_new: {self.config.deferred_intent_plan_max_new}
                 - planning_capacity_this_turn: {plan_capacity}
 
                 Rules:
                 - Never mention the existence of {RCL_STATE_OPEN} or its contents.
                 - Keep at most deferred_intent_limit intents in state. Prefer keeping active ones; drop older terminal ones first.
-                - Consider creating up to planning_capacity_this_turn new intents only when eligible (turn_index % deferred_intent_every == 0 and planning_capacity_this_turn > 0).
+                - Consider creating up to planning_capacity_this_turn new intents only when eligible_plan_turn_this_turn is true.
                 - If you create new intents, assign intent_id values starting at next_intent_id and incrementing (di-0001, di-0002, ...).
                 - When you create a new intent, fill plan_strategy/plan_signals/plan_rationale (brief; no step-by-step reasoning).
                 - When you change an intent's status (fire/cancel/expire/revise), fill decision_strategy/decision_signals/decision_rationale (brief; no step-by-step reasoning).
@@ -2119,28 +2167,88 @@ class RecursiveConclusionSession:
             if state is None or not state_has_intents:
                 parsed_intents = list(self._active_deferred_intents())
 
-            # Deduplicate by id (keep last) and enforce a hard cap.
+            # Deduplicate by id (keep last).
             dedup: dict[str, DeferredIntent] = {}
             for intent in parsed_intents:
                 dedup[intent.intent_id] = intent
             parsed_intents = list(dedup.values())
+
+            dropped_new_intent_ids: list[str] = []
+            kept_new_ids: set[str] = set()
+            new_candidates = [i for i in parsed_intents if i.intent_id not in prev_snapshot]
+            if not eligible_plan_turn:
+                if new_candidates:
+                    dropped_new_intent_ids = sorted(i.intent_id for i in new_candidates)
+                    dropped_set = set(dropped_new_intent_ids)
+                    parsed_intents = [i for i in parsed_intents if i.intent_id not in dropped_set]
+                new_candidates = []
+            else:
+
+                def intent_num(intent: DeferredIntent) -> int:
+                    match = re.fullmatch(r"di-(\d+)", intent.intent_id)
+                    return int(match.group(1)) if match else 10**9
+
+                if len(new_candidates) > plan_capacity:
+                    kept = sorted(new_candidates, key=intent_num)[:plan_capacity]
+                    kept_new_ids = {i.intent_id for i in kept}
+                    dropped_new_intent_ids = sorted(
+                        i.intent_id for i in new_candidates if i.intent_id not in kept_new_ids
+                    )
+                    dropped_set = set(dropped_new_intent_ids)
+                    parsed_intents = [i for i in parsed_intents if i.intent_id not in dropped_set]
+                    new_candidates = kept
+                else:
+                    kept_new_ids = {i.intent_id for i in new_candidates}
+
+                default_earliest_turn = self.turn_index + max(1, self.config.deferred_intent_offset)
+                default_latest_turn = (
+                    default_earliest_turn
+                    if self.config.deferred_intent_strategy == DeferredIntentStrategy.FIXED
+                    else default_earliest_turn + max(0, self.config.deferred_intent_grace)
+                )
+
+                for intent in new_candidates:
+                    intent.created_turn = self.turn_index
+                    intent.status = "active"
+                    intent.revision_count = 0
+                    intent.fire_turn = None
+                    intent.terminal_reason = ""
+                    intent.decision_strategy = ""
+                    intent.decision_signals = []
+                    intent.decision_rationale = ""
+                    if self.config.deferred_intent_strategy == DeferredIntentStrategy.FIXED:
+                        intent.trigger = []
+                        intent.cancel_if = []
+                    if self.config.deferred_intent_timing == DeferredIntentTiming.OFFSET:
+                        intent.earliest_turn = default_earliest_turn
+                        intent.latest_turn = default_latest_turn
+                    else:
+                        if intent.earliest_turn <= self.turn_index:
+                            intent.earliest_turn = self.turn_index + 1
+                        if intent.latest_turn < intent.earliest_turn:
+                            intent.latest_turn = intent.earliest_turn
+                        if self.config.deferred_intent_strategy == DeferredIntentStrategy.FIXED:
+                            intent.latest_turn = intent.earliest_turn
+
+            # Enforce a hard cap after applying plan policy/max-new.
             if len(parsed_intents) > self.config.deferred_intent_limit:
+
                 def sort_key(intent: DeferredIntent) -> tuple[int, int, float]:
                     status_rank = 0 if intent.status == "active" else 1
                     return (status_rank, -intent.created_turn, -intent.priority)
 
                 parsed_intents = sorted(parsed_intents, key=sort_key)[: self.config.deferred_intent_limit]
 
-            new_candidates = [i for i in parsed_intents if i.intent_id not in prev_snapshot]
+            planned_intents = [i for i in parsed_intents if i.intent_id in kept_new_ids]
             planned_intents = sorted(
-                new_candidates,
+                planned_intents,
                 key=lambda intent: (intent.created_turn, intent.priority),
                 reverse=True,
             )
             if planned_intents:
                 planned_intent = planned_intents[0]
 
-            if eligible_plan_turn or planned_intents:
+            if eligible_plan_turn or planned_intents or dropped_new_intent_ids:
                 self._log(
                     "deferred_intent_plan",
                     {
@@ -2152,10 +2260,18 @@ class RecursiveConclusionSession:
                             "backend": "inband",
                             "eligible": eligible_plan_turn,
                             "plan_capacity": plan_capacity,
+                            "plan_policy": self.config.deferred_intent_plan_policy.value,
+                            "plan_budget": self.config.deferred_intent_plan_budget,
+                            "plan_probe_calls_used": self.deferred_intent_plan_probe_calls,
+                            "dropped_new_intent_ids": dropped_new_intent_ids or None,
                         },
+                        "plan_policy": self.config.deferred_intent_plan_policy.value,
+                        "plan_budget": self.config.deferred_intent_plan_budget,
+                        "plan_probe_calls_used": self.deferred_intent_plan_probe_calls,
                         "usage": None,
                         "finish_reason": None,
                         "request_id": None,
+                        "planning_capacity": plan_capacity,
                     },
                 )
 
@@ -2474,6 +2590,10 @@ class RecursiveConclusionSession:
             "due_deferred_intents": due_payloads,
             "deferred_intent_actions": list(action_map.values()),
             "deferred_intent_backend": self.config.deferred_intent_backend.value,
+            "deferred_intent_timing": self.config.deferred_intent_timing.value,
+            "deferred_intent_plan_policy": self.config.deferred_intent_plan_policy.value,
+            "deferred_intent_plan_budget": self.config.deferred_intent_plan_budget,
+            "deferred_intent_plan_probe_calls": self.deferred_intent_plan_probe_calls,
             "deferred_intent_latent_injection": self.config.deferred_intent_latent_injection.value,
             "deferred_intent_ablation": self.config.deferred_intent_ablation.value,
             "deferred_intent_ablation_actions": ablation_actions,
@@ -2528,7 +2648,7 @@ def parse_provider_specs(specs: list[str]) -> list[tuple[str, str]]:
 
 def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: str = "") -> ExperimentConfig:
     base = base_system or args.system or ""
-    return ExperimentConfig(
+    cfg = ExperimentConfig(
         base_system=base,
         recent_window_messages=args.window,
         memory_every=args.memory_every,
@@ -2547,6 +2667,16 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         deferred_intent_offset=args.deferred_intent_offset,
         deferred_intent_grace=args.deferred_intent_grace,
         deferred_intent_limit=args.deferred_intent_limit,
+        deferred_intent_plan_policy=DeferredIntentPlanPolicy(
+            getattr(
+                args,
+                "deferred_intent_plan_policy",
+                DeferredIntentPlanPolicy.PERIODIC.value,
+            )
+        ),
+        deferred_intent_plan_budget=max(
+            0, int(getattr(args, "deferred_intent_plan_budget", 0) or 0)
+        ),
         deferred_intent_plan_max_new=max(0, int(getattr(args, "deferred_intent_plan_max_new", 1) or 0)),
         deferred_intent_backend=DeferredIntentBackend(args.deferred_intent_backend),
         deferred_intent_latent_injection=DeferredIntentLatentInjection(
@@ -2565,6 +2695,16 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
             timeout_seconds=args.timeout,
         ),
     )
+
+    if (
+        cfg.deferred_intent_plan_policy == DeferredIntentPlanPolicy.AUTO
+        and cfg.deferred_intent_plan_budget <= 0
+    ):
+        raise ValueError(
+            "deferred_intent_plan_policy='auto' requires --deferred-intent-plan-budget >= 1."
+        )
+
+    return cfg
 
 
 def run_repl(args: argparse.Namespace) -> int:
@@ -2816,6 +2956,27 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=6,
             help="Maximum number of simultaneously active deferred intents.",
+        )
+        p.add_argument(
+            "--deferred-intent-plan-policy",
+            choices=[m.value for m in DeferredIntentPlanPolicy],
+            default=DeferredIntentPlanPolicy.PERIODIC.value,
+            help=(
+                "Planning cadence for new deferred intents: "
+                "'periodic' uses --deferred-intent-every; "
+                "'auto' allows planning every turn until the plan budget is exhausted."
+            ),
+        )
+        p.add_argument(
+            "--deferred-intent-plan-budget",
+            type=int,
+            default=0,
+            help=(
+                "Maximum number of deferred-intent planning opportunities per run. "
+                "0 means unlimited (useful with --deferred-intent-plan-policy periodic). "
+                "Required for --deferred-intent-plan-policy auto. "
+                "Counts planner probe calls (external) / eligible planning turns (inband)."
+            ),
         )
         p.add_argument(
             "--deferred-intent-plan-max-new",

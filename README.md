@@ -97,6 +97,19 @@ python recursive_conclusion_lab.py run-config \
 - `external` (default): explicit planner/scheduler probes (more controlled, more API calls).
 - `inband`: the assistant carries deferred-intent state by appending a hidden `<RCL_STATE>...</RCL_STATE>` JSON block to each reply (more portable, fewer moving parts).
 
+### Planning cadence & timing
+
+- `--deferred-intent-plan-policy periodic|auto`
+  - `periodic`: plan on `--deferred-intent-every` turns.
+  - `auto`: allow planning every turn until the plan budget is exhausted.
+- `--deferred-intent-plan-budget N`
+  - required for `--deferred-intent-plan-policy auto`
+  - limits planner calls (`external`) / eligible planning turns (`inband`)
+- `--deferred-intent-plan-max-new N`: cap new intents per eligible planning turn (both backends).
+- `--deferred-intent-timing offset|model`
+  - `offset` (default): timing window derives from `--deferred-intent-offset` / `--deferred-intent-grace`.
+  - `model`: the planner proposes a timing window (fully supported in `external`; `inband` uses the state's `earliest_turn`/`latest_turn`).
+
 Enable in-band deferred intents:
 
 ```bash
@@ -167,6 +180,14 @@ python recursive_conclusion_lab.py compare \
 python analyze_runs.py \
   --log-dir compare_outputs/deferred_trigger \
   --script protocol_scripts/gather_then_recommend.json
+```
+
+Import JSONL into SQLite:
+
+```bash
+python jsonl_to_sqlite.py \
+  --db runs/rcl.sqlite \
+  --log-dir compare_outputs/deferred_trigger
 ```
 
 ## Protocol docs

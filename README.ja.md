@@ -18,6 +18,9 @@
    - `fixed / trigger / adaptive` の 3 戦略を試せます。
    - `--deferred-intent-mode soft_fire` にすると、due になった意図を system 側へ自然発火のヒントとして注入できます。
    - `--deferred-intent-backend inband` にすると、意図状態を会話内（返信末尾の隠し `<RCL_STATE>` JSON）で保持でき、planner/scheduler の追加プローブ呼び出しを減らせます。
+   - `--deferred-intent-plan-policy periodic|auto` / `--deferred-intent-plan-budget N` で「新規 intent をいつ/どれだけ計画できるか」を制御できます（`auto` のとき budget 必須）。
+   - `--deferred-intent-plan-max-new N` は 1 回の計画ターンで作れる新規 intent 数の上限です（external + inband）。
+   - `--deferred-intent-timing offset|model` は timing window の決め方です（`model` は external planner で timing も提案させたい場合）。
 
 ## 対応プロバイダ
 
@@ -180,6 +183,14 @@ python analyze_runs.py \
   --log-dir compare_outputs/deferred_trigger \
   --script protocol_scripts/gather_then_recommend.json \
   --out compare_outputs/deferred_trigger/analysis.json
+```
+
+## JSONL → SQLite
+
+```bash
+python jsonl_to_sqlite.py \
+  --db runs/rcl.sqlite \
+  --log-dir compare_outputs/deferred_trigger
 ```
 
 主な出力指標:

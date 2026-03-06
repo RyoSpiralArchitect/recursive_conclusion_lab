@@ -110,6 +110,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     planned_intents: list[dict[str, Any]] = []
     intent_status_by_id: dict[str, str] = {}
     inband_prune_events: list[dict[str, Any]] = []
+    plan_probe_call_count = 0
 
     for row in events:
         provider = provider or row.get("provider")
@@ -123,6 +124,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         elif et == "memory_capsule":
             capsules.append(payload.get("capsule", ""))
         elif et == "deferred_intent_plan":
+            plan_probe_call_count += 1
             if payload.get("created"):
                 if isinstance(payload.get("intent"), dict):
                     planned_intents.append(payload["intent"])
@@ -131,6 +133,8 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                     for item in created_items:
                         if isinstance(item, dict):
                             planned_intents.append(item)
+        elif et == "deferred_intent_plan_error":
+            plan_probe_call_count += 1
         elif et == "deferred_intent_decision":
             for decision in payload.get("decisions") or []:
                 if isinstance(decision, dict) and decision.get("intent_id"):
@@ -186,6 +190,10 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     premature_fire_count = 0
     stale_fire_count = 0
     fire_turn_gaps: list[int] = []
+    fire_window_widths: list[int] = []
+    fire_window_position_ratios: list[float] = []
+    fire_at_earliest_count = 0
+    fire_at_latest_count = 0
     seen_fired_ids: set[str] = set()
     seen_terminal_ids: set[str] = set()
 
@@ -241,6 +249,10 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         premature_fire_count = 0
         stale_fire_count = 0
         fire_turn_gaps = []
+        fire_window_widths = []
+        fire_window_position_ratios = []
+        fire_at_earliest_count = 0
+        fire_at_latest_count = 0
         fire_count = 0
         for turn_idx, row in enumerate(assistant_rows, start=1):
             for action in row.get("deferred_intent_actions") or []:
@@ -265,6 +277,19 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                     premature_fire_count += 1
                 if isinstance(latest_turn, int) and turn_idx > latest_turn:
                     stale_fire_count += 1
+                if isinstance(earliest_turn, int) and isinstance(latest_turn, int):
+                    width = latest_turn - earliest_turn
+                    if width < 0:
+                        continue
+                    fire_window_widths.append(width)
+                    if turn_idx == earliest_turn:
+                        fire_at_earliest_count += 1
+                    if turn_idx == latest_turn:
+                        fire_at_latest_count += 1
+                    if width > 0:
+                        fire_window_position_ratios.append((turn_idx - earliest_turn) / width)
+                    else:
+                        fire_window_position_ratios.append(0.0)
 
     planned_ids = {
         str(item.get("intent_id"))
@@ -314,11 +339,47 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     decision_signal_counts = count_strings(decision_signals)
 
     deferred_intent_backend = None
+    deferred_intent_timing = None
+    deferred_intent_plan_policy = None
+    deferred_intent_plan_budget = None
+    deferred_intent_plan_probe_calls = 0
     for row in assistant_rows:
-        backend = row.get("deferred_intent_backend")
-        if backend:
-            deferred_intent_backend = str(backend)
-            break
+        if deferred_intent_backend is None:
+            backend = row.get("deferred_intent_backend")
+            if backend:
+                deferred_intent_backend = str(backend)
+        if deferred_intent_timing is None:
+            timing = row.get("deferred_intent_timing")
+            if timing:
+                deferred_intent_timing = str(timing)
+        if deferred_intent_plan_policy is None:
+            policy = row.get("deferred_intent_plan_policy")
+            if policy:
+                deferred_intent_plan_policy = str(policy)
+        if deferred_intent_plan_budget is None:
+            budget = row.get("deferred_intent_plan_budget")
+            if isinstance(budget, int):
+                deferred_intent_plan_budget = budget
+        probe_calls = row.get("deferred_intent_plan_probe_calls")
+        if isinstance(probe_calls, int):
+            deferred_intent_plan_probe_calls = max(deferred_intent_plan_probe_calls, probe_calls)
+
+    planned_delay_mins: list[int] = []
+    planned_delay_maxs: list[int] = []
+    planned_window_widths: list[int] = []
+    for item in planned_unique:
+        created_turn = item.get("created_turn")
+        earliest_turn = item.get("earliest_turn")
+        latest_turn = item.get("latest_turn")
+        if not (
+            isinstance(created_turn, int)
+            and isinstance(earliest_turn, int)
+            and isinstance(latest_turn, int)
+        ):
+            continue
+        planned_delay_mins.append(earliest_turn - created_turn)
+        planned_delay_maxs.append(latest_turn - created_turn)
+        planned_window_widths.append(latest_turn - earliest_turn)
 
     inband_state_errors = [
         str(row.get("inband_state_error"))
@@ -350,6 +411,11 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "probe_count": len(probes),
         "memory_capsule_count": len(capsules),
         "deferred_intent_backend": deferred_intent_backend,
+        "deferred_intent_timing": deferred_intent_timing,
+        "deferred_intent_plan_policy": deferred_intent_plan_policy,
+        "deferred_intent_plan_budget": deferred_intent_plan_budget,
+        "deferred_intent_plan_probe_calls": deferred_intent_plan_probe_calls,
+        "deferred_intent_plan_probe_call_count": plan_probe_call_count,
         "deferred_intent_plan_count": len(planned_ids),
         "deferred_intent_fire_count": fire_count,
         "deferred_intent_cancel_count": cancel_count,
@@ -362,6 +428,13 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         ),
         "avg_deferred_intent_reply_overlap": mean_or_none(fire_overlaps),
         "avg_deferred_intent_fire_gap": mean_or_none(fire_turn_gaps),
+        "avg_planned_delay_min_turns": mean_or_none(planned_delay_mins),
+        "avg_planned_delay_max_turns": mean_or_none(planned_delay_maxs),
+        "avg_planned_window_width_turns": mean_or_none(planned_window_widths),
+        "avg_fire_window_width_turns": mean_or_none(fire_window_widths),
+        "avg_fire_window_position_ratio": mean_or_none(fire_window_position_ratios),
+        "fire_at_earliest_rate": (fire_at_earliest_count / fire_count) if fire_count else None,
+        "fire_at_latest_rate": (fire_at_latest_count / fire_count) if fire_count else None,
         "deferred_intent_premature_fire_count": premature_fire_count,
         "deferred_intent_stale_fire_count": stale_fire_count,
         "avg_probe_reply_overlap": mean_or_none(per_turn_overlap),
@@ -416,11 +489,14 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "provider",
         "model",
         "deferred_intent_backend",
+        "deferred_intent_timing",
         "turns",
         "probe_count",
         "deferred_intent_plan_count",
         "deferred_intent_fire_count",
         "deferred_intent_realization_rate",
+        "avg_planned_window_width_turns",
+        "avg_fire_window_position_ratio",
         "avg_deferred_intent_reply_overlap",
         "avg_probe_reply_overlap",
         "inband_state_error_count",

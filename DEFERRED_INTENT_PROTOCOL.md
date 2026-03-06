@@ -42,6 +42,8 @@ python recursive_conclusion_lab.py compare \
 - `--deferred-intent-timing offset` (default): planner proposes *content* only; timing is derived from `--deferred-intent-offset` / `--deferred-intent-grace`.
 - `--deferred-intent-timing model`: planner proposes `timing.delay_min_turns` / `timing.delay_max_turns` (or `timing.earliest_turn` / `timing.latest_turn`) for each planned intent.
 - `--deferred-intent-plan-max-new` caps how many new intents can be created per eligible planning turn (external + inband).
+- `--deferred-intent-plan-policy periodic|auto`: `periodic` uses `--deferred-intent-every`; `auto` allows planning every turn until the plan budget is exhausted (external + inband).
+- `--deferred-intent-plan-budget N`: required for `--deferred-intent-plan-policy auto`; limits planner probe calls per run (`external`) / limits planning-eligible turns for new intents (`inband`).
 
 現在の会話から「あとで言う候補」を 1 件だけ作る。
 
@@ -153,6 +155,12 @@ latent injection を有効にした上で、`--deferred-intent-ablation delete_p
 - `deferred_intent_stale_fire_count`
 - `deferred_intent_cancel_count`
 - `deferred_intent_revise_count`
+- `deferred_intent_timing` (offset|model)
+- `avg_planned_delay_min_turns` / `avg_planned_delay_max_turns`
+- `avg_planned_window_width_turns`
+- `avg_fire_window_width_turns`
+- `avg_fire_window_position_ratio`
+- `fire_at_earliest_rate` / `fire_at_latest_rate`
 
 ### decision-trace metrics (new)
 
@@ -247,6 +255,14 @@ python analyze_runs.py \
   --log-dir runs/deferred_trigger \
   --script protocol_scripts/gather_then_recommend.json \
   --out runs/deferred_trigger/analysis.json
+```
+
+### JSONL → SQLite
+
+```bash
+python jsonl_to_sqlite.py \
+  --db runs/rcl.sqlite \
+  --log-dir runs/deferred_trigger
 ```
 
 ## 9. 読み方
