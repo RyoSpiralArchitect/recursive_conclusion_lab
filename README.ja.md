@@ -246,3 +246,7 @@ python jsonl_to_sqlite.py \
 - `fixed` vs `trigger` vs `adaptive` で deferred intent の自然さがどう変わるか
 - `gather_then_recommend` で「早すぎる提案」が減るか
 - `interrupted_agenda` で保持した意図をちゃんと cancel できるか
+
+## ライセンス
+
+GNU Affero General Public License v3.0 以降（`AGPL-3.0-or-later`）。`LICENSE` を参照してください。

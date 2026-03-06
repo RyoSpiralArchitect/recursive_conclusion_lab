@@ -231,3 +231,7 @@ python jsonl_to_sqlite.py \
 
 - `EXPERIMENT_PROTOCOL.md` (JP)
 - `DEFERRED_INTENT_PROTOCOL.md` (JP)
+
+## License
+
+GNU Affero General Public License v3.0 or later (`AGPL-3.0-or-later`). See `LICENSE`.
