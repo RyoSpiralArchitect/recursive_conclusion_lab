@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 DEFERRED_REALIZATION_THRESHOLD = 0.10
 CONCLUSION_MENTION_THRESHOLD = 0.10
+LATENT_ALIGNMENT_THRESHOLD = 0.55
 
 
 def compact_text(text: str) -> str:
@@ -33,6 +34,19 @@ def mean_or_none(values: Iterable[float]) -> float | None:
     return statistics.fmean(vals)
 
 
+def sequence_slope(values: Iterable[float]) -> float | None:
+    vals = [float(v) for v in values]
+    if len(vals) < 2:
+        return None
+    x_mean = (len(vals) - 1) / 2.0
+    y_mean = statistics.fmean(vals)
+    denom = sum((idx - x_mean) ** 2 for idx in range(len(vals)))
+    if denom <= 0.0:
+        return None
+    numer = sum((idx - x_mean) * (value - y_mean) for idx, value in enumerate(vals))
+    return numer / denom
+
+
 def count_strings(values: Iterable[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for value in values:
@@ -41,6 +55,55 @@ def count_strings(values: Iterable[str]) -> dict[str, int]:
             continue
         counts[key] = counts.get(key, 0) + 1
     return counts
+
+
+def coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = compact_text(str(value))
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def hazard_delays(profile: Any) -> list[int]:
+    if not isinstance(profile, list):
+        return []
+    delays: list[int] = []
+    for item in profile:
+        if not isinstance(item, dict):
+            continue
+        delay = coerce_int(item.get("delay_turns"))
+        prob = item.get("prob")
+        if delay is None:
+            continue
+        if isinstance(prob, (int, float)) and float(prob) <= 0.0:
+            continue
+        delays.append(delay)
+    return sorted(set(delays))
+
+
+def hazard_probability_for_delay(profile: Any, delay: int) -> float | None:
+    if not isinstance(profile, list):
+        return None
+    for item in profile:
+        if not isinstance(item, dict):
+            continue
+        item_delay = coerce_int(item.get("delay_turns"))
+        if item_delay != delay:
+            continue
+        prob = item.get("prob")
+        if isinstance(prob, (int, float)):
+            return float(prob)
+        return None
+    return 0.0
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -110,14 +173,20 @@ def coerce_usage_num(value: Any) -> float:
 
 def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     events = read_jsonl(path)
+    arm = None
     provider = None
     model = None
+    if "___" in path.stem:
+        arm_part, _ = path.stem.split("___", 1)
+        if arm_part.startswith("arm_"):
+            arm = arm_part[4:]
 
     assistant_rows: list[dict[str, Any]] = []
     assistant_text_by_turn: dict[int, str] = {}
     probes: list[str] = []
     probe_events: list[tuple[int, str]] = []
     probe_plan_events: list[dict[str, Any]] = []
+    latent_trace_events: list[dict[str, Any]] = []
     delayed_mention_plans: list[dict[str, Any]] = []
     delayed_mention_actions: list[dict[str, Any]] = []
     delayed_mention_plan_error_count = 0
@@ -159,6 +228,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                             "keywords": keywords,
                             "mention_delay_min_turns": payload.get("mention_delay_min_turns"),
                             "mention_delay_max_turns": payload.get("mention_delay_max_turns"),
+                            "mention_hazard_profile": payload.get("mention_hazard_profile") or [],
                             "mention_likelihood": payload.get("mention_likelihood"),
                             "delay_strategy": payload.get("delay_strategy"),
                             "delay_signals": payload.get("delay_signals") or [],
@@ -182,6 +252,14 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
             for decision in payload.get("decisions") or []:
                 if isinstance(decision, dict) and decision.get("intent_id"):
                     intent_status_by_id[str(decision["intent_id"])] = str(decision.get("status_after", ""))
+        elif et == "latent_convergence_trace":
+            if isinstance(payload, dict):
+                latent_trace_events.append(
+                    {
+                        **payload,
+                        "turn": row.get("turn_index"),
+                    }
+                )
         elif et == "inband_state_prune":
             if isinstance(payload, dict):
                 inband_prune_events.append(payload)
@@ -244,6 +322,11 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     planned_conclusion_delay_mins: list[int] = []
     planned_conclusion_delay_maxs: list[int] = []
     planned_conclusion_window_widths: list[int] = []
+    planned_conclusion_hazard_support_widths: list[int] = []
+    conclusion_hazard_plan_count = 0
+    conclusion_hazard_turn_probs_at_mention: list[float] = []
+    conclusion_hazard_mention_count = 0
+    conclusion_hazard_on_support_count = 0
     conclusion_delay_strategies: list[str] = []
     conclusion_delay_signals: list[str] = []
     conclusion_mention_likelihoods: list[float] = []
@@ -261,6 +344,11 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         delay_min = plan.get("mention_delay_min_turns")
         delay_max = plan.get("mention_delay_max_turns")
         has_window = isinstance(delay_min, int) and isinstance(delay_max, int) and delay_max >= delay_min
+        hazard_profile = plan.get("mention_hazard_profile") or []
+        delays = hazard_delays(hazard_profile)
+        if delays:
+            conclusion_hazard_plan_count += 1
+            planned_conclusion_hazard_support_widths.append(max(delays) - min(delays))
         if has_window:
             conclusion_plan_window_defined_count += 1
             planned_conclusion_delay_mins.append(delay_min)
@@ -295,6 +383,13 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                 mention_delay = turn_idx - probe_turn
                 conclusion_any_mention_count += 1
                 conclusion_any_mention_delays.append(mention_delay)
+                if delays:
+                    conclusion_hazard_mention_count += 1
+                    hazard_turn_prob = hazard_probability_for_delay(hazard_profile, mention_delay)
+                    if isinstance(hazard_turn_prob, (int, float)):
+                        conclusion_hazard_turn_probs_at_mention.append(float(hazard_turn_prob))
+                        if float(hazard_turn_prob) > 0.0:
+                            conclusion_hazard_on_support_count += 1
                 if has_window:
                     if mention_delay < delay_min:
                         conclusion_plan_early_count += 1
@@ -378,6 +473,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     fire_turn_gaps: list[int] = []
     fire_window_widths: list[int] = []
     fire_window_position_ratios: list[float] = []
+    hazard_turn_probs_at_fire: list[float] = []
     fire_at_earliest_count = 0
     fire_at_latest_count = 0
     seen_fired_ids: set[str] = set()
@@ -405,6 +501,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                         realized_fire_count += 1
                 if action.get("injected"):
                     injected_fire_count += 1
+                hazard_turn_prob = action.get("hazard_turn_prob")
+                if isinstance(hazard_turn_prob, (int, float)):
+                    hazard_turn_probs_at_fire.append(float(hazard_turn_prob))
                 turn = action.get("created_turn")
                 fire_turn = action.get("fire_turn")
                 if isinstance(turn, int) and isinstance(fire_turn, int):
@@ -437,6 +536,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         fire_turn_gaps = []
         fire_window_widths = []
         fire_window_position_ratios = []
+        hazard_turn_probs_at_fire = []
         fire_at_earliest_count = 0
         fire_at_latest_count = 0
         fire_count = 0
@@ -454,6 +554,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                         realized_fire_count += 1
                 if action.get("injected"):
                     injected_fire_count += 1
+                hazard_turn_prob = action.get("hazard_turn_prob")
+                if isinstance(hazard_turn_prob, (int, float)):
+                    hazard_turn_probs_at_fire.append(float(hazard_turn_prob))
                 created_turn = action.get("created_turn")
                 earliest_turn = action.get("earliest_turn")
                 latest_turn = action.get("latest_turn")
@@ -553,10 +656,24 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     planned_delay_mins: list[int] = []
     planned_delay_maxs: list[int] = []
     planned_window_widths: list[int] = []
+    planned_hazard_support_widths: list[int] = []
+    hazard_plan_count = 0
     for item in planned_unique:
         created_turn = item.get("created_turn")
         earliest_turn = item.get("earliest_turn")
         latest_turn = item.get("latest_turn")
+        hazard_profile = item.get("hazard_profile") or []
+        if isinstance(hazard_profile, list) and hazard_profile:
+            hazard_plan_count += 1
+            delays = []
+            for point in hazard_profile:
+                if not isinstance(point, dict):
+                    continue
+                delay = point.get("delay_turns")
+                if isinstance(delay, int):
+                    delays.append(delay)
+            if delays:
+                planned_hazard_support_widths.append(max(delays) - min(delays))
         if not (
             isinstance(created_turn, int)
             and isinstance(earliest_turn, int)
@@ -566,6 +683,68 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         planned_delay_mins.append(earliest_turn - created_turn)
         planned_delay_maxs.append(latest_turn - created_turn)
         planned_window_widths.append(latest_turn - earliest_turn)
+
+    latent_alignments: list[float] = []
+    latent_readiness_values: list[float] = []
+    latent_leakage_risks: list[float] = []
+    latent_stage_counts: list[str] = []
+    latent_signal_counts: list[str] = []
+    latent_prewindow_trace_count = 0
+    latent_semantic_leakage_count = 0
+    first_semantic_turn_by_probe: dict[int, int] = {}
+    for event in latent_trace_events:
+        alignment = event.get("alignment")
+        readiness = event.get("articulation_readiness")
+        leakage_risk = event.get("leakage_risk")
+        if isinstance(alignment, (int, float)):
+            latent_alignments.append(float(alignment))
+        if isinstance(readiness, (int, float)):
+            latent_readiness_values.append(float(readiness))
+        if isinstance(leakage_risk, (int, float)):
+            latent_leakage_risks.append(float(leakage_risk))
+        stage = event.get("trajectory_stage")
+        if stage:
+            latent_stage_counts.append(str(stage))
+        signals = event.get("shift_signals") or []
+        if isinstance(signals, list):
+            latent_signal_counts.extend(str(x) for x in signals if x)
+
+        turn = event.get("turn")
+        planned_earliest_turn = event.get("planned_earliest_turn")
+        explicit_present = event.get("explicit_mention_present")
+        if isinstance(turn, int) and isinstance(planned_earliest_turn, int) and turn < planned_earliest_turn:
+            latent_prewindow_trace_count += 1
+            if (
+                isinstance(alignment, (int, float))
+                and float(alignment) >= LATENT_ALIGNMENT_THRESHOLD
+                and explicit_present is not True
+            ):
+                latent_semantic_leakage_count += 1
+
+        probe_turn = event.get("conclusion_probe_turn")
+        if (
+            isinstance(probe_turn, int)
+            and isinstance(turn, int)
+            and isinstance(alignment, (int, float))
+            and float(alignment) >= LATENT_ALIGNMENT_THRESHOLD
+            and explicit_present is not True
+            and turn >= probe_turn
+        ):
+            first_semantic_turn_by_probe.setdefault(probe_turn, turn)
+
+    first_explicit_turn_by_probe: dict[int, int] = {}
+    for turn_idx, row in enumerate(assistant_rows, start=1):
+        probe_turn = row.get("latest_conclusion_probe_turn")
+        if not isinstance(probe_turn, int):
+            continue
+        if row.get("latest_conclusion_mentioned_any") is True:
+            first_explicit_turn_by_probe.setdefault(probe_turn, turn_idx)
+
+    articulation_gaps: list[int] = []
+    for probe_turn, semantic_turn in first_semantic_turn_by_probe.items():
+        explicit_turn = first_explicit_turn_by_probe.get(probe_turn)
+        if isinstance(explicit_turn, int) and explicit_turn > semantic_turn:
+            articulation_gaps.append(explicit_turn - semantic_turn)
 
     inband_state_errors = [
         str(row.get("inband_state_error"))
@@ -629,6 +808,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     delayed_mention_late_count = 0
     delayed_mention_delays: list[int] = []
     delayed_mention_injected_on_mention_count = 0
+    delayed_mention_hazard_mention_count = 0
+    delayed_mention_hazard_on_support_count = 0
+    delayed_mention_hazard_turn_probs_at_mention: list[float] = []
     for act in mention_actions:
         mt = act.get("mention_turn")
         et = act.get("earliest_turn")
@@ -642,6 +824,12 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
             delayed_mention_delays.append(delay)
         if act.get("injected") is True:
             delayed_mention_injected_on_mention_count += 1
+        hazard_turn_prob = act.get("hazard_turn_prob")
+        if isinstance(hazard_turn_prob, (int, float)):
+            delayed_mention_hazard_mention_count += 1
+            delayed_mention_hazard_turn_probs_at_mention.append(float(hazard_turn_prob))
+            if float(hazard_turn_prob) > 0.0:
+                delayed_mention_hazard_on_support_count += 1
 
     delayed_mention_mention_rate = (
         delayed_mention_mentioned_count / delayed_mention_planned_count
@@ -677,8 +865,33 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     delayed_mention_strategy_counts = count_strings(delayed_mention_strategies)
     delayed_mention_signal_counts = count_strings(delayed_mention_signals)
 
+    delayed_mention_leak_policy = None
+    delayed_mention_leak_threshold = None
+    suppressed_delayed_mention_counts: list[int] = []
+    for row in assistant_rows:
+        if delayed_mention_leak_policy is None:
+            value = row.get("delayed_mention_leak_policy")
+            if value:
+                delayed_mention_leak_policy = str(value)
+        if delayed_mention_leak_threshold is None:
+            value = row.get("delayed_mention_leak_threshold")
+            if isinstance(value, (int, float)):
+                delayed_mention_leak_threshold = float(value)
+        suppressed = row.get("suppressed_delayed_mentions") or []
+        if isinstance(suppressed, list):
+            suppressed_delayed_mention_counts.append(len(suppressed))
+
+    delayed_mention_hazard_plan_count = 0
+    planned_delayed_mention_hazard_support_widths: list[int] = []
+    for item in delayed_mention_unique:
+        delays = hazard_delays(item.get("hazard_profile") or [])
+        if delays:
+            delayed_mention_hazard_plan_count += 1
+            planned_delayed_mention_hazard_support_widths.append(max(delays) - min(delays))
+
     result = {
         "file": str(path),
+        "arm": arm,
         "provider": provider,
         "model": model,
         "turns": len(assistant_rows),
@@ -701,16 +914,45 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "avg_planned_conclusion_window_width_turns": mean_or_none(
             planned_conclusion_window_widths
         ),
+        "conclusion_hazard_plan_count": conclusion_hazard_plan_count,
+        "avg_planned_conclusion_hazard_support_width_turns": mean_or_none(
+            planned_conclusion_hazard_support_widths
+        ),
+        "avg_conclusion_hazard_turn_prob_at_mention": mean_or_none(
+            conclusion_hazard_turn_probs_at_mention
+        ),
+        "conclusion_on_support_rate": (
+            conclusion_hazard_on_support_count / conclusion_hazard_mention_count
+            if conclusion_hazard_mention_count
+            else None
+        ),
         "avg_conclusion_mention_likelihood": mean_or_none(conclusion_mention_likelihoods),
         "delayed_mention_plan_error_count": delayed_mention_plan_error_count,
         "delayed_mention_planned_count": delayed_mention_planned_count,
         "delayed_mention_planned_nonconclusion_count": delayed_mention_planned_nonconclusion_count,
+        "delayed_mention_hazard_plan_count": delayed_mention_hazard_plan_count,
+        "delayed_mention_leak_policy": delayed_mention_leak_policy,
+        "delayed_mention_leak_threshold": delayed_mention_leak_threshold,
         "delayed_mention_mentioned_count": delayed_mention_mentioned_count,
         "delayed_mention_expired_count": delayed_mention_expired_count,
         "delayed_mention_mention_rate": delayed_mention_mention_rate,
         "delayed_mention_nonconclusion_mention_rate": delayed_mention_nonconclusion_mention_rate,
         "delayed_mention_within_window_rate": delayed_mention_within_window_rate,
         "avg_delayed_mention_delay_turns": mean_or_none(delayed_mention_delays),
+        "avg_planned_delayed_mention_hazard_support_width_turns": mean_or_none(
+            planned_delayed_mention_hazard_support_widths
+        ),
+        "avg_delayed_mention_hazard_turn_prob_at_mention": mean_or_none(
+            delayed_mention_hazard_turn_probs_at_mention
+        ),
+        "delayed_mention_on_support_rate": (
+            delayed_mention_hazard_on_support_count / delayed_mention_hazard_mention_count
+            if delayed_mention_hazard_mention_count
+            else None
+        ),
+        "avg_suppressed_delayed_mention_count": mean_or_none(
+            suppressed_delayed_mention_counts
+        ),
         "delayed_mention_early_count": delayed_mention_early_count,
         "delayed_mention_late_count": delayed_mention_late_count,
         "delayed_mention_injected_on_mention_rate": delayed_mention_injected_on_mention_rate,
@@ -724,6 +966,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "deferred_intent_plan_probe_calls": deferred_intent_plan_probe_calls,
         "deferred_intent_plan_probe_call_count": plan_probe_call_count,
         "deferred_intent_plan_count": len(planned_ids),
+        "deferred_intent_hazard_plan_count": hazard_plan_count,
         "deferred_intent_fire_count": fire_count,
         "deferred_intent_cancel_count": cancel_count,
         "deferred_intent_expire_count": expire_count,
@@ -738,8 +981,10 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "avg_planned_delay_min_turns": mean_or_none(planned_delay_mins),
         "avg_planned_delay_max_turns": mean_or_none(planned_delay_maxs),
         "avg_planned_window_width_turns": mean_or_none(planned_window_widths),
+        "avg_planned_hazard_support_width_turns": mean_or_none(planned_hazard_support_widths),
         "avg_fire_window_width_turns": mean_or_none(fire_window_widths),
         "avg_fire_window_position_ratio": mean_or_none(fire_window_position_ratios),
+        "avg_hazard_turn_prob_at_fire": mean_or_none(hazard_turn_probs_at_fire),
         "fire_at_earliest_rate": (fire_at_earliest_count / fire_count) if fire_count else None,
         "fire_at_latest_rate": (fire_at_latest_count / fire_count) if fire_count else None,
         "deferred_intent_premature_fire_count": premature_fire_count,
@@ -757,6 +1002,20 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "max_inband_state_chars": max(inband_state_sizes) if inband_state_sizes else None,
         "inband_state_prune_count": len(inband_prune_events),
         "inband_state_pruned_intents_total": pruned_intents_total,
+        "latent_trace_count": len(latent_trace_events),
+        "avg_latent_alignment": mean_or_none(latent_alignments),
+        "avg_latent_readiness": mean_or_none(latent_readiness_values),
+        "avg_latent_leakage_risk": mean_or_none(latent_leakage_risks),
+        "latent_alignment_slope": sequence_slope(latent_alignments),
+        "latent_semantic_leakage_count": latent_semantic_leakage_count,
+        "latent_semantic_leakage_rate": (
+            latent_semantic_leakage_count / latent_prewindow_trace_count
+            if latent_prewindow_trace_count
+            else None
+        ),
+        "avg_articulation_gap_turns": mean_or_none(articulation_gaps),
+        "latent_stage_counts": count_strings(latent_stage_counts) or None,
+        "latent_signal_counts": count_strings(latent_signal_counts) or None,
         "plan_strategy_counts": plan_strategy_counts or None,
         "plan_signal_counts": plan_signal_counts or None,
         "decision_strategy_counts": decision_strategy_counts or None,
@@ -795,8 +1054,11 @@ def collect_logs(args: argparse.Namespace) -> list[Path]:
 
 def print_table(rows: list[dict[str, Any]]) -> None:
     cols = [
+        "arm",
         "provider",
         "model",
+        "delayed_mention_leak_policy",
+        "delayed_mention_leak_threshold",
         "deferred_intent_backend",
         "deferred_intent_timing",
         "turns",
@@ -804,19 +1066,29 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "conclusion_line_mention_rate",
         "conclusion_any_mention_rate",
         "conclusion_plan_within_window_rate",
+        "conclusion_on_support_rate",
         "delayed_mention_planned_nonconclusion_count",
         "delayed_mention_nonconclusion_mention_rate",
         "delayed_mention_within_window_rate",
+        "delayed_mention_on_support_rate",
+        "avg_suppressed_delayed_mention_count",
         "delayed_mention_injected_on_mention_rate",
         "avg_conclusion_line_mention_delay_turns",
         "avg_conclusion_any_mention_delay_turns",
+        "avg_conclusion_hazard_turn_prob_at_mention",
+        "avg_delayed_mention_hazard_turn_prob_at_mention",
         "deferred_intent_plan_count",
         "deferred_intent_fire_count",
         "deferred_intent_realization_rate",
         "avg_planned_window_width_turns",
         "avg_fire_window_position_ratio",
         "avg_deferred_intent_reply_overlap",
+        "avg_hazard_turn_prob_at_fire",
         "avg_probe_reply_overlap",
+        "avg_latent_alignment",
+        "latent_alignment_slope",
+        "latent_semantic_leakage_rate",
+        "avg_articulation_gap_turns",
         "inband_state_error_count",
         "avg_inband_state_chars",
         "last_turn_alignment",

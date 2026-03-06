@@ -6,6 +6,7 @@ Cross-provider experiment harness for observing (and optionally steering) the *t
 
 - Recursive **memory capsules** (compressed context you can reload every turn)
 - Periodic **conclusion probes** (predict the likely end-state)
+- Observe-only **latent convergence traces** (semantic drift before explicit mention)
 - **Deferred utterance intents** (plan now, say later)
 
 ## Providers
@@ -82,6 +83,7 @@ Templates:
 
 - `templates/script_template.json`
 - `templates/compare_config_template.json` (CLI-to-JSON mapping reference)
+- `templates/compare_matrix_config_template.json` (arm matrix example)
 
 Run from a JSON config file:
 
@@ -106,9 +108,27 @@ python recursive_conclusion_lab.py run-config \
   - required for `--deferred-intent-plan-policy auto`
   - limits planner calls (`external`) / eligible planning turns (`inband`)
 - `--deferred-intent-plan-max-new N`: cap new intents per eligible planning turn (both backends).
-- `--deferred-intent-timing offset|model`
+- `--deferred-intent-timing offset|model|hazard`
   - `offset` (default): timing window derives from `--deferred-intent-offset` / `--deferred-intent-grace`.
   - `model`: the planner proposes a timing window (fully supported in `external`; `inband` uses the state's `earliest_turn`/`latest_turn`).
+  - `hazard`: the planner proposes a per-delay probability profile (`hazard_profile`) instead of a single fixed offset.
+
+### Latent convergence trace
+
+Track semantic convergence toward the latest conclusion even before explicit mention:
+
+```bash
+python recursive_conclusion_lab.py compare \
+  --script protocol_scripts/latent_resurfacing.json \
+  --providers openai=<model_id> \
+  --conclusion-every 2 \
+  --latent-convergence-every 1 \
+  --out-dir compare_outputs/latent_trace
+```
+
+This logs `latent_convergence_trace` events and analyzer fields like
+`avg_latent_alignment`, `latent_alignment_slope`, `latent_semantic_leakage_rate`,
+and `avg_articulation_gap_turns`.
 
 Enable in-band deferred intents:
 
@@ -176,15 +196,29 @@ python recursive_conclusion_lab.py compare \
 
 ## Analyze logs
 
+### Arm matrix
+
+Run a fixed arm set (for example `observe`, `latent_only`, `soft_fire`, `hard_fire`, `delete_planned`) from JSON:
+
+```bash
+python recursive_conclusion_lab.py compare-matrix \
+  --config templates/compare_matrix_config_template.json
+```
+
+This writes arm-tagged logs like `arm_soft_fire___openai__model.jsonl`, arm-specific summaries
+(`summary__soft_fire.json`), and a combined `summary.json`.
+
 ### Conclusion mention “delay” (observe-only)
 
 Each `conclusion_probe` also emits an observe-only “mention plan” (not injected into replies):
 
 - `keywords`: 3–5 distinctive phrases for mention detection
 - `mention_delay_min_turns` / `mention_delay_max_turns`: predicted mention window (turns after probe)
+- `mention_hazard_profile`: per-delay mention mass inside that window
 - `mention_likelihood`, `delay_strategy`, `delay_signals`
 
-`analyze_runs.py` reports planned-vs-actual metrics like `conclusion_plan_within_window_rate`.
+`analyze_runs.py` reports planned-vs-actual metrics like `conclusion_plan_within_window_rate`,
+`conclusion_on_support_rate`, and `avg_conclusion_hazard_turn_prob_at_mention`.
 
 ### Delayed mention targets (multi-item; optional)
 
@@ -207,11 +241,29 @@ python recursive_conclusion_lab.py compare \
   --delayed-mention-every 2 \
   --delayed-mention-mode soft_fire \
   --delayed-mention-fire-prob 0.35 \
+  --delayed-mention-leak-policy on \
+  --delayed-mention-leak-threshold 0.05 \
   --delayed-mention-fire-max-items 2
 ```
 
+Internally each delayed mention is now normalized to a `mention_hazard_profile`; `soft_fire`
+uses that per-delay mass to weight the per-turn injection probability instead of treating the
+whole support window as flat.
+
+The leakage guard is configurable:
+
+- `--delayed-mention-leak-policy on|off`
+- `--delayed-mention-leak-threshold <0.00-1.00>`
+
+When the guard is on, active delayed mentions whose current turn probability is still below the
+threshold are injected into the private system prompt as “keep latent” targets. This is meant to
+reduce early explicit surfacing without removing latent trajectory pressure.
+
 This logs `delayed_mention_plan` / `delayed_mention_action` events and adds analyzer columns like:
-`delayed_mention_nonconclusion_mention_rate`, `delayed_mention_within_window_rate`.
+`delayed_mention_nonconclusion_mention_rate`, `delayed_mention_within_window_rate`,
+`delayed_mention_on_support_rate`, `avg_delayed_mention_hazard_turn_prob_at_mention`,
+`delayed_mention_leak_policy`, `delayed_mention_leak_threshold`, and
+`avg_suppressed_delayed_mention_count`.
 
 ```bash
 python analyze_runs.py \

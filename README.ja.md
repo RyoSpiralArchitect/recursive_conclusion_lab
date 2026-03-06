@@ -13,14 +13,18 @@
    - 数ターンごとに「この対話が最終的にどんな結論へ向かっているか」を side channel で推定します。
    - `--conclusion-mode soft_steer` にすると、その仮説を次ターンへ soft hint として注入できます。
 
-3. **Deferred utterance intents**
+3. **Latent convergence trace**
+   - 結論をまだ明示していない段階でも、会話軌道がその結論へどの程度収束しているかを observe-only で計測します。
+   - `latent_convergence_trace` として alignment / readiness / leakage risk / stage をログします。
+
+4. **Deferred utterance intents**
    - 「今はまだ言わないが、数ターン後に適切なら言う」という将来発話意図を side channel で作ります。
    - `fixed / trigger / adaptive` の 3 戦略を試せます。
    - `--deferred-intent-mode soft_fire` にすると、due になった意図を system 側へ自然発火のヒントとして注入できます。
    - `--deferred-intent-backend inband` にすると、意図状態を会話内（返信末尾の隠し `<RCL_STATE>` JSON）で保持でき、planner/scheduler の追加プローブ呼び出しを減らせます。
    - `--deferred-intent-plan-policy periodic|auto` / `--deferred-intent-plan-budget N` で「新規 intent をいつ/どれだけ計画できるか」を制御できます（`auto` のとき budget 必須）。
    - `--deferred-intent-plan-max-new N` は 1 回の計画ターンで作れる新規 intent 数の上限です（external + inband）。
-   - `--deferred-intent-timing offset|model` は timing window の決め方です（`model` は external planner で timing も提案させたい場合）。
+   - `--deferred-intent-timing offset|model|hazard` は timing window の決め方です（`hazard` は delay ごとの確率 profile を planner に出させます）。
 
 ## 対応プロバイダ
 
@@ -156,6 +160,7 @@ python recursive_conclusion_lab.py compare \
 
 - `templates/script_template.json`（script.json の雛形）
 - `templates/compare_config_template.json`（CLI 引数と JSON の対応のメモ）
+- `templates/compare_matrix_config_template.json`（arm matrix の雛形）
 
 ## config JSON から実行
 
@@ -163,6 +168,17 @@ python recursive_conclusion_lab.py compare \
 python recursive_conclusion_lab.py run-config \
   --config templates/compare_config_template.json
 ```
+
+## compare-matrix 実行
+
+arm ごとの条件差分を 1 つの config にまとめて比較できます。
+
+```bash
+python recursive_conclusion_lab.py compare-matrix \
+  --config templates/compare_matrix_config_template.json
+```
+
+`observe` / `latent_only` / `soft_fire` / `hard_fire` / `delete_planned` のような arm を並べる用途を想定しています。
 
 ## ログ
 
@@ -172,6 +188,7 @@ python recursive_conclusion_lab.py run-config \
 主なイベント種別:
 - `memory_capsule`
 - `conclusion_probe`
+- `latent_convergence_trace`
 - `deferred_intent_plan`
 - `deferred_intent_decision`
 - `assistant_reply`
@@ -184,9 +201,20 @@ python recursive_conclusion_lab.py run-config \
 
 - `keywords`: 言及検出用の 3–5 個のキーワード/フレーズ
 - `mention_delay_min_turns` / `mention_delay_max_turns`: 言及が出やすい予測ウィンドウ（probe からの turn 差）
+- `mention_hazard_profile`: そのウィンドウ内の delay ごとの確率 mass
 - `mention_likelihood`, `delay_strategy`, `delay_signals`
 
-`analyze_runs.py` で planned-vs-actual の指標（例: `conclusion_plan_within_window_rate`）を出力します。
+`analyze_runs.py` で planned-vs-actual の指標（例: `conclusion_plan_within_window_rate`,
+`conclusion_on_support_rate`, `avg_conclusion_hazard_turn_prob_at_mention`）を出力します。
+
+### latent convergence
+
+`--latent-convergence-every N` を有効にすると、明示言及前の semantic drift を observe-only で追えます。
+
+- `avg_latent_alignment`
+- `latent_alignment_slope`
+- `latent_semantic_leakage_rate`
+- `avg_articulation_gap_turns`
 
 ### 言及遅延ターゲット（複数候補; 任意）
 
@@ -209,11 +237,27 @@ python recursive_conclusion_lab.py compare \
   --delayed-mention-every 2 \
   --delayed-mention-mode soft_fire \
   --delayed-mention-fire-prob 0.35 \
+  --delayed-mention-leak-policy on \
+  --delayed-mention-leak-threshold 0.05 \
   --delayed-mention-fire-max-items 2
 ```
 
 `delayed_mention_plan` / `delayed_mention_action` を記録し、`analyze_runs.py` で
-`delayed_mention_nonconclusion_mention_rate` / `delayed_mention_within_window_rate` なども出力します。
+`delayed_mention_nonconclusion_mention_rate` / `delayed_mention_within_window_rate` /
+`delayed_mention_on_support_rate` / `avg_delayed_mention_hazard_turn_prob_at_mention`
+なども出力します。内部的には各 delayed mention を `mention_hazard_profile` に正規化し、
+`soft_fire` の注入確率もその per-delay mass で重み付けされます。
+
+leak guard も比較できるようにしました。
+
+- `--delayed-mention-leak-policy on|off`
+- `--delayed-mention-leak-threshold <0.00-1.00>`
+
+guard が on のときは、current turn probability が threshold 未満の active delayed mention を
+private prompt 側で「まだ surface させない target」として明示します。latent な trajectory bias は残しつつ、
+早漏の explicit mention を抑えるための設定です。`analyze_runs.py` では
+`delayed_mention_leak_policy` / `delayed_mention_leak_threshold` /
+`avg_suppressed_delayed_mention_count` も見られます。
 
 ```bash
 python analyze_runs.py \

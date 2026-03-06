@@ -1,0 +1,97 @@
+{
+  "command": "compare-matrix",
+  "script": "protocol_scripts/latent_resurfacing.json",
+  "providers": [
+    "openai=<model_id>",
+    "anthropic=<model_id>"
+  ],
+  "out_dir": "compare_outputs/arm_matrix_example",
+  "args": {
+    "window": 8,
+    "memory_every": 2,
+    "conclusion_every": 2,
+    "delayed_mention_leak_policy": "on",
+    "delayed_mention_leak_threshold": 0.05,
+    "latent_convergence_every": 1,
+    "deferred_intent_every": 2,
+    "deferred_intent_strategy": "trigger",
+    "deferred_intent_timing": "hazard",
+    "deferred_intent_plan_max_new": 1,
+    "temperature": 0.2,
+    "probe_max_tokens": 220,
+    "show_probes": false
+  },
+  "arms": [
+    {
+      "name": "observe",
+      "description": "No latent injection, no firing.",
+      "args": {
+        "deferred_intent_mode": "observe",
+        "deferred_intent_latent_injection": "off",
+        "deferred_intent_ablation": "none",
+        "delayed_mention_leak_policy": "on"
+      }
+    },
+    {
+      "name": "latent_only",
+      "description": "Keep deferred intents latent but do not fire them into replies.",
+      "args": {
+        "deferred_intent_mode": "observe",
+        "deferred_intent_latent_injection": "active",
+        "deferred_intent_ablation": "none",
+        "delayed_mention_leak_policy": "on"
+      }
+    },
+    {
+      "name": "soft_fire",
+      "description": "Let due intents surface softly.",
+      "args": {
+        "deferred_intent_mode": "soft_fire",
+        "deferred_intent_latent_injection": "active",
+        "deferred_intent_ablation": "none",
+        "delayed_mention_leak_policy": "on"
+      }
+    },
+    {
+      "name": "hard_fire",
+      "description": "Force due intents to surface explicitly.",
+      "args": {
+        "deferred_intent_mode": "hard_fire",
+        "deferred_intent_latent_injection": "active",
+        "deferred_intent_ablation": "none",
+        "delayed_mention_leak_policy": "on"
+      }
+    },
+    {
+      "name": "delete_planned",
+      "description": "Ablation that deletes planned intents immediately.",
+      "args": {
+        "deferred_intent_mode": "soft_fire",
+        "deferred_intent_latent_injection": "active",
+        "deferred_intent_ablation": "delete_planned",
+        "delayed_mention_leak_policy": "on"
+      }
+    },
+    {
+      "name": "leak_guard_off",
+      "description": "Turn off delayed-mention leakage suppression.",
+      "args": {
+        "deferred_intent_mode": "soft_fire",
+        "deferred_intent_latent_injection": "active",
+        "deferred_intent_ablation": "none",
+        "delayed_mention_leak_policy": "off"
+      }
+    },
+    {
+      "name": "leak_guard_strict",
+      "description": "Keep suppression on but require higher current hazard mass before surfacing.",
+      "args": {
+        "deferred_intent_mode": "soft_fire",
+        "deferred_intent_latent_injection": "active",
+        "deferred_intent_ablation": "none",
+        "delayed_mention_leak_policy": "on",
+        "delayed_mention_leak_threshold": 0.25
+      }
+    }
+  ]
+}

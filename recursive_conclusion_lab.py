@@ -89,9 +89,15 @@ class DelayedMentionMode(str, Enum):
     SOFT_FIRE = "soft_fire"
 
 
+class DelayedMentionLeakPolicy(str, Enum):
+    OFF = "off"
+    ON = "on"
+
+
 class DeferredIntentMode(str, Enum):
     OBSERVE = "observe"
     SOFT_FIRE = "soft_fire"
+    HARD_FIRE = "hard_fire"
 
 
 class DeferredIntentStrategy(str, Enum):
@@ -103,6 +109,7 @@ class DeferredIntentStrategy(str, Enum):
 class DeferredIntentTiming(str, Enum):
     OFFSET = "offset"
     MODEL = "model"
+    HAZARD = "hazard"
 
 
 class DeferredIntentPlanPolicy(str, Enum):
@@ -141,6 +148,9 @@ class ExperimentConfig:
     delayed_mention_mode: DelayedMentionMode = DelayedMentionMode.OBSERVE
     delayed_mention_fire_prob: float = 0.35
     delayed_mention_fire_max_items: int = 2
+    delayed_mention_leak_policy: DelayedMentionLeakPolicy = DelayedMentionLeakPolicy.ON
+    delayed_mention_leak_threshold: float = 0.05
+    latent_convergence_every: int = 0
     deferred_intent_every: int = 0
     deferred_intent_mode: DeferredIntentMode = DeferredIntentMode.OBSERVE
     deferred_intent_strategy: DeferredIntentStrategy = DeferredIntentStrategy.TRIGGER
@@ -182,6 +192,7 @@ class DeferredIntent:
     why_not_now: str = ""
     earliest_turn: int = 0
     latest_turn: int = 0
+    hazard_profile: list[dict[str, Any]] = field(default_factory=list)
     trigger: list[str] = field(default_factory=list)
     cancel_if: list[str] = field(default_factory=list)
     confidence: float = 0.0
@@ -214,6 +225,7 @@ class DelayedMentionItem:
     keywords: list[str] = field(default_factory=list)
     earliest_turn: int = 0
     latest_turn: int = 0
+    hazard_profile: list[dict[str, Any]] = field(default_factory=list)
     likelihood: float = 0.0
     delay_strategy: str = ""
     delay_signals: list[str] = field(default_factory=list)
@@ -465,6 +477,7 @@ INBAND_SIGNAL_MAX_ITEMS = 6
 INBAND_SIGNAL_ITEM_MAX_CHARS = 80
 INBAND_CONDITION_MAX_ITEMS = 4
 INBAND_CONDITION_ITEM_MAX_CHARS = 120
+INBAND_HAZARD_MAX_ITEMS = 8
 
 
 def truncate_text(value: Any, max_chars: int) -> str:
@@ -492,6 +505,248 @@ def truncate_signals(items: Any) -> list[str]:
     return result
 
 
+def parse_probe_bool(raw: str) -> Optional[bool]:
+    text = compact_text(raw).lower()
+    if text in {"yes", "true", "1"}:
+        return True
+    if text in {"no", "false", "0"}:
+        return False
+    return None
+
+
+def parse_hazard_profile(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, str):
+        loaded = extract_json_value(value)
+        if loaded is not None:
+            value = loaded
+    points: list[tuple[int, float]] = []
+    if isinstance(value, dict):
+        delay_turn_probs = value.get("delay_turn_probs")
+        if isinstance(delay_turn_probs, dict):
+            for raw_delay, raw_prob in delay_turn_probs.items():
+                delay = coerce_int(raw_delay)
+                prob = clamp01(raw_prob, default=0.0)
+                if delay is None or delay < 0 or prob <= 0.0:
+                    continue
+                points.append((delay, prob))
+        else:
+            for key in ("hazard_profile", "hazard", "points"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    value = nested
+                    break
+
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            delay = coerce_int(
+                item.get("delay_turns")
+                or item.get("delay")
+                or item.get("turn")
+                or item.get("offset")
+            )
+            prob = clamp01(
+                item.get("prob")
+                or item.get("weight")
+                or item.get("hazard")
+                or item.get("p"),
+                default=0.0,
+            )
+            if delay is None or delay < 0 or prob <= 0.0:
+                continue
+            points.append((delay, prob))
+
+    merged: dict[int, float] = {}
+    for delay, prob in points:
+        merged[delay] = merged.get(delay, 0.0) + float(prob)
+
+    total = sum(merged.values())
+    if total <= 0.0:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for delay in sorted(merged):
+        normalized.append(
+            {
+                "delay_turns": int(delay),
+                "prob": float(merged[delay] / total),
+            }
+        )
+    normalized = normalized[:INBAND_HAZARD_MAX_ITEMS]
+    clipped_total = sum(clamp01(item.get("prob"), default=0.0) for item in normalized)
+    if clipped_total <= 0.0:
+        return []
+    for item in normalized:
+        item["prob"] = clamp01(item.get("prob"), default=0.0) / clipped_total
+    return normalized
+
+
+def default_hazard_profile(*, offset: int, grace: int) -> list[dict[str, Any]]:
+    start = max(0, int(offset))
+    stop = start + max(0, int(grace))
+    delays = list(range(start, stop + 1))
+    if not delays:
+        delays = [0]
+    weights = [1.0 / (idx + 1) for idx, _ in enumerate(delays)]
+    total = sum(weights) or 1.0
+    return [
+        {
+            "delay_turns": delay,
+            "prob": weight / total,
+        }
+        for delay, weight in zip(delays, weights)
+    ]
+
+
+def hazard_profile_from_bounds(
+    *,
+    created_turn: int,
+    earliest_turn: int,
+    latest_turn: int,
+) -> list[dict[str, Any]]:
+    start = max(0, earliest_turn - created_turn)
+    stop = max(start, latest_turn - created_turn)
+    delays = list(range(start, stop + 1))
+    prob = 1.0 / len(delays)
+    return [{"delay_turns": delay, "prob": prob} for delay in delays]
+
+
+def ensure_hazard_profile(
+    profile: list[dict[str, Any]],
+    *,
+    created_turn: int,
+    earliest_turn: Optional[int],
+    latest_turn: Optional[int],
+    offset: int,
+    grace: int,
+) -> list[dict[str, Any]]:
+    normalized = parse_hazard_profile(profile)
+    if normalized:
+        return normalized
+    if earliest_turn is not None:
+        return hazard_profile_from_bounds(
+            created_turn=created_turn,
+            earliest_turn=earliest_turn,
+            latest_turn=max(earliest_turn, int(latest_turn or earliest_turn)),
+        )
+    return default_hazard_profile(offset=offset, grace=grace)
+
+
+def hazard_bounds_from_profile(
+    *,
+    created_turn: int,
+    profile: list[dict[str, Any]],
+) -> tuple[int, int]:
+    normalized = parse_hazard_profile(profile)
+    if not normalized:
+        return created_turn + 1, created_turn + 1
+    delays = [coerce_int(item.get("delay_turns")) or 0 for item in normalized]
+    return created_turn + min(delays), created_turn + max(delays)
+
+
+def hazard_turn_probability(
+    profile: list[dict[str, Any]],
+    *,
+    created_turn: int,
+    turn_index: int,
+) -> float:
+    delay = turn_index - created_turn
+    if delay < 0:
+        return 0.0
+    for item in parse_hazard_profile(profile):
+        if (coerce_int(item.get("delay_turns")) or 0) == delay:
+            return clamp01(item.get("prob"), default=0.0)
+    return 0.0
+
+
+def hazard_peak_delay(profile: list[dict[str, Any]]) -> Optional[int]:
+    normalized = parse_hazard_profile(profile)
+    if not normalized:
+        return None
+    best = max(
+        normalized,
+        key=lambda item: (
+            clamp01(item.get("prob"), default=0.0),
+            -(coerce_int(item.get("delay_turns")) or 0),
+        ),
+    )
+    return coerce_int(best.get("delay_turns"))
+
+
+def hazard_peak_probability(profile: list[dict[str, Any]]) -> float:
+    normalized = parse_hazard_profile(profile)
+    if not normalized:
+        return 0.0
+    return max(clamp01(item.get("prob"), default=0.0) for item in normalized)
+
+
+def hazard_support_size(profile: list[dict[str, Any]]) -> int:
+    normalized = parse_hazard_profile(profile)
+    return len(normalized)
+
+
+def format_hazard_profile_brief(
+    profile: list[dict[str, Any]],
+    *,
+    max_items: int = 4,
+) -> str:
+    normalized = parse_hazard_profile(profile)
+    if not normalized:
+        return ""
+    parts: list[str] = []
+    for item in normalized[:max(1, max_items)]:
+        delay = coerce_int(item.get("delay_turns"))
+        prob = clamp01(item.get("prob"), default=0.0)
+        if delay is None:
+            continue
+        parts.append(f"{delay}:{prob:.2f}")
+    if len(normalized) > max_items:
+        parts.append("...")
+    return ", ".join(parts)
+
+
+def resolve_mention_hazard_plan(
+    *,
+    created_turn: int,
+    delay_min: Optional[int],
+    delay_max: Optional[int],
+    raw_hazard_profile: Any,
+    default_min: int = 1,
+    default_span: int = 2,
+) -> tuple[int, int, list[dict[str, Any]]]:
+    if delay_min is not None:
+        delay_min = max(0, int(delay_min))
+    if delay_max is not None:
+        delay_max = max(0, int(delay_max))
+    if delay_min is not None and delay_max is not None and delay_max < delay_min:
+        delay_min, delay_max = delay_max, delay_min
+
+    resolved_min = delay_min if delay_min is not None else max(0, int(default_min))
+    resolved_max = delay_max if delay_max is not None else resolved_min + max(0, int(default_span))
+    resolved_max = max(resolved_min, resolved_max)
+
+    earliest_turn = created_turn + resolved_min
+    latest_turn = created_turn + resolved_max
+    hazard_profile = ensure_hazard_profile(
+        parse_hazard_profile(raw_hazard_profile),
+        created_turn=created_turn,
+        earliest_turn=earliest_turn,
+        latest_turn=latest_turn,
+        offset=resolved_min,
+        grace=max(0, resolved_max - resolved_min),
+    )
+    earliest_turn, latest_turn = hazard_bounds_from_profile(
+        created_turn=created_turn,
+        profile=hazard_profile,
+    )
+    return (
+        max(0, earliest_turn - created_turn),
+        max(0, latest_turn - created_turn),
+        hazard_profile,
+    )
+
+
 def deferred_intent_to_inband_dict(intent: DeferredIntent) -> dict[str, Any]:
     data = intent.to_dict()
     data["intent"] = truncate_text(data.get("intent"), INBAND_INTENT_TEXT_MAX_CHARS)
@@ -511,6 +766,7 @@ def deferred_intent_to_inband_dict(intent: DeferredIntent) -> dict[str, Any]:
     )
     data["trigger"] = truncate_conditions(data.get("trigger"))
     data["cancel_if"] = truncate_conditions(data.get("cancel_if"))
+    data["hazard_profile"] = parse_hazard_profile(data.get("hazard_profile"))
     return data
 
 
@@ -721,6 +977,7 @@ def build_deferred_intent_from_plan(
 
     earliest_turn = default_earliest_turn
     latest_turn = default_latest_turn
+    hazard_profile: list[dict[str, Any]] = []
     if timing == DeferredIntentTiming.MODEL:
         timing_block = data.get("timing") if isinstance(data.get("timing"), dict) else {}
         delay_min = coerce_int(
@@ -760,6 +1017,33 @@ def build_deferred_intent_from_plan(
 
         if strategy == DeferredIntentStrategy.FIXED:
             latest_turn = earliest_turn
+    elif timing == DeferredIntentTiming.HAZARD:
+        timing_block = data.get("timing") if isinstance(data.get("timing"), dict) else {}
+        hazard_profile = ensure_hazard_profile(
+            parse_hazard_profile(
+                timing_block.get("hazard_profile")
+                or timing_block.get("hazard")
+                or data.get("hazard_profile")
+                or data.get("hazard")
+                or data
+            ),
+            created_turn=created_turn,
+            earliest_turn=None,
+            latest_turn=None,
+            offset=offset,
+            grace=grace,
+        )
+        earliest_turn, latest_turn = hazard_bounds_from_profile(
+            created_turn=created_turn,
+            profile=hazard_profile,
+        )
+        if strategy == DeferredIntentStrategy.FIXED:
+            peak_delay = hazard_peak_delay(hazard_profile)
+            if peak_delay is None:
+                peak_delay = max(0, offset)
+            hazard_profile = [{"delay_turns": peak_delay, "prob": 1.0}]
+            earliest_turn = created_turn + peak_delay
+            latest_turn = earliest_turn
 
     return DeferredIntent(
         intent_id=intent_id,
@@ -769,6 +1053,7 @@ def build_deferred_intent_from_plan(
         why_not_now=why_not_now,
         earliest_turn=earliest_turn,
         latest_turn=max(earliest_turn, latest_turn),
+        hazard_profile=hazard_profile,
         trigger=trigger,
         cancel_if=cancel_if,
         confidence=clamp01(data.get("confidence"), default=0.0),
@@ -784,6 +1069,8 @@ def apply_revised_intent(
     data: dict[str, Any],
     *,
     current_turn: int,
+    timing: DeferredIntentTiming,
+    default_offset: int,
     default_grace: int,
 ) -> None:
     new_kind = compact_text(str(data.get("kind", "")))
@@ -805,6 +1092,11 @@ def apply_revised_intent(
 
     earliest_turn = coerce_int(data.get("earliest_turn"))
     latest_turn = coerce_int(data.get("latest_turn"))
+    hazard_profile = parse_hazard_profile(
+        data.get("hazard_profile")
+        or data.get("hazard")
+        or (data.get("timing") if isinstance(data.get("timing"), dict) else {})
+    )
 
     if earliest_turn is None:
         earliest_turn = max(current_turn + 1, intent.earliest_turn)
@@ -816,6 +1108,23 @@ def apply_revised_intent(
 
     intent.earliest_turn = earliest_turn
     intent.latest_turn = latest_turn
+    if timing == DeferredIntentTiming.HAZARD:
+        intent.hazard_profile = ensure_hazard_profile(
+            hazard_profile or intent.hazard_profile,
+            created_turn=intent.created_turn,
+            earliest_turn=intent.earliest_turn,
+            latest_turn=intent.latest_turn,
+            offset=default_offset,
+            grace=default_grace,
+        )
+        intent.earliest_turn, intent.latest_turn = hazard_bounds_from_profile(
+            created_turn=intent.created_turn,
+            profile=intent.hazard_profile,
+        )
+    elif hazard_profile:
+        intent.hazard_profile = hazard_profile
+    else:
+        intent.hazard_profile = []
     intent.revision_count += 1
     intent.status = "active"
     intent.terminal_reason = ""
@@ -887,6 +1196,7 @@ class DummyAdapter(BaseAdapter):
             deferred_intent_plan_max_new = parse_int("deferred_intent_plan_max_new", 1)
             deferred_intent_mode = parse_str("deferred_intent_mode", DeferredIntentMode.OBSERVE.value)
             deferred_intent_strategy = parse_str("deferred_intent_strategy", DeferredIntentStrategy.TRIGGER.value)
+            deferred_intent_timing = parse_str("deferred_intent_timing", DeferredIntentTiming.OFFSET.value)
 
             prev_state: dict[str, Any] = {"version": 1, "intents": []}
             for msg in reversed(messages):
@@ -925,11 +1235,22 @@ class DummyAdapter(BaseAdapter):
                     intent_id = f"di-{base_idx + idx_offset:04d}"
                     if intent_id in existing_ids:
                         continue
-                    earliest_turn = current_turn + max(1, deferred_intent_offset)
-                    if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
-                        latest_turn = earliest_turn
+                    hazard_profile: list[dict[str, Any]] = []
+                    if deferred_intent_timing == DeferredIntentTiming.HAZARD.value:
+                        hazard_profile = default_hazard_profile(
+                            offset=deferred_intent_offset,
+                            grace=deferred_intent_grace,
+                        )
+                        earliest_turn, latest_turn = hazard_bounds_from_profile(
+                            created_turn=current_turn,
+                            profile=hazard_profile,
+                        )
                     else:
-                        latest_turn = earliest_turn + max(0, deferred_intent_grace)
+                        earliest_turn = current_turn + max(1, deferred_intent_offset)
+                        if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
+                            latest_turn = earliest_turn
+                        else:
+                            latest_turn = earliest_turn + max(0, deferred_intent_grace)
 
                     kind = "proposal" if idx_offset == 0 else "question"
                     intent_text = (
@@ -947,6 +1268,7 @@ class DummyAdapter(BaseAdapter):
                             "why_not_now": "The dialogue is still collecting constraints and timing cues.",
                             "earliest_turn": earliest_turn,
                             "latest_turn": latest_turn,
+                            "hazard_profile": hazard_profile,
                             "trigger": [
                                 "the user asks for a concrete next step",
                                 "enough constraints have accumulated",
@@ -976,17 +1298,34 @@ class DummyAdapter(BaseAdapter):
                 if status != "active":
                     continue
                 created_turn = coerce_int(item.get("created_turn")) or current_turn
+                hazard_profile = parse_hazard_profile(item.get("hazard_profile"))
                 earliest = coerce_int(item.get("earliest_turn"))
                 latest = coerce_int(item.get("latest_turn"))
-                if earliest is None:
-                    earliest = created_turn + max(1, deferred_intent_offset)
-                if latest is None:
-                    if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
+                if deferred_intent_timing == DeferredIntentTiming.HAZARD.value:
+                    hazard_profile = ensure_hazard_profile(
+                        hazard_profile,
+                        created_turn=created_turn,
+                        earliest_turn=earliest,
+                        latest_turn=latest,
+                        offset=deferred_intent_offset,
+                        grace=deferred_intent_grace,
+                    )
+                    earliest, latest = hazard_bounds_from_profile(
+                        created_turn=created_turn,
+                        profile=hazard_profile,
+                    )
+                else:
+                    if earliest is None:
+                        earliest = created_turn + max(1, deferred_intent_offset)
+                    if latest is None:
+                        if deferred_intent_strategy == DeferredIntentStrategy.FIXED.value:
+                            latest = earliest
+                        else:
+                            latest = earliest + max(0, deferred_intent_grace)
+                    if latest < earliest:
                         latest = earliest
-                    else:
-                        latest = earliest + max(0, deferred_intent_grace)
-                if latest < earliest:
-                    latest = earliest
+                    hazard_profile = []
+                item["hazard_profile"] = hazard_profile
 
                 if current_turn < earliest:
                     continue
@@ -997,6 +1336,14 @@ class DummyAdapter(BaseAdapter):
                     item["decision_signals"] = ["past_latest_turn"]
                     item["decision_rationale"] = "The intended timing window has passed."
                     continue
+
+                if deferred_intent_timing == DeferredIntentTiming.HAZARD.value:
+                    peak_delay = hazard_peak_delay(hazard_profile)
+                    if peak_delay is None:
+                        peak_delay = max(0, deferred_intent_offset)
+                    peak_turn = created_turn + peak_delay
+                    if current_turn < peak_turn:
+                        continue
 
                 item["status"] = "fired"
                 item["fire_turn"] = current_turn
@@ -1012,9 +1359,17 @@ class DummyAdapter(BaseAdapter):
                 "Dummy reply (in-band). I’ll respond to the latest turn concretely.\n"
                 f"Grounding: {compact_text(last_user)[:180]}"
             )
-            if deferred_intent_mode == DeferredIntentMode.SOFT_FIRE.value and fired_this_turn:
+            if deferred_intent_mode in {
+                DeferredIntentMode.SOFT_FIRE.value,
+                DeferredIntentMode.HARD_FIRE.value,
+            } and fired_this_turn:
                 fired_block = "\n".join(f"- {text}" for text in fired_this_turn)
-                visible_reply = visible_reply.rstrip() + "\n\nDeferred follow-up:\n" + fired_block
+                heading = (
+                    "Deferred follow-up:"
+                    if deferred_intent_mode == DeferredIntentMode.SOFT_FIRE.value
+                    else "Deferred intents (explicit):"
+                )
+                visible_reply = visible_reply.rstrip() + f"\n\n{heading}\n" + fired_block
 
             state_out = {
                 "version": int(coerce_int(prev_state.get("version")) or 1),
@@ -1030,6 +1385,12 @@ class DummyAdapter(BaseAdapter):
             output = f"Goal remains active. Recent thread: {compact_text(text)}"
         elif "most likely eventual conclusion" in lower or "infer the likely end-state" in (system or "").lower():
             final_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+            mention_hazard_line = ""
+            if "mention_hazard_profile" in lower:
+                mention_hazard_line = (
+                    'MENTION_HAZARD_PROFILE: [{"delay_turns": 2, "prob": 0.20}, '
+                    '{"delay_turns": 3, "prob": 0.50}, {"delay_turns": 4, "prob": 0.30}]\n'
+                )
             output = textwrap.dedent(
                 f"""\
                 CONCLUSION: The dialogue is converging toward a concrete experiment design with explicit instrumentation and comparison conditions.
@@ -1038,10 +1399,61 @@ class DummyAdapter(BaseAdapter):
                 KEYWORDS: instrumentation; baseline comparison; deferred mention; metrics; firing window
                 MENTION_DELAY_MIN_TURNS: 2
                 MENTION_DELAY_MAX_TURNS: 4
+                {mention_hazard_line}\
                 MENTION_LIKELIHOOD: 0.55
                 DELAY_STRATEGY: build_context
                 DELAY_SIGNALS: constraints_missing, user_not_ready, need_one_more_turn
                 DELAY_RATIONALE: Hold the conclusion until after 1-2 more constraint-gathering turns.
+                """
+            ).strip()
+        elif "latent convergence trace" in system_lower or (
+            "latent_alignment" in lower and "articulation_readiness" in lower
+        ):
+            current_turn_match = re.search(r"current turn index:\s*(\d+)", prompt, flags=re.IGNORECASE)
+            current_turn = int(current_turn_match.group(1)) if current_turn_match else 0
+            earliest_match = re.search(
+                r"planned earliest articulation turn:\s*(\d+)",
+                prompt,
+                flags=re.IGNORECASE,
+            )
+            earliest_turn = int(earliest_match.group(1)) if earliest_match else current_turn + 1
+            latest_reply = ""
+            reply_match = re.search(
+                r"latest assistant reply:\s*(.+?)(?:\n\s*\n|\Z)",
+                prompt,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if reply_match:
+                latest_reply = compact_text(reply_match.group(1))
+            explicit = "converging toward a concrete experiment design" in latest_reply.lower()
+            alignment = min(0.26 + 0.12 * max(0, current_turn), 0.92)
+            readiness = min(0.14 + 0.11 * max(0, current_turn), 0.90)
+            leakage_risk = 0.68 if current_turn < earliest_turn else 0.24
+            if explicit:
+                alignment = max(alignment, 0.84)
+                readiness = max(readiness, 0.95)
+                leakage_risk = 0.05
+            if explicit:
+                stage = "explicit"
+                signals = "explicit_surface,window_open"
+            elif readiness >= 0.72:
+                stage = "ready"
+                signals = "window_open,articulation_ready"
+            elif alignment >= 0.52:
+                stage = "approaching"
+                signals = "latent_bias,trajectory_converging"
+            else:
+                stage = "latent"
+                signals = "holding_pattern,trajectory_forming"
+            output = textwrap.dedent(
+                f"""\
+                LATENT_ALIGNMENT: {alignment:.2f}
+                ARTICULATION_READINESS: {readiness:.2f}
+                LEAKAGE_RISK: {leakage_risk:.2f}
+                EXPLICIT_MENTION_PRESENT: {"yes" if explicit else "no"}
+                TRAJECTORY_STAGE: {stage}
+                SHIFT_SIGNALS: {signals}
+                EVIDENCE: Dummy latent trace at turn {current_turn}; trajectory is being tracked without forcing explicit articulation.
                 """
             ).strip()
         elif "delayed mention planner" in system_lower:
@@ -1072,11 +1484,30 @@ class DummyAdapter(BaseAdapter):
                     },
                 ]
             }
+            if "mention_hazard_profile" in lower:
+                payload["items"][0]["mention_hazard_profile"] = [
+                    {"delay_turns": 1, "prob": 0.45},
+                    {"delay_turns": 2, "prob": 0.35},
+                    {"delay_turns": 3, "prob": 0.20},
+                ]
+                payload["items"][1]["mention_hazard_profile"] = [
+                    {"delay_turns": 2, "prob": 0.20},
+                    {"delay_turns": 3, "prob": 0.55},
+                    {"delay_turns": 4, "prob": 0.25},
+                ]
             output = json.dumps(payload, ensure_ascii=False)
         elif "deferred utterance planner" in (system or "").lower() or ("create_intent" in lower and "why_not_now" in lower and "deferred utterance" in lower):
             latest_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
             timing = None
-            if "delay_min_turns" in lower or "delay_max_turns" in lower:
+            if "hazard_profile" in lower:
+                timing = {
+                    "hazard_profile": [
+                        {"delay_turns": 2, "prob": 0.20},
+                        {"delay_turns": 3, "prob": 0.50},
+                        {"delay_turns": 4, "prob": 0.30},
+                    ]
+                }
+            elif "delay_min_turns" in lower or "delay_max_turns" in lower:
                 timing = {"delay_min_turns": 2, "delay_max_turns": 4}
             payload: dict[str, Any] = {
                 "kind": "proposal",
@@ -1114,13 +1545,30 @@ class DummyAdapter(BaseAdapter):
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                earliest = coerce_int(item.get("earliest_turn")) or current_turn + 1
-                latest = coerce_int(item.get("latest_turn")) or earliest
+                created_turn = coerce_int(item.get("created_turn")) or current_turn
+                hazard_profile = parse_hazard_profile(item.get("hazard_profile"))
+                earliest = coerce_int(item.get("earliest_turn"))
+                latest = coerce_int(item.get("latest_turn"))
+                if hazard_profile:
+                    earliest, latest = hazard_bounds_from_profile(
+                        created_turn=created_turn,
+                        profile=hazard_profile,
+                    )
+                else:
+                    earliest = earliest or current_turn + 1
+                    latest = latest or earliest
+                peak_delay = hazard_peak_delay(hazard_profile) if hazard_profile else None
+                peak_turn = created_turn + peak_delay if peak_delay is not None else None
                 if current_turn < earliest:
                     action = "hold"
                     reason = "Too early. Keep the utterance in reserve."
                     decision_strategy = "too_early"
                     decision_signals = ["before_earliest_turn"]
+                elif peak_turn is not None and current_turn < peak_turn:
+                    action = "hold"
+                    reason = "Hazard mass is still building; keep the utterance latent."
+                    decision_strategy = "hazard_wait"
+                    decision_signals = ["before_hazard_peak"]
                 elif current_turn > latest:
                     action = "expire"
                     reason = "The intended timing window has passed."
@@ -1148,6 +1596,15 @@ class DummyAdapter(BaseAdapter):
                 "Dummy reply. I would answer the latest user turn concretely, "
                 f"grounding on: {last_user[:180]}"
             )
+            due_deferred = []
+            if system_lower and "deferred utterances are due now" in system_lower:
+                for line in (system or "").splitlines():
+                    match = re.match(r"\s*-\s*\[(di-[^\]]+)\]\s*(.+)\s*$", line)
+                    if match:
+                        due_deferred.append(match.group(2).strip())
+            if due_deferred:
+                block = "\n".join(f"- {text}" for text in due_deferred)
+                output = output.rstrip() + "\n\nDeferred intents (simulated):\n" + block
             delayed = []
             if system_lower and "delayed mention targets are due now" in system_lower:
                 for line in (system or "").splitlines():
@@ -1517,10 +1974,12 @@ class RecursiveConclusionSession:
         self.latest_conclusion_keywords: list[str] = []
         self.latest_conclusion_mention_delay_min_turns: Optional[int] = None
         self.latest_conclusion_mention_delay_max_turns: Optional[int] = None
+        self.latest_conclusion_mention_hazard_profile: list[dict[str, Any]] = []
         self.latest_conclusion_mention_likelihood: Optional[float] = None
         self.latest_conclusion_delay_strategy: str = ""
         self.latest_conclusion_delay_signals: list[str] = []
         self.latest_conclusion_delay_rationale: str = ""
+        self.latest_latent_convergence_trace: Optional[dict[str, Any]] = None
         self.delayed_mentions: list[DelayedMentionItem] = []
         self.deferred_intents: list[DeferredIntent] = []
         self.turn_index = 0
@@ -1542,17 +2001,65 @@ class RecursiveConclusionSession:
         return [item for item in self.delayed_mentions if item.status == "active"]
 
     def _due_delayed_mentions(self) -> list[DelayedMentionItem]:
-        return [
-            item
-            for item in self._active_delayed_mentions()
-            if item.earliest_turn <= self.turn_index <= item.latest_turn
-        ]
+        due: list[DelayedMentionItem] = []
+        for item in self._active_delayed_mentions():
+            if not (item.earliest_turn <= self.turn_index <= item.latest_turn):
+                continue
+            if item.hazard_profile:
+                turn_prob = hazard_turn_probability(
+                    item.hazard_profile,
+                    created_turn=item.created_turn,
+                    turn_index=self.turn_index,
+                )
+                if turn_prob <= 0.0:
+                    continue
+            due.append(item)
+        return due
+
+    def _delayed_mention_leak_threshold(self) -> float:
+        return clamp01(self.config.delayed_mention_leak_threshold, default=0.0)
+
+    def _suppressed_delayed_mentions(
+        self,
+        *,
+        injected_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
+    ) -> list[DelayedMentionItem]:
+        if self.config.delayed_mention_leak_policy != DelayedMentionLeakPolicy.ON:
+            return []
+        threshold = self._delayed_mention_leak_threshold()
+        injected_ids = {item.item_id for item in injected_delayed_mentions or []}
+        suppressed: list[DelayedMentionItem] = []
+        for item in self._active_delayed_mentions():
+            if item.item_id in injected_ids:
+                continue
+            turn_prob = hazard_turn_probability(
+                item.hazard_profile,
+                created_turn=item.created_turn,
+                turn_index=self.turn_index,
+            )
+            if turn_prob >= threshold:
+                continue
+            suppressed.append(item)
+        suppressed.sort(
+            key=lambda item: (
+                hazard_turn_probability(
+                    item.hazard_profile,
+                    created_turn=item.created_turn,
+                    turn_index=self.turn_index,
+                ),
+                item.latest_turn,
+                item.earliest_turn,
+                item.item_id,
+            )
+        )
+        return suppressed
 
     def _build_system_prompt(
         self,
         *,
         due_intents: Optional[list[DeferredIntent]] = None,
         injected_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
+        suppressed_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
     ) -> str:
         parts: list[str] = []
         base = compact_text(self.config.base_system)
@@ -1616,19 +2123,46 @@ class RecursiveConclusionSession:
                     "- Only realize a deferred intention when it appears in an explicit 'due now' section."
                 )
 
+        if suppressed_delayed_mentions:
+            threshold = self._delayed_mention_leak_threshold()
+            bullets = "\n".join(
+                (
+                    f"- [{item.item_id}] p_now="
+                    f"{hazard_turn_probability(item.hazard_profile, created_turn=item.created_turn, turn_index=self.turn_index):.2f} "
+                    f"| {item.text}"
+                )
+                for item in suppressed_delayed_mentions
+            )
+            parts.append(
+                "Delayed mention targets currently remain latent (private; do NOT surface them explicitly yet):\n"
+                f"{bullets}\n\n"
+                "Rules:\n"
+                f"- Do not quote, paraphrase, or explicitly state these targets while their current turn probability stays below {threshold:.2f}.\n"
+                "- They may still shape internal trajectory, question choice, and ordering.\n"
+                "- Only surface them when they appear in a due-now section or their current turn probability clears the threshold."
+            )
+
         if (
-            self.config.deferred_intent_mode == DeferredIntentMode.SOFT_FIRE
+            self.config.deferred_intent_mode
+            in {DeferredIntentMode.SOFT_FIRE, DeferredIntentMode.HARD_FIRE}
             and due_intents
         ):
             bullets = "\n".join(
                 f"- [{intent.intent_id}] {intent.intent}" for intent in due_intents
             )
-            parts.append(
-                "Deferred utterances are due now. Integrate them only if they still fit the current turn.\n"
-                f"{bullets}\n\n"
-                "Realize them naturally instead of quoting them verbatim. "
-                "If the latest user turn conflicts with a deferred utterance, prioritize the current evidence."
-            )
+            if self.config.deferred_intent_mode == DeferredIntentMode.HARD_FIRE:
+                parts.append(
+                    "Deferred utterances are due now. Include all of them explicitly in this turn unless the latest user turn makes one impossible.\n"
+                    f"{bullets}\n\n"
+                    "Preserve the intent content faithfully. If there is tension with the latest user turn, state the conflict directly instead of silently dropping the deferred utterance."
+                )
+            else:
+                parts.append(
+                    "Deferred utterances are due now. Integrate them only if they still fit the current turn.\n"
+                    f"{bullets}\n\n"
+                    "Realize them naturally instead of quoting them verbatim. "
+                    "If the latest user turn conflicts with a deferred utterance, prioritize the current evidence."
+                )
 
         if (
             self.config.delayed_mention_mode == DelayedMentionMode.SOFT_FIRE
@@ -1731,6 +2265,7 @@ class RecursiveConclusionSession:
             KEYWORDS: <3-5 distinctive keywords/phrases separated by ;>
             MENTION_DELAY_MIN_TURNS: <integer, minimum turns to wait before the conclusion is likely to be said>
             MENTION_DELAY_MAX_TURNS: <integer >= MIN, maximum turns until it is likely to be said>
+            MENTION_HAZARD_PROFILE: <JSON list like [{{"delay_turns": 1, "prob": 0.20}}, ...] or [] ; delays are relative to the current turn>
             MENTION_LIKELIHOOD: <0.00 to 1.00>
             DELAY_STRATEGY: <one of: clarify_first | gather_constraints | build_context | avoid_premature_commitment | already_ready | other>
             DELAY_SIGNALS: <2-6 short tags separated by ,>
@@ -1761,19 +2296,19 @@ class RecursiveConclusionSession:
             mention_delay_max_turns = parse_probe_int(
                 extract_probe_line_value(hypothesis, "MENTION_DELAY_MAX_TURNS")
             )
-            if mention_delay_min_turns is not None and mention_delay_min_turns < 0:
-                mention_delay_min_turns = 0
-            if mention_delay_max_turns is not None and mention_delay_max_turns < 0:
-                mention_delay_max_turns = 0
-            if (
-                mention_delay_min_turns is not None
-                and mention_delay_max_turns is not None
-                and mention_delay_max_turns < mention_delay_min_turns
-            ):
-                mention_delay_min_turns, mention_delay_max_turns = (
-                    mention_delay_max_turns,
-                    mention_delay_min_turns,
-                )
+            mention_hazard_profile = parse_hazard_profile(
+                extract_probe_line_value(hypothesis, "MENTION_HAZARD_PROFILE")
+            )
+            (
+                mention_delay_min_turns,
+                mention_delay_max_turns,
+                mention_hazard_profile,
+            ) = resolve_mention_hazard_plan(
+                created_turn=self.turn_index,
+                delay_min=mention_delay_min_turns,
+                delay_max=mention_delay_max_turns,
+                raw_hazard_profile=mention_hazard_profile,
+            )
             mention_likelihood = parse_probe_float(
                 extract_probe_line_value(hypothesis, "MENTION_LIKELIHOOD")
             )
@@ -1796,16 +2331,13 @@ class RecursiveConclusionSession:
             self.latest_conclusion_keywords = keywords
             self.latest_conclusion_mention_delay_min_turns = mention_delay_min_turns
             self.latest_conclusion_mention_delay_max_turns = mention_delay_max_turns
+            self.latest_conclusion_mention_hazard_profile = list(mention_hazard_profile)
             self.latest_conclusion_mention_likelihood = mention_likelihood
             self.latest_conclusion_delay_strategy = delay_strategy
             self.latest_conclusion_delay_signals = delay_signals
             self.latest_conclusion_delay_rationale = delay_rationale
 
             conclusion_text = strip_conclusion_prefix(conclusion_line)
-            dm_min = mention_delay_min_turns if mention_delay_min_turns is not None else 1
-            dm_max = mention_delay_max_turns if mention_delay_max_turns is not None else dm_min + 2
-            dm_min = max(0, int(dm_min))
-            dm_max = max(dm_min, int(dm_max))
             conclusion_plan_item: Optional[DelayedMentionItem] = None
             if conclusion_text:
                 existing = next(
@@ -1825,8 +2357,9 @@ class RecursiveConclusionSession:
                         kind="conclusion",
                         text=conclusion_text,
                         keywords=keywords,
-                        earliest_turn=self.turn_index + dm_min,
-                        latest_turn=self.turn_index + dm_max,
+                        earliest_turn=self.turn_index + mention_delay_min_turns,
+                        latest_turn=self.turn_index + mention_delay_max_turns,
+                        hazard_profile=list(mention_hazard_profile),
                         likelihood=float(mention_likelihood or 0.0),
                         delay_strategy=delay_strategy,
                         delay_signals=list(delay_signals),
@@ -1843,12 +2376,18 @@ class RecursiveConclusionSession:
                         },
                     )
                 else:
+                    existing.created_turn = self.turn_index
                     existing.text = conclusion_text
                     existing.keywords = list(keywords)
+                    existing.earliest_turn = self.turn_index + mention_delay_min_turns
+                    existing.latest_turn = self.turn_index + mention_delay_max_turns
+                    existing.hazard_profile = list(mention_hazard_profile)
                     existing.likelihood = float(mention_likelihood or 0.0)
                     existing.delay_strategy = delay_strategy
                     existing.delay_signals = list(delay_signals)
                     existing.delay_rationale = delay_rationale
+                    existing.mention_turn = None
+                    existing.terminal_reason = ""
                     conclusion_plan_item = existing
                     self._log(
                         "delayed_mention_plan",
@@ -1867,6 +2406,7 @@ class RecursiveConclusionSession:
                     "keywords": keywords,
                     "mention_delay_min_turns": mention_delay_min_turns,
                     "mention_delay_max_turns": mention_delay_max_turns,
+                    "mention_hazard_profile": list(mention_hazard_profile),
                     "mention_earliest_turn": (
                         self.turn_index + mention_delay_min_turns
                         if mention_delay_min_turns is not None
@@ -1920,6 +2460,7 @@ class RecursiveConclusionSession:
                   "keywords": ["<3-5 distinctive phrases>"],
                   "mention_delay_min_turns": <int>,
                   "mention_delay_max_turns": <int>,
+                  "mention_hazard_profile": [{{"delay_turns": <int>=0, "prob": <0.00-1.00>}}, ...],
                   "mention_likelihood": <0.00-1.00>,
                   "delay_strategy": "<short label>",
                   "delay_signals": ["<2-6 short tags>"],
@@ -1980,12 +2521,14 @@ class RecursiveConclusionSession:
 
             delay_min = coerce_int(item_raw.get("mention_delay_min_turns"))
             delay_max = coerce_int(item_raw.get("mention_delay_max_turns"))
-            if delay_min is None:
-                delay_min = 1
-            if delay_max is None:
-                delay_max = delay_min + 2
-            delay_min = max(0, int(delay_min))
-            delay_max = max(delay_min, int(delay_max))
+            delay_min, delay_max, mention_hazard_profile = resolve_mention_hazard_plan(
+                created_turn=self.turn_index,
+                delay_min=delay_min,
+                delay_max=delay_max,
+                raw_hazard_profile=(
+                    item_raw.get("mention_hazard_profile") or item_raw.get("hazard_profile")
+                ),
+            )
 
             likelihood = clamp01(item_raw.get("mention_likelihood"), default=0.0)
             delay_strategy = truncate_text(item_raw.get("delay_strategy") or "", 48)
@@ -2003,6 +2546,7 @@ class RecursiveConclusionSession:
                 keywords=keywords,
                 earliest_turn=self.turn_index + delay_min,
                 latest_turn=self.turn_index + delay_max,
+                hazard_profile=list(mention_hazard_profile),
                 likelihood=likelihood,
                 delay_strategy=delay_strategy,
                 delay_signals=delay_signals,
@@ -2026,6 +2570,107 @@ class RecursiveConclusionSession:
             },
         )
         return created
+
+    def _probe_latent_convergence(
+        self,
+        *,
+        assistant_text: str,
+        planned_earliest_turn: Optional[int],
+        planned_latest_turn: Optional[int],
+        explicit_mention_present: Optional[bool],
+    ) -> Optional[dict[str, Any]]:
+        if self.config.latent_convergence_every <= 0:
+            return None
+        if self.turn_index == 0 or self.turn_index % self.config.latent_convergence_every != 0:
+            return None
+
+        conclusion_text = strip_conclusion_prefix(self.latest_conclusion_line)
+        if not conclusion_text:
+            return None
+
+        source = textwrap.dedent(
+            f"""\
+            Current turn index: {self.turn_index}
+            Latest conclusion probe turn: {self.latest_conclusion_probe_turn}
+            Planned earliest articulation turn: {planned_earliest_turn if planned_earliest_turn is not None else "unknown"}
+            Planned latest articulation turn: {planned_latest_turn if planned_latest_turn is not None else "unknown"}
+
+            Latest conclusion line:
+            {conclusion_text}
+
+            Conclusion keywords:
+            {"; ".join(self.latest_conclusion_keywords) if self.latest_conclusion_keywords else "(none)"}
+
+            Latest assistant reply:
+            {assistant_text}
+
+            Recent dialogue window:
+            {render_messages(self._recent_window())}
+
+            Evaluate whether the trajectory is semantically converging toward the conclusion even if it is not explicitly stated yet.
+
+            Return exactly this format:
+            LATENT_ALIGNMENT: <0.00 to 1.00>
+            ARTICULATION_READINESS: <0.00 to 1.00>
+            LEAKAGE_RISK: <0.00 to 1.00>
+            EXPLICIT_MENTION_PRESENT: <yes|no>
+            TRAJECTORY_STAGE: <latent|approaching|ready|explicit|diverged>
+            SHIFT_SIGNALS: <2-6 short tags separated by ,>
+            EVIDENCE: <<= 160 chars, no chain-of-thought>
+            """
+        ).strip()
+
+        response = self.adapter.generate(
+            system=(
+                "Latent convergence trace. You observe dialogue dynamics and estimate semantic convergence "
+                "toward the latest conclusion without answering the user."
+            ),
+            messages=[ChatMessage(role="user", content=source)],
+            config=self.config.probe_config,
+        )
+        raw = response.text.strip()
+        alignment = parse_probe_float(extract_probe_line_value(raw, "LATENT_ALIGNMENT"))
+        readiness = parse_probe_float(
+            extract_probe_line_value(raw, "ARTICULATION_READINESS")
+        )
+        leakage_risk = parse_probe_float(extract_probe_line_value(raw, "LEAKAGE_RISK"))
+        explicit_from_probe = parse_probe_bool(
+            extract_probe_line_value(raw, "EXPLICIT_MENTION_PRESENT")
+        )
+        trajectory_stage = truncate_text(
+            extract_probe_line_value(raw, "TRAJECTORY_STAGE"),
+            24,
+        )
+        shift_signals = parse_probe_list(
+            extract_probe_line_value(raw, "SHIFT_SIGNALS"),
+            max_items=6,
+            max_item_chars=80,
+        )
+        evidence = truncate_text(extract_probe_line_value(raw, "EVIDENCE"), 160)
+        payload = {
+            "conclusion_probe_turn": self.latest_conclusion_probe_turn,
+            "conclusion_line": conclusion_text,
+            "planned_earliest_turn": planned_earliest_turn,
+            "planned_latest_turn": planned_latest_turn,
+            "alignment": alignment,
+            "articulation_readiness": readiness,
+            "leakage_risk": leakage_risk,
+            "explicit_mention_present": (
+                explicit_from_probe
+                if explicit_from_probe is not None
+                else explicit_mention_present
+            ),
+            "trajectory_stage": trajectory_stage or None,
+            "shift_signals": shift_signals,
+            "evidence": evidence or None,
+            "raw": raw,
+            "usage": response.usage,
+            "finish_reason": response.finish_reason,
+            "request_id": response.request_id,
+        }
+        self.latest_latent_convergence_trace = payload
+        self._log("latent_convergence_trace", payload)
+        return payload
 
     def _probe_deferred_intent_plans(self) -> list[DeferredIntent]:
         if self.turn_index == 0:
@@ -2083,6 +2728,15 @@ class RecursiveConclusionSession:
                 - delay_min_turns must be >= 1. delay_max_turns must be >= delay_min_turns.
                 """
             ).strip()
+        elif self.config.deferred_intent_timing == DeferredIntentTiming.HAZARD:
+            timing_lines = textwrap.dedent(
+                """\
+                Timing:
+                - Provide a timing.hazard_profile list with per-delay probabilities.
+                - Each item must have delay_turns >= 1 and prob > 0.0.
+                - The probabilities should sum to about 1.0 and express when the utterance becomes most likely to surface.
+                """
+            ).strip()
         else:
             timing_lines = textwrap.dedent(
                 f"""\
@@ -2099,6 +2753,16 @@ class RecursiveConclusionSession:
                 '                  "timing": {\n'
                 '                    "delay_min_turns": 1,\n'
                 '                    "delay_max_turns": 3\n'
+                "                  },\n"
+            )
+        elif self.config.deferred_intent_timing == DeferredIntentTiming.HAZARD:
+            timing_schema = (
+                '                  "timing": {\n'
+                '                    "hazard_profile": [\n'
+                '                      {"delay_turns": 2, "prob": 0.20},\n'
+                '                      {"delay_turns": 3, "prob": 0.45},\n'
+                '                      {"delay_turns": 4, "prob": 0.35}\n'
+                "                    ]\n"
                 "                  },\n"
             )
 
@@ -2136,6 +2800,8 @@ class RecursiveConclusionSession:
                 "Include timing either as timing.delay_min_turns/timing.delay_max_turns (relative), "
                 "or timing.earliest_turn/timing.latest_turn (absolute)."
                 if self.config.deferred_intent_timing == DeferredIntentTiming.MODEL
+                else "Include timing.hazard_profile with per-delay probabilities."
+                if self.config.deferred_intent_timing == DeferredIntentTiming.HAZARD
                 else "Do NOT include timing fields."
             )
             schema_instructions = textwrap.dedent(
@@ -2295,6 +2961,12 @@ class RecursiveConclusionSession:
                     "created_turn": intent.created_turn,
                     "earliest_turn": intent.earliest_turn,
                     "latest_turn": intent.latest_turn,
+                    "hazard_profile": list(intent.hazard_profile),
+                    "hazard_turn_prob": hazard_turn_probability(
+                        intent.hazard_profile,
+                        created_turn=intent.created_turn,
+                        turn_index=self.turn_index,
+                    ),
                     "kind": intent.kind,
                     "intent": intent.intent,
                     "why_not_now": intent.why_not_now,
@@ -2458,6 +3130,8 @@ class RecursiveConclusionSession:
                         intent,
                         updated_intent_payload,
                         current_turn=self.turn_index,
+                        timing=self.config.deferred_intent_timing,
+                        default_offset=self.config.deferred_intent_offset,
                         default_grace=self.config.deferred_intent_grace,
                     )
                     status_after = intent.status
@@ -2491,6 +3165,12 @@ class RecursiveConclusionSession:
                     "created_turn": intent.created_turn,
                     "earliest_turn": intent.earliest_turn,
                     "latest_turn": intent.latest_turn,
+                    "hazard_profile": list(intent.hazard_profile),
+                    "hazard_turn_prob": hazard_turn_probability(
+                        intent.hazard_profile,
+                        created_turn=intent.created_turn,
+                        turn_index=self.turn_index,
+                    ),
                     "priority": intent.priority,
                     "confidence": intent.confidence,
                     "revision_count": intent.revision_count,
@@ -2539,19 +3219,52 @@ class RecursiveConclusionSession:
         ):
             due_sorted = sorted(
                 due_delayed_mentions,
-                key=lambda item: (item.latest_turn, item.earliest_turn, item.item_id),
+                key=lambda item: (
+                    -hazard_turn_probability(
+                        item.hazard_profile,
+                        created_turn=item.created_turn,
+                        turn_index=self.turn_index,
+                    ),
+                    item.latest_turn,
+                    item.earliest_turn,
+                    item.item_id,
+                ),
             )
             for item in due_sorted:
                 if len(injected_delayed_mentions) >= delayed_mention_fire_max_items:
                     break
+                hazard_turn_prob = (
+                    hazard_turn_probability(
+                        item.hazard_profile,
+                        created_turn=item.created_turn,
+                        turn_index=self.turn_index,
+                    )
+                    if item.hazard_profile
+                    else None
+                )
+                effective_prob = delayed_mention_fire_prob
+                hazard_points = hazard_support_size(item.hazard_profile)
+                if isinstance(hazard_turn_prob, float):
+                    effective_prob = min(
+                        1.0,
+                        delayed_mention_fire_prob * max(1, hazard_points) * hazard_turn_prob,
+                    )
+                hazard_peak_prob = (
+                    hazard_peak_probability(item.hazard_profile) if item.hazard_profile else None
+                )
                 draw = random.random()
-                inject = draw < delayed_mention_fire_prob
+                inject = draw < effective_prob
                 delayed_mention_injection_draws.append(
                     {
                         "item_id": item.item_id,
                         "kind": item.kind,
                         "draw": draw,
-                        "prob": delayed_mention_fire_prob,
+                        "prob": effective_prob,
+                        "base_prob": delayed_mention_fire_prob,
+                        "hazard_profile": list(item.hazard_profile),
+                        "hazard_turn_prob": hazard_turn_prob,
+                        "hazard_peak_prob": hazard_peak_prob,
+                        "hazard_support_size": hazard_points or None,
                         "inject": inject,
                     }
                 )
@@ -2562,6 +3275,9 @@ class RecursiveConclusionSession:
         due_intents: list[DeferredIntent] = []
         deferred_actions: list[dict[str, Any]] = []
         ablation_actions: list[dict[str, Any]] = []
+        suppressed_delayed_mentions = self._suppressed_delayed_mentions(
+            injected_delayed_mentions=injected_delayed_mentions
+        )
         inband_state: Optional[dict[str, Any]] = None
         inband_state_error: Optional[str] = None
         inband_state_chars: Optional[int] = None
@@ -2603,6 +3319,7 @@ class RecursiveConclusionSession:
             base_prompt = self._build_system_prompt(
                 due_intents=None,
                 injected_delayed_mentions=injected_delayed_mentions,
+                suppressed_delayed_mentions=suppressed_delayed_mentions,
             )
             prev_assistant = next(
                 (m for m in reversed(self.history[:-1]) if m.role == "assistant"),
@@ -2655,9 +3372,11 @@ class RecursiveConclusionSession:
                     - fixed: fire exactly at earliest_turn (latest_turn == earliest_turn).
                     - trigger/adaptive: decide fire/cancel/hold based on triggers/cancel_if and dialogue relevance.
                     - adaptive may revise wording/timing/conditions (increment revision_count) instead of firing.
+                  - If deferred_intent_timing is 'hazard', include hazard_profile as [{"delay_turns": N, "prob": P}, ...].
                   - If you set status=fired, set fire_turn={self.turn_index} and set terminal_reason.
                 - If deferred_intent_mode is 'soft_fire', integrate fired intents naturally into the visible reply.
-                  If deferred_intent_mode is 'observe', do NOT include fired intent content in the visible reply.
+                - If deferred_intent_mode is 'hard_fire', include every fired intent explicitly in the visible reply.
+                - If deferred_intent_mode is 'observe', do NOT include fired intent content in the visible reply.
                 """
             ).strip()
             if inject_schema:
@@ -2675,6 +3394,7 @@ class RecursiveConclusionSession:
                           "why_not_now": "...",
                           "earliest_turn": 6,
                           "latest_turn": 8,
+                          "hazard_profile": [{"delay_turns": 3, "prob": 0.6}],
                           "trigger": ["..."],
                           "cancel_if": ["..."],
                           "confidence": 0.0,
@@ -2750,6 +3470,20 @@ class RecursiveConclusionSession:
                         latest_turn = earliest_turn + max(0, self.config.deferred_intent_grace)
                 if latest_turn < earliest_turn:
                     latest_turn = earliest_turn
+                hazard_profile = parse_hazard_profile(item.get("hazard_profile"))
+                if self.config.deferred_intent_timing == DeferredIntentTiming.HAZARD:
+                    hazard_profile = ensure_hazard_profile(
+                        hazard_profile,
+                        created_turn=created_turn,
+                        earliest_turn=earliest_turn,
+                        latest_turn=latest_turn,
+                        offset=self.config.deferred_intent_offset,
+                        grace=self.config.deferred_intent_grace,
+                    )
+                    earliest_turn, latest_turn = hazard_bounds_from_profile(
+                        created_turn=created_turn,
+                        profile=hazard_profile,
+                    )
 
                 status = compact_text(str(item.get("status", "active"))).lower() or "active"
                 if status not in {"active", "fired", "canceled", "expired"}:
@@ -2767,6 +3501,7 @@ class RecursiveConclusionSession:
                         why_not_now=why_not_now,
                         earliest_turn=earliest_turn,
                         latest_turn=latest_turn,
+                        hazard_profile=hazard_profile,
                         trigger=coerce_str_list(item.get("trigger")),
                         cancel_if=coerce_str_list(item.get("cancel_if")),
                         confidence=clamp01(item.get("confidence"), default=0.0),
@@ -2875,6 +3610,20 @@ class RecursiveConclusionSession:
                     if self.config.deferred_intent_timing == DeferredIntentTiming.OFFSET:
                         intent.earliest_turn = default_earliest_turn
                         intent.latest_turn = default_latest_turn
+                        intent.hazard_profile = []
+                    elif self.config.deferred_intent_timing == DeferredIntentTiming.HAZARD:
+                        intent.hazard_profile = ensure_hazard_profile(
+                            intent.hazard_profile,
+                            created_turn=intent.created_turn,
+                            earliest_turn=intent.earliest_turn,
+                            latest_turn=intent.latest_turn,
+                            offset=self.config.deferred_intent_offset,
+                            grace=self.config.deferred_intent_grace,
+                        )
+                        intent.earliest_turn, intent.latest_turn = hazard_bounds_from_profile(
+                            created_turn=intent.created_turn,
+                            profile=intent.hazard_profile,
+                        )
                     else:
                         if intent.earliest_turn <= self.turn_index:
                             intent.earliest_turn = self.turn_index + 1
@@ -2882,6 +3631,7 @@ class RecursiveConclusionSession:
                             intent.latest_turn = intent.earliest_turn
                         if self.config.deferred_intent_strategy == DeferredIntentStrategy.FIXED:
                             intent.latest_turn = intent.earliest_turn
+                        intent.hazard_profile = []
 
             # Enforce a hard cap after applying plan policy/max-new.
             if len(parsed_intents) > self.config.deferred_intent_limit:
@@ -3043,6 +3793,12 @@ class RecursiveConclusionSession:
                         "created_turn": intent.created_turn,
                         "earliest_turn": intent.earliest_turn,
                         "latest_turn": intent.latest_turn,
+                        "hazard_profile": list(intent.hazard_profile),
+                        "hazard_turn_prob": hazard_turn_probability(
+                            intent.hazard_profile,
+                            created_turn=intent.created_turn,
+                            turn_index=self.turn_index,
+                        ),
                         "priority": intent.priority,
                         "confidence": intent.confidence,
                         "revision_count": intent.revision_count,
@@ -3192,6 +3948,7 @@ class RecursiveConclusionSession:
             system_prompt = self._build_system_prompt(
                 due_intents=due_intents,
                 injected_delayed_mentions=injected_delayed_mentions,
+                suppressed_delayed_mentions=suppressed_delayed_mentions,
             )
             reply = self.adapter.generate(
                 system=system_prompt or None,
@@ -3262,6 +4019,20 @@ class RecursiveConclusionSession:
                     self.latest_conclusion_probe_turn
                     + self.latest_conclusion_mention_delay_max_turns
                 )
+        latest_conclusion_plan_hazard_turn_prob: Optional[float] = None
+        if self.latest_conclusion_probe_turn is not None and self.latest_conclusion_mention_hazard_profile:
+            latest_conclusion_plan_hazard_turn_prob = hazard_turn_probability(
+                self.latest_conclusion_mention_hazard_profile,
+                created_turn=self.latest_conclusion_probe_turn,
+                turn_index=self.turn_index,
+            )
+
+        latent_convergence = self._probe_latent_convergence(
+            assistant_text=assistant_text,
+            planned_earliest_turn=latest_conclusion_plan_earliest_turn,
+            planned_latest_turn=latest_conclusion_plan_latest_turn,
+            explicit_mention_present=latest_conclusion_mentioned_any,
+        )
 
         injected_delayed_mention_ids = {item.item_id for item in injected_delayed_mentions}
         delayed_mention_actions: list[dict[str, Any]] = []
@@ -3270,6 +4041,15 @@ class RecursiveConclusionSession:
                 continue
             overlap_score = lexical_overlap(item.text, assistant_text)
             hits = keyword_hits(item.keywords, assistant_text) if item.keywords else None
+            hazard_turn_prob = (
+                hazard_turn_probability(
+                    item.hazard_profile,
+                    created_turn=item.created_turn,
+                    turn_index=self.turn_index,
+                )
+                if item.hazard_profile
+                else None
+            )
             required_hits: Optional[int] = None
             keyword_mentioned = False
             if item.keywords:
@@ -3295,6 +4075,8 @@ class RecursiveConclusionSession:
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
+                    "hazard_profile": list(item.hazard_profile),
+                    "hazard_turn_prob": hazard_turn_prob,
                     "mention_turn": item.mention_turn,
                     "delay_turns": (item.mention_turn or 0) - item.created_turn,
                     "within_window": item.earliest_turn <= self.turn_index <= item.latest_turn,
@@ -3318,6 +4100,8 @@ class RecursiveConclusionSession:
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
+                    "hazard_profile": list(item.hazard_profile),
+                    "hazard_turn_prob": hazard_turn_prob,
                     "mention_turn": None,
                     "delay_turns": None,
                     "within_window": False,
@@ -3341,6 +4125,12 @@ class RecursiveConclusionSession:
                 "created_turn": intent.created_turn,
                 "earliest_turn": intent.earliest_turn,
                 "latest_turn": intent.latest_turn,
+                "hazard_profile": list(intent.hazard_profile),
+                "hazard_turn_prob": hazard_turn_probability(
+                    intent.hazard_profile,
+                    created_turn=intent.created_turn,
+                    turn_index=self.turn_index,
+                ),
                 "fire_turn": self.turn_index,
                 "plan_strategy": intent.plan_strategy,
                 "plan_signals": list(intent.plan_signals),
@@ -3350,7 +4140,8 @@ class RecursiveConclusionSession:
                 "decision_rationale": intent.decision_rationale,
                 "assistant_overlap": fire_overlap,
                 "realized": realized,
-                "injected": self.config.deferred_intent_mode == DeferredIntentMode.SOFT_FIRE,
+                "injected": self.config.deferred_intent_mode
+                in {DeferredIntentMode.SOFT_FIRE, DeferredIntentMode.HARD_FIRE},
             }
             due_payloads.append(payload)
             if intent.intent_id in action_map:
@@ -3377,10 +4168,44 @@ class RecursiveConclusionSession:
             "latest_conclusion_plan_delay_max_turns": self.latest_conclusion_mention_delay_max_turns,
             "latest_conclusion_plan_earliest_turn": latest_conclusion_plan_earliest_turn,
             "latest_conclusion_plan_latest_turn": latest_conclusion_plan_latest_turn,
+            "latest_conclusion_plan_hazard_profile": (
+                list(self.latest_conclusion_mention_hazard_profile)
+                if self.latest_conclusion_mention_hazard_profile
+                else None
+            ),
+            "latest_conclusion_plan_hazard_turn_prob": latest_conclusion_plan_hazard_turn_prob,
             "latest_conclusion_plan_likelihood": self.latest_conclusion_mention_likelihood,
             "latest_conclusion_plan_strategy": self.latest_conclusion_delay_strategy or None,
             "latest_conclusion_plan_signals": list(self.latest_conclusion_delay_signals or [])
             or None,
+            "latent_convergence_alignment": (
+                latent_convergence.get("alignment") if latent_convergence else None
+            ),
+            "latent_convergence_readiness": (
+                latent_convergence.get("articulation_readiness")
+                if latent_convergence
+                else None
+            ),
+            "latent_convergence_leakage_risk": (
+                latent_convergence.get("leakage_risk") if latent_convergence else None
+            ),
+            "latent_convergence_stage": (
+                latent_convergence.get("trajectory_stage") if latent_convergence else None
+            ),
+            "latent_convergence_signals": (
+                list(latent_convergence.get("shift_signals") or [])
+                if latent_convergence
+                else None
+            ),
+            "latent_convergence_explicit": (
+                latent_convergence.get("explicit_mention_present")
+                if latent_convergence
+                else None
+            ),
+            "latent_convergence_evidence": (
+                latent_convergence.get("evidence") if latent_convergence else None
+            ),
+            "latent_convergence_trace": latent_convergence,
             "planned_delayed_mentions": (
                 [item.to_dict() for item in planned_delayed_mentions]
                 if planned_delayed_mentions
@@ -3394,6 +4219,16 @@ class RecursiveConclusionSession:
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
+                    "hazard_profile": list(item.hazard_profile),
+                    "hazard_turn_prob": (
+                        hazard_turn_probability(
+                            item.hazard_profile,
+                            created_turn=item.created_turn,
+                            turn_index=self.turn_index,
+                        )
+                        if item.hazard_profile
+                        else None
+                    ),
                     "likelihood": item.likelihood,
                     "text": truncate_text(item.text, 140),
                 }
@@ -3406,6 +4241,16 @@ class RecursiveConclusionSession:
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
+                    "hazard_profile": list(item.hazard_profile),
+                    "hazard_turn_prob": (
+                        hazard_turn_probability(
+                            item.hazard_profile,
+                            created_turn=item.created_turn,
+                            turn_index=self.turn_index,
+                        )
+                        if item.hazard_profile
+                        else None
+                    ),
                     "likelihood": item.likelihood,
                     "text": truncate_text(item.text, 140),
                 }
@@ -3415,6 +4260,27 @@ class RecursiveConclusionSession:
             "delayed_mention_mode": self.config.delayed_mention_mode.value,
             "delayed_mention_fire_prob": delayed_mention_fire_prob,
             "delayed_mention_fire_max_items": delayed_mention_fire_max_items,
+            "delayed_mention_leak_policy": self.config.delayed_mention_leak_policy.value,
+            "delayed_mention_leak_threshold": self._delayed_mention_leak_threshold(),
+            "suppressed_delayed_mentions": [
+                {
+                    "item_id": item.item_id,
+                    "kind": item.kind,
+                    "created_turn": item.created_turn,
+                    "earliest_turn": item.earliest_turn,
+                    "latest_turn": item.latest_turn,
+                    "hazard_profile": list(item.hazard_profile),
+                    "hazard_turn_prob": hazard_turn_probability(
+                        item.hazard_profile,
+                        created_turn=item.created_turn,
+                        turn_index=self.turn_index,
+                    ),
+                    "threshold": self._delayed_mention_leak_threshold(),
+                    "likelihood": item.likelihood,
+                    "text": truncate_text(item.text, 140),
+                }
+                for item in suppressed_delayed_mentions
+            ],
             "delayed_mention_injection_draws": delayed_mention_injection_draws,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "planned_deferred_intents": planned_intents_payload,
@@ -3447,16 +4313,25 @@ class RecursiveConclusionSession:
 # ----------------------------
 
 def load_script(path: Path) -> tuple[str, list[str]]:
+    def normalize_turns(turns_raw: list[Any]) -> list[str]:
+        turns: list[str] = []
+        for idx, item in enumerate(turns_raw, start=1):
+            turn = str(item).strip()
+            if not turn:
+                raise ValueError(f"Script turn {idx} must not be empty or whitespace.")
+            turns.append(turn)
+        return turns
+
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, list):
-        turns = [str(x) for x in data]
+        turns = normalize_turns(data)
         return "", turns
     if isinstance(data, dict):
         system = str(data.get("system", "") or "")
         turns_raw = data.get("turns")
         if not isinstance(turns_raw, list):
             raise ValueError("Script JSON object must contain a list field 'turns'.")
-        turns = [str(x) for x in turns_raw]
+        turns = normalize_turns(turns_raw)
         return system, turns
     raise ValueError("Script JSON must be either a list[str] or {system, turns}.")
 
@@ -3498,6 +4373,20 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         delayed_mention_fire_prob=float(getattr(args, "delayed_mention_fire_prob", 0.35) or 0.0),
         delayed_mention_fire_max_items=max(
             0, int(getattr(args, "delayed_mention_fire_max_items", 2) or 0)
+        ),
+        delayed_mention_leak_policy=DelayedMentionLeakPolicy(
+            getattr(
+                args,
+                "delayed_mention_leak_policy",
+                DelayedMentionLeakPolicy.ON.value,
+            )
+        ),
+        delayed_mention_leak_threshold=clamp01(
+            getattr(args, "delayed_mention_leak_threshold", 0.05),
+            default=0.05,
+        ),
+        latent_convergence_every=max(
+            0, int(getattr(args, "latent_convergence_every", 0) or 0)
         ),
         deferred_intent_every=args.deferred_intent_every,
         deferred_intent_mode=DeferredIntentMode(args.deferred_intent_mode),
@@ -3570,49 +4459,151 @@ def run_repl(args: argparse.Namespace) -> int:
 
         result = session.user_turn(user_text)
         if cfg.show_probe_outputs:
-            if result["memory_capsule"]:
-                print(f"\n[memory capsule]\n{result['memory_capsule']}\n")
-            if result["conclusion_probe"]:
-                print(f"[conclusion probe]\n{result['conclusion_probe']}\n")
-            if result["planned_deferred_intent"]:
-                plan = result["planned_deferred_intent"]
-                print(
-                    "[deferred intent planned]\n"
-                    f"{plan['intent_id']} -> {plan['intent']} "
-                    f"(window: turn {plan['earliest_turn']}..{plan['latest_turn']})\n"
-                )
-            if result["due_deferred_intents"]:
-                print("[deferred intents due]")
-                for item in result["due_deferred_intents"]:
-                    print(
-                        f"- {item['intent_id']}: overlap={item['assistant_overlap']:.3f} realized={item['realized']} | {item['intent']}"
-                    )
-                print()
+            print_probe_outputs(result)
         print(f"assistant> {result['assistant']}\n")
     return 0
 
 
-def run_compare(args: argparse.Namespace) -> int:
+def print_probe_outputs(result: dict[str, Any]) -> None:
+    if result.get("memory_capsule"):
+        print(f"\n[memory capsule]\n{result['memory_capsule']}\n")
+    if result.get("conclusion_probe"):
+        print(f"[conclusion probe]\n{result['conclusion_probe']}\n")
+    latent_trace = result.get("latent_convergence_trace")
+    if isinstance(latent_trace, dict):
+        print(
+            "[latent convergence]\n"
+            f"alignment={latent_trace.get('alignment')} "
+            f"readiness={latent_trace.get('articulation_readiness')} "
+            f"leakage_risk={latent_trace.get('leakage_risk')} "
+            f"stage={latent_trace.get('trajectory_stage')}\n"
+        )
+
+    planned_delayed_mentions = result.get("planned_delayed_mentions") or []
+    if isinstance(planned_delayed_mentions, list) and planned_delayed_mentions:
+        print("[delayed mentions planned]")
+        for item in planned_delayed_mentions:
+            if not isinstance(item, dict):
+                continue
+            hazard_brief = format_hazard_profile_brief(item.get("hazard_profile") or [])
+            hazard_suffix = f"; hazard: {hazard_brief}" if hazard_brief else ""
+            print(
+                f"- {item.get('item_id')}: {item.get('text')} "
+                f"(window: turn {item.get('earliest_turn')}..{item.get('latest_turn')}{hazard_suffix})"
+            )
+        print()
+
+    suppressed_delayed_mentions = result.get("suppressed_delayed_mentions") or []
+    if isinstance(suppressed_delayed_mentions, list) and suppressed_delayed_mentions:
+        print("[delayed mentions suppressed]")
+        for item in suppressed_delayed_mentions:
+            if not isinstance(item, dict):
+                continue
+            turn_prob = item.get("hazard_turn_prob")
+            threshold = item.get("threshold")
+            print(
+                f"- {item.get('item_id')}: p_now={float(turn_prob):.3f} "
+                f"threshold={float(threshold):.3f} | {item.get('text')}"
+            )
+        print()
+
+    planned_intents = result.get("planned_deferred_intents") or []
+    if not planned_intents and result.get("planned_deferred_intent"):
+        planned_intents = [result["planned_deferred_intent"]]
+    if isinstance(planned_intents, list) and planned_intents:
+        print("[deferred intents planned]")
+        for item in planned_intents:
+            if not isinstance(item, dict):
+                continue
+            hazard_brief = format_hazard_profile_brief(item.get("hazard_profile") or [])
+            hazard_suffix = f"; hazard: {hazard_brief}" if hazard_brief else ""
+            print(
+                f"- {item.get('intent_id')}: {item.get('intent')} "
+                f"(window: turn {item.get('earliest_turn')}..{item.get('latest_turn')}{hazard_suffix})"
+            )
+        print()
+
+    due_intents = result.get("due_deferred_intents") or []
+    if isinstance(due_intents, list) and due_intents:
+        print("[deferred intents due]")
+        for item in due_intents:
+            if not isinstance(item, dict):
+                continue
+            overlap = float(item.get("assistant_overlap", 0.0) or 0.0)
+            hazard_turn_prob = item.get("hazard_turn_prob")
+            hazard_suffix = (
+                f" hazard_turn_prob={float(hazard_turn_prob):.3f}"
+                if isinstance(hazard_turn_prob, (int, float))
+                else ""
+            )
+            print(
+                f"- {item.get('intent_id')}: overlap={overlap:.3f} "
+                f"realized={item.get('realized')}{hazard_suffix} | {item.get('intent')}"
+            )
+        print()
+
+
+def write_summary_rows(path: Path, rows: list[dict[str, Any]]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def build_compare_log_path(
+    out_dir: Path,
+    *,
+    provider: str,
+    model: str,
+    arm_name: str = "",
+) -> Path:
+    prefix = f"arm_{sanitize_filename(arm_name)}___" if arm_name else ""
+    return out_dir / f"{prefix}{provider}__{sanitize_filename(model)}.jsonl"
+
+
+def write_compare_summary(
+    out_dir: Path,
+    rows: list[dict[str, Any]],
+    *,
+    arm_name: str = "",
+) -> Path:
+    filename = f"summary__{sanitize_filename(arm_name)}.json" if arm_name else "summary.json"
+    return write_summary_rows(out_dir / filename, rows)
+
+
+def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
     script_path = Path(args.script)
     script_system, turns = load_script(script_path)
     provider_specs = parse_provider_specs(args.providers)
 
     out_dir = Path(args.out_dir or "compare_outputs")
     out_dir.mkdir(parents=True, exist_ok=True)
+    arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
+    arm_description = compact_text(str(getattr(args, "arm_description", "") or ""))
 
     rows: list[dict[str, Any]] = []
+    if arm_name:
+        print(f"=== arm: {arm_name} ===")
     for provider, model in provider_specs:
         adapter = build_adapter(provider, model)
         cfg = make_experiment_config_from_args(args, base_system=script_system)
-        log_path = out_dir / f"{provider}__{sanitize_filename(model)}.jsonl"
+        log_path = build_compare_log_path(
+            out_dir,
+            provider=provider,
+            model=model,
+            arm_name=arm_name,
+        )
         session = RecursiveConclusionSession(adapter=adapter, config=cfg, log_path=log_path)
 
         print(f"=== {provider} / {model} ===")
         for turn_no, user_text in enumerate(turns, start=1):
             result = session.user_turn(user_text)
             fire_count = sum(1 for item in result["deferred_intent_actions"] if item.get("action") == "fire")
+            if cfg.show_probe_outputs:
+                print_probe_outputs(result)
             rows.append(
                 {
+                    "arm": arm_name or None,
+                    "arm_description": arm_description or None,
                     "provider": provider,
                     "model": model,
                     "turn": turn_no,
@@ -3620,9 +4611,19 @@ def run_compare(args: argparse.Namespace) -> int:
                     "assistant": result["assistant"],
                     "memory_capsule": result["memory_capsule"],
                     "conclusion_probe": result["conclusion_probe"],
+                    "delayed_mention_leak_policy": result["delayed_mention_leak_policy"],
+                    "delayed_mention_leak_threshold": result["delayed_mention_leak_threshold"],
+                    "suppressed_delayed_mention_count": len(
+                        result.get("suppressed_delayed_mentions") or []
+                    ),
                     "planned_deferred_intent": result["planned_deferred_intent"],
                     "due_deferred_intents": result["due_deferred_intents"],
                     "deferred_intent_actions": result["deferred_intent_actions"],
+                    "deferred_intent_timing": result["deferred_intent_timing"],
+                    "latent_convergence_alignment": result["latent_convergence_alignment"],
+                    "latent_convergence_readiness": result["latent_convergence_readiness"],
+                    "latent_convergence_leakage_risk": result["latent_convergence_leakage_risk"],
+                    "latent_convergence_stage": result["latent_convergence_stage"],
                     "probe_reply_overlap": result["probe_reply_overlap"],
                     "usage": result["usage"],
                 }
@@ -3633,10 +4634,131 @@ def run_compare(args: argparse.Namespace) -> int:
             )
         print()
 
-    summary_path = out_dir / "summary.json"
-    summary_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    return rows
+
+
+def run_compare(args: argparse.Namespace) -> int:
+    rows = execute_compare(args)
+    summary_path = write_compare_summary(
+        Path(args.out_dir or "compare_outputs"),
+        rows,
+        arm_name=compact_text(str(getattr(args, "arm_name", "") or "")),
+    )
     print(f"Wrote {summary_path}")
     return 0
+
+
+def to_cli_flag(name: str) -> str:
+    return "--" + name.replace("_", "-")
+
+
+def extend_argv_from_args_dict(argv: list[str], args_dict: dict[str, Any]) -> None:
+    for key, value in args_dict.items():
+        if value is None:
+            continue
+        flag = to_cli_flag(str(key))
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+            continue
+        if isinstance(value, list):
+            argv.append(flag)
+            argv.extend(str(item) for item in value)
+            continue
+        argv.extend([flag, str(value)])
+
+
+def build_compare_args_from_config(
+    data: dict[str, Any],
+    *,
+    out_dir_override: Optional[str] = None,
+    args_override: Optional[dict[str, Any]] = None,
+    arm_name: str = "",
+    arm_description: str = "",
+) -> argparse.Namespace:
+    script = data.get("script")
+    providers = data.get("providers")
+    out_dir = out_dir_override or data.get("out_dir") or data.get("out-dir") or "compare_outputs"
+    if not script or not isinstance(script, str):
+        raise ValueError("compare config requires string field 'script'.")
+    if not isinstance(providers, list) or not all(isinstance(x, str) for x in providers):
+        raise ValueError("compare config requires list[str] field 'providers'.")
+
+    argv: list[str] = ["compare", "--script", script, "--providers", *providers]
+    if out_dir:
+        argv.extend(["--out-dir", str(out_dir)])
+
+    base_args = data.get("args") or {}
+    if not isinstance(base_args, dict):
+        raise ValueError("Field 'args' must be an object if present.")
+    merged_args = dict(base_args)
+    if args_override:
+        merged_args.update(args_override)
+    if merged_args:
+        extend_argv_from_args_dict(argv, merged_args)
+
+    parser = build_parser()
+    inner_args = parser.parse_args(argv)
+    inner_args.arm_name = arm_name
+    inner_args.arm_description = arm_description
+    return inner_args
+
+
+def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
+    if not isinstance(data, dict):
+        raise ValueError("Config JSON must be an object.")
+
+    arms = data.get("arms")
+    if not isinstance(arms, list) or not arms:
+        raise ValueError("compare-matrix config requires non-empty list field 'arms'.")
+
+    out_dir = Path(str(data.get("out_dir") or data.get("out-dir") or "compare_outputs"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    combined_rows: list[dict[str, Any]] = []
+    for idx, arm in enumerate(arms, start=1):
+        if not isinstance(arm, dict):
+            raise ValueError(f"Arm {idx} must be an object.")
+        arm_name = compact_text(str(arm.get("name") or f"arm_{idx:02d}"))
+        arm_description = compact_text(str(arm.get("description") or ""))
+        arm_args = arm.get("args") or {}
+        if not isinstance(arm_args, dict):
+            raise ValueError(f"Arm {arm_name!r} field 'args' must be an object.")
+
+        compare_args = build_compare_args_from_config(
+            data,
+            out_dir_override=str(out_dir),
+            args_override=arm_args,
+            arm_name=arm_name,
+            arm_description=arm_description,
+        )
+        rows = execute_compare(compare_args)
+        combined_rows.extend(rows)
+        arm_summary_path = write_compare_summary(out_dir, rows, arm_name=arm_name)
+        print(f"Wrote {arm_summary_path}")
+
+    matrix_summary_path = write_compare_summary(out_dir, combined_rows)
+    manifest_path = write_summary_rows(
+        out_dir / "arms.json",
+        [
+            {
+                "name": compact_text(str(arm.get("name") or f"arm_{idx:02d}")),
+                "description": compact_text(str(arm.get("description") or "")) or None,
+                "args": arm.get("args") or {},
+            }
+            for idx, arm in enumerate(arms, start=1)
+            if isinstance(arm, dict)
+        ],
+    )
+    print(f"Wrote {matrix_summary_path}")
+    print(f"Wrote {manifest_path}")
+    return 0
+
+
+def run_compare_matrix(args: argparse.Namespace) -> int:
+    config_path = Path(args.config)
+    data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    return run_compare_matrix_from_config_data(data)
 
 
 def run_config(args: argparse.Namespace) -> int:
@@ -3647,34 +4769,21 @@ def run_config(args: argparse.Namespace) -> int:
 
     command = data.get("command")
     if command is None:
-        if "providers" in data:
+        if "providers" in data and "arms" in data:
+            command = "compare-matrix"
+        elif "providers" in data:
             command = "compare"
         elif "provider" in data and "model" in data:
             command = "repl"
-    command = str(command or "").strip().lower()
-    if command not in {"compare", "repl"}:
+    command = str(command or "").strip().lower().replace("_", "-")
+    if command not in {"compare", "repl", "compare-matrix"}:
         raise ValueError(
-            "Config must specify command='compare'|'repl', or include either "
-            "('providers' for compare) or ('provider' and 'model' for repl)."
+            "Config must specify command='compare'|'repl'|'compare-matrix', or include either "
+            "('providers' for compare, optionally with 'arms' for compare-matrix) or "
+            "('provider' and 'model' for repl)."
         )
-
-    def to_flag(name: str) -> str:
-        return "--" + name.replace("_", "-")
-
-    def extend_from_args_dict(argv: list[str], args_dict: dict[str, Any]) -> None:
-        for key, value in args_dict.items():
-            if value is None:
-                continue
-            flag = to_flag(str(key))
-            if isinstance(value, bool):
-                if value:
-                    argv.append(flag)
-                continue
-            if isinstance(value, list):
-                argv.append(flag)
-                argv.extend(str(item) for item in value)
-                continue
-            argv.extend([flag, str(value)])
+    if command == "compare-matrix":
+        return run_compare_matrix_from_config_data(data)
 
     argv: list[str] = [command]
     if command == "compare":
@@ -3701,7 +4810,7 @@ def run_config(args: argparse.Namespace) -> int:
     args_dict = data.get("args") or {}
     if not isinstance(args_dict, dict):
         raise ValueError("Field 'args' must be an object if present.")
-    extend_from_args_dict(argv, args_dict)
+    extend_argv_from_args_dict(argv, args_dict)
 
     parser = build_parser()
     inner_args = parser.parse_args(argv)
@@ -3784,6 +4893,33 @@ def build_parser() -> argparse.ArgumentParser:
             help="Maximum number of due delayed-mention hints to inject per turn (only affects --delayed-mention-mode soft_fire).",
         )
         p.add_argument(
+            "--delayed-mention-leak-policy",
+            choices=[m.value for m in DelayedMentionLeakPolicy],
+            default=DelayedMentionLeakPolicy.ON.value,
+            help=(
+                "Whether active delayed mentions that are still below the current hazard threshold "
+                "should be explicitly suppressed from surfacing."
+            ),
+        )
+        p.add_argument(
+            "--delayed-mention-leak-threshold",
+            type=float,
+            default=0.05,
+            help=(
+                "Current-turn hazard probability required before an active delayed mention is allowed "
+                "to surface without suppression when --delayed-mention-leak-policy is on."
+            ),
+        )
+        p.add_argument(
+            "--latent-convergence-every",
+            type=int,
+            default=0,
+            help=(
+                "Run an observe-only latent convergence trace every N turns after replies. "
+                "0 disables."
+            ),
+        )
+        p.add_argument(
             "--deferred-intent-every",
             type=int,
             default=0,
@@ -3807,7 +4943,8 @@ def build_parser() -> argparse.ArgumentParser:
             default=DeferredIntentTiming.OFFSET.value,
             help=(
                 "How to set intent timing windows: 'offset' derives from --deferred-intent-offset/--deferred-intent-grace; "
-                "'model' asks the planner to propose timing (external backend)."
+                "'model' asks the planner to propose timing bounds; "
+                "'hazard' asks the planner to emit a per-delay probability profile."
             ),
         )
         p.add_argument(
@@ -3899,8 +5036,26 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--out-dir", default="compare_outputs", help="Directory for JSONL logs and summary.")
     compare.set_defaults(func=run_compare)
 
+    compare_matrix = sub.add_parser(
+        "compare-matrix",
+        help="Run an arm matrix from a JSON config file.",
+    )
+    compare_matrix.add_argument(
+        "--config",
+        required=True,
+        help="Path to JSON config with script/providers/arms/out_dir.",
+    )
+    compare_matrix.set_defaults(func=run_compare_matrix)
+
     run_cfg = sub.add_parser("run-config", help="Run repl/compare from a JSON config file.")
-    run_cfg.add_argument("--config", required=True, help="Path to JSON config (see templates/compare_config_template.json).")
+    run_cfg.add_argument(
+        "--config",
+        required=True,
+        help=(
+            "Path to JSON config (see templates/compare_config_template.json or "
+            "templates/compare_matrix_config_template.json)."
+        ),
+    )
     run_cfg.set_defaults(func=run_config)
 
     return parser
