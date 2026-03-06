@@ -1319,6 +1319,8 @@ class RecursiveConclusionSession:
         self.turn_index = 0
         self.next_deferred_intent_index = 1
         self.deferred_intent_plan_probe_calls = 0
+        self._deferred_intent_plan_compact_ok = False
+        self._deferred_intent_scheduler_compact_ok = False
 
     def _recent_window(self) -> list[ChatMessage]:
         if self.config.recent_window_messages <= 0:
@@ -1587,6 +1589,51 @@ class RecursiveConclusionSession:
                 "                  },\n"
             )
 
+        inject_schema = not self._deferred_intent_plan_compact_ok
+        if inject_schema:
+            schema_instructions = textwrap.dedent(
+                f"""\
+                Return strict JSON only.
+                Use this schema:
+                {{
+                  "intents": [
+                    {{
+                      "kind": "summary|proposal|correction|question|reminder|other",
+                      "intent": "what should be said later",
+                      "why_not_now": "why it should be delayed",
+                      "selection": {{
+                        "strategy": "hold_for_user_prompt|need_more_constraints|avoid_premature|anticipate_request|topic_sensitive|other",
+                        "signals": ["short tags describing cues used"],
+                        "rationale": "1-2 sentences (no step-by-step reasoning)"
+                      }},
+                {timing_schema}\
+                      "trigger": ["condition 1", "condition 2"],
+                      "cancel_if": ["condition 1", "condition 2"],
+                      "confidence": 0.0,
+                      "priority": 0.0
+                    }}
+                  ]
+                }}
+
+                If no future utterance should be held, return {{"intents": []}}.
+                """
+            ).strip()
+        else:
+            timing_hint = (
+                "Include timing either as timing.delay_min_turns/timing.delay_max_turns (relative), "
+                "or timing.earliest_turn/timing.latest_turn (absolute)."
+                if self.config.deferred_intent_timing == DeferredIntentTiming.MODEL
+                else "Do NOT include timing fields."
+            )
+            schema_instructions = textwrap.dedent(
+                f"""\
+                Return strict JSON only as: {{"intents": [ ... ]}}.
+                Each item should include: kind, intent, why_not_now, selection{{strategy,signals,rationale}}, trigger, cancel_if, confidence, priority.
+                {timing_hint}
+                If no intent should be held, return {{"intents": []}}.
+                """
+            ).strip()
+
         source = textwrap.dedent(
             f"""\
             Memory capsules:
@@ -1604,29 +1651,7 @@ class RecursiveConclusionSession:
 
             {timing_lines}
 
-            Return strict JSON only.
-            Use this schema:
-            {{
-              "intents": [
-                {{
-                  "kind": "summary|proposal|correction|question|reminder|other",
-                  "intent": "what should be said later",
-                  "why_not_now": "why it should be delayed",
-                  "selection": {{
-                    "strategy": "hold_for_user_prompt|need_more_constraints|avoid_premature|anticipate_request|topic_sensitive|other",
-                    "signals": ["short tags describing cues used"],
-                    "rationale": "1-2 sentences (no step-by-step reasoning)"
-                  }},
-{timing_schema}\
-                  "trigger": ["condition 1", "condition 2"],
-                  "cancel_if": ["condition 1", "condition 2"],
-                  "confidence": 0.0,
-                  "priority": 0.0
-                }}
-              ]
-            }}
-
-            If no future utterance should be held, return {{"intents": []}}.
+            {schema_instructions}
             """
         ).strip()
 
@@ -1641,10 +1666,12 @@ class RecursiveConclusionSession:
         )
         parsed = extract_json_value(response.text)
         if not isinstance(parsed, (dict, list)):
+            self._deferred_intent_plan_compact_ok = False
             self._log(
                 "deferred_intent_plan_error",
                 {
                     "raw_text": response.text,
+                    "prompt_schema_injected": inject_schema,
                     "plan_policy": self.config.deferred_intent_plan_policy.value,
                     "plan_budget": self.config.deferred_intent_plan_budget,
                     "plan_probe_calls_used": self.deferred_intent_plan_probe_calls,
@@ -1654,6 +1681,15 @@ class RecursiveConclusionSession:
                 },
             )
             return []
+
+        plan_shape_ok = False
+        if isinstance(parsed, list):
+            plan_shape_ok = True
+        elif isinstance(parsed.get("intents"), list):
+            plan_shape_ok = True
+        elif compact_text(str(parsed.get("intent", ""))):
+            plan_shape_ok = True
+        self._deferred_intent_plan_compact_ok = plan_shape_ok
 
         items: list[dict[str, Any]] = []
         if isinstance(parsed, list):
@@ -1689,6 +1725,7 @@ class RecursiveConclusionSession:
                 "intent": created[0].to_dict() if created else None,
                 "created_intents": [intent.to_dict() for intent in created],
                 "raw_plan": parsed,
+                "prompt_schema_injected": inject_schema,
                 "plan_policy": self.config.deferred_intent_plan_policy.value,
                 "plan_budget": self.config.deferred_intent_plan_budget,
                 "plan_probe_calls_used": self.deferred_intent_plan_probe_calls,
@@ -1704,6 +1741,9 @@ class RecursiveConclusionSession:
         active = self._active_deferred_intents()
         if not active:
             return [], []
+
+        scheduler_prompt_schema_injected: Optional[bool] = None
+        scheduler_parse_ok: Optional[bool] = None
 
         if self.config.deferred_intent_strategy == DeferredIntentStrategy.FIXED:
             decisions_payload = {
@@ -1733,6 +1773,70 @@ class RecursiveConclusionSession:
             scheduler_request_id = None
             scheduler_raw_text = ""
         else:
+            inject_schema = not self._deferred_intent_scheduler_compact_ok
+            scheduler_prompt_schema_injected = inject_schema
+
+            intents_for_scheduler = [
+                {
+                    "intent_id": intent.intent_id,
+                    "created_turn": intent.created_turn,
+                    "earliest_turn": intent.earliest_turn,
+                    "latest_turn": intent.latest_turn,
+                    "kind": intent.kind,
+                    "intent": intent.intent,
+                    "why_not_now": intent.why_not_now,
+                    "trigger": list(intent.trigger),
+                    "cancel_if": list(intent.cancel_if),
+                    "confidence": float(intent.confidence),
+                    "priority": float(intent.priority),
+                    "revision_count": int(intent.revision_count),
+                }
+                for intent in active
+            ]
+            intents_json = (
+                json.dumps(intents_for_scheduler, ensure_ascii=False, indent=2)
+                if inject_schema
+                else json.dumps(intents_for_scheduler, ensure_ascii=False, separators=(",", ":"))
+            )
+
+            if inject_schema:
+                decision_schema = textwrap.dedent(
+                    """\
+                    Return strict JSON only:
+                    {
+                      "decisions": [
+                        {
+                          "intent_id": "di-0001",
+                          "action": "hold|fire|cancel|expire__REVISE_SUFFIX__",
+                          "reason": "brief reason",
+                          "decision_strategy": "trigger_match|topic_shift|window_expired|revise_wording|other",
+                          "decision_signals": ["short tags describing cues used"],
+                          "decision_rationale": "1-2 sentences (no step-by-step reasoning)",
+                          "updated_intent": {
+                            "kind": "optional",
+                            "intent": "optional revised intent",
+                            "why_not_now": "optional",
+                            "trigger": ["optional"],
+                            "cancel_if": ["optional"],
+                            "confidence": 0.0,
+                            "priority": 0.0,
+                            "earliest_turn": 0,
+                            "latest_turn": 0
+                          }
+                        }
+                      ]
+                    }
+                    """
+                ).strip()
+            else:
+                decision_schema = textwrap.dedent(
+                    """\
+                    Return strict JSON only as: {"decisions":[...]}.
+                    Each decision must include: intent_id, action, reason, decision_strategy, decision_signals, decision_rationale.
+                    If action is "revise", include updated_intent with any fields you change.
+                    """
+                ).strip()
+
             source = textwrap.dedent(
                 f"""\
                 Memory capsules:
@@ -1744,7 +1848,7 @@ class RecursiveConclusionSession:
                 Current turn index: {self.turn_index}
 
                 Deferred intents:
-                {json.dumps([intent.to_dict() for intent in active], ensure_ascii=False, indent=2)}
+                {intents_json}
 
                 Decide whether each deferred utterance should be held, fired, canceled, expired, or revised.
                 Use "fire" only when the utterance would feel timely and appropriate now.
@@ -1753,30 +1857,7 @@ class RecursiveConclusionSession:
                 Use "cancel" if the topic moved on or its assumptions broke.
                 "revise" is allowed only if the core idea is still useful but the wording or timing should change.
 
-                Return strict JSON only:
-                {{
-                  "decisions": [
-                    {{
-                      "intent_id": "di-0001",
-                      "action": "hold|fire|cancel|expire__REVISE_SUFFIX__",
-                      "reason": "brief reason",
-                      "decision_strategy": "trigger_match|topic_shift|window_expired|revise_wording|other",
-                      "decision_signals": ["short tags describing cues used"],
-                      "decision_rationale": "1-2 sentences (no step-by-step reasoning)",
-                      "updated_intent": {{
-                        "kind": "optional",
-                        "intent": "optional revised intent",
-                        "why_not_now": "optional",
-                        "trigger": ["optional"],
-                        "cancel_if": ["optional"],
-                        "confidence": 0.0,
-                        "priority": 0.0,
-                        "earliest_turn": 0,
-                        "latest_turn": 0
-                      }}
-                    }}
-                  ]
-                }}
+                {decision_schema}
                 """
             ).replace(
                 "__REVISE_SUFFIX__",
@@ -1792,7 +1873,11 @@ class RecursiveConclusionSession:
                 config=self.config.probe_config,
             )
             decisions_payload = extract_json_value(response.text)
-            if not isinstance(decisions_payload, dict):
+            scheduler_parse_ok = isinstance(decisions_payload, dict) and isinstance(
+                decisions_payload.get("decisions"), list
+            )
+            self._deferred_intent_scheduler_compact_ok = bool(scheduler_parse_ok)
+            if not scheduler_parse_ok:
                 decisions_payload = {"decisions": []}
             scheduler_usage = response.usage
             scheduler_finish_reason = response.finish_reason
@@ -1906,6 +1991,8 @@ class RecursiveConclusionSession:
                 "strategy": self.config.deferred_intent_strategy.value,
                 "decisions": applied,
                 "scheduler_raw": scheduler_raw_text,
+                "prompt_schema_injected": scheduler_prompt_schema_injected,
+                "scheduler_parse_ok": scheduler_parse_ok,
                 "usage": scheduler_usage,
                 "finish_reason": scheduler_finish_reason,
                 "request_id": scheduler_request_id,
