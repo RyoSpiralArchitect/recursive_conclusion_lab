@@ -1967,7 +1967,21 @@ class RecursiveConclusionSession:
                 self.deferred_intent_plan_probe_calls += 1
 
             base_prompt = self._build_system_prompt(due_intents=None)
-            system_prompt = (f"{base_prompt}\n\n" if base_prompt else "") + textwrap.dedent(
+            prev_assistant = next(
+                (m for m in reversed(self.history[:-1]) if m.role == "assistant"),
+                None,
+            )
+            prev_state_ok = False
+            if prev_assistant is not None:
+                _, prev_state, prev_state_error = split_rcl_state(prev_assistant.content)
+                prev_state_ok = (
+                    prev_state_error is None
+                    and isinstance(prev_state, dict)
+                    and isinstance(prev_state.get("intents"), list)
+                )
+            inject_schema = not prev_state_ok
+
+            inband_instructions = textwrap.dedent(
                 f"""\
                 Deferred-intent in-band state (private; never reveal to the user):
                 - After the user-visible reply, append {RCL_STATE_OPEN}{{...}}{RCL_STATE_CLOSE} with strict JSON (no code fences).
@@ -2007,45 +2021,47 @@ class RecursiveConclusionSession:
                   - If you set status=fired, set fire_turn={self.turn_index} and set terminal_reason.
                 - If deferred_intent_mode is 'soft_fire', integrate fired intents naturally into the visible reply.
                   If deferred_intent_mode is 'observe', do NOT include fired intent content in the visible reply.
-
-                State JSON schema:
-                {{
-                  "version": 1,
-                  "intents": [
-                    {{
-                      "intent_id": "di-0001",
-                      "created_turn": 3,
-                      "kind": "summary|proposal|correction|question|reminder|other",
-                      "intent": "what should be said later",
-                      "why_not_now": "...",
-                      "earliest_turn": 6,
-                      "latest_turn": 8,
-                      "trigger": ["..."],
-                      "cancel_if": ["..."],
-                      "confidence": 0.0,
-                      "priority": 0.0,
-                      "plan_strategy": "",
-                      "plan_signals": [],
-                      "plan_rationale": "",
-                      "decision_strategy": "",
-                      "decision_signals": [],
-                      "decision_rationale": "",
-                      "status": "active|fired|canceled|expired",
-                      "revision_count": 0,
-                      "fire_turn": null,
-                      "terminal_reason": ""
-                    }}
-                  ]
-                }}
                 """
             ).strip()
+            if inject_schema:
+                inband_instructions += "\n\n" + textwrap.dedent(
+                    """\
+                    State JSON schema:
+                    {
+                      "version": 1,
+                      "intents": [
+                        {
+                          "intent_id": "di-0001",
+                          "created_turn": 3,
+                          "kind": "summary|proposal|correction|question|reminder|other",
+                          "intent": "what should be said later",
+                          "why_not_now": "...",
+                          "earliest_turn": 6,
+                          "latest_turn": 8,
+                          "trigger": ["..."],
+                          "cancel_if": ["..."],
+                          "confidence": 0.0,
+                          "priority": 0.0,
+                          "plan_strategy": "",
+                          "plan_signals": [],
+                          "plan_rationale": "",
+                          "decision_strategy": "",
+                          "decision_signals": [],
+                          "decision_rationale": "",
+                          "status": "active|fired|canceled|expired",
+                          "revision_count": 0,
+                          "fire_turn": null,
+                          "terminal_reason": ""
+                        }
+                      ]
+                    }
+                    """
+                ).strip()
+
+            system_prompt = (f"{base_prompt}\n\n" if base_prompt else "") + inband_instructions
 
             messages = self._recent_window()
             if self.config.recent_window_messages == 1:
-                prev_assistant = next(
-                    (m for m in reversed(self.history[:-1]) if m.role == "assistant"),
-                    None,
-                )
                 if prev_assistant is not None:
                     messages = [prev_assistant, self.history[-1]]
 
