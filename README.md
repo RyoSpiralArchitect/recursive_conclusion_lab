@@ -1,6 +1,6 @@
 # Recursive Conclusion Lab
 
-[日本語 README](README.ja.md)
+[Japanese README](README.ja.md)
 
 Cross-provider experiment harness for observing (and optionally steering) the *time-structure* of LLM dialogue:
 
@@ -175,6 +175,16 @@ python recursive_conclusion_lab.py compare \
 ```
 
 ## Analyze logs
+
+### Conclusion mention “delay” (observe-only)
+
+Each `conclusion_probe` also emits an observe-only “mention plan” (not injected into replies):
+
+- `keywords`: 3–5 distinctive phrases for mention detection
+- `mention_delay_min_turns` / `mention_delay_max_turns`: predicted mention window (turns after probe)
+- `mention_likelihood`, `delay_strategy`, `delay_signals`
+
+`analyze_runs.py` reports planned-vs-actual metrics like `conclusion_plan_within_window_rate`.
 
 ```bash
 python analyze_runs.py \

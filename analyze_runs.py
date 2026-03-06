@@ -116,6 +116,7 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     assistant_text_by_turn: dict[int, str] = {}
     probes: list[str] = []
     probe_events: list[tuple[int, str]] = []
+    probe_plan_events: list[dict[str, Any]] = []
     capsules: list[str] = []
     planned_intents: list[dict[str, Any]] = []
     intent_status_by_id: dict[str, str] = {}
@@ -141,6 +142,24 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                 line_text = extract_conclusion_line(raw_line) or extract_conclusion_line(hypothesis)
                 if line_text:
                     probe_events.append((turn_idx, line_text))
+                    raw_keywords = payload.get("keywords") or []
+                    keywords: list[str] = []
+                    if isinstance(raw_keywords, list):
+                        keywords = [str(x) for x in raw_keywords if x]
+                    elif isinstance(raw_keywords, str):
+                        keywords = [x.strip() for x in re.split(r"[;,|\n]\s*", raw_keywords) if x.strip()]
+                    probe_plan_events.append(
+                        {
+                            "turn": turn_idx,
+                            "conclusion_line": line_text,
+                            "keywords": keywords,
+                            "mention_delay_min_turns": payload.get("mention_delay_min_turns"),
+                            "mention_delay_max_turns": payload.get("mention_delay_max_turns"),
+                            "mention_likelihood": payload.get("mention_likelihood"),
+                            "delay_strategy": payload.get("delay_strategy"),
+                            "delay_signals": payload.get("delay_signals") or [],
+                        }
+                    )
         elif et == "memory_capsule":
             capsules.append(payload.get("capsule", ""))
         elif et == "deferred_intent_plan":
@@ -197,6 +216,79 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
                     conclusion_line_immediate_count += 1
                 break
 
+    conclusion_any_mention_count = 0
+    conclusion_any_mention_delays: list[int] = []
+    conclusion_plan_window_defined_count = 0
+    conclusion_plan_within_window_count = 0
+    conclusion_plan_early_count = 0
+    conclusion_plan_late_count = 0
+    conclusion_plan_missing_count = 0
+    planned_conclusion_delay_mins: list[int] = []
+    planned_conclusion_delay_maxs: list[int] = []
+    planned_conclusion_window_widths: list[int] = []
+    conclusion_delay_strategies: list[str] = []
+    conclusion_delay_signals: list[str] = []
+    conclusion_mention_likelihoods: list[float] = []
+
+    for plan in probe_plan_events:
+        probe_turn = plan.get("turn")
+        if not isinstance(probe_turn, int):
+            continue
+        conclusion_line = str(plan.get("conclusion_line") or "")
+        keywords = plan.get("keywords") or []
+        if not isinstance(keywords, list):
+            keywords = []
+        keywords = [str(x) for x in keywords if x]
+
+        delay_min = plan.get("mention_delay_min_turns")
+        delay_max = plan.get("mention_delay_max_turns")
+        has_window = isinstance(delay_min, int) and isinstance(delay_max, int) and delay_max >= delay_min
+        if has_window:
+            conclusion_plan_window_defined_count += 1
+            planned_conclusion_delay_mins.append(delay_min)
+            planned_conclusion_delay_maxs.append(delay_max)
+            planned_conclusion_window_widths.append(delay_max - delay_min)
+
+        strat = plan.get("delay_strategy")
+        if strat:
+            conclusion_delay_strategies.append(str(strat))
+        sigs = plan.get("delay_signals") or []
+        if isinstance(sigs, list):
+            conclusion_delay_signals.extend(str(x) for x in sigs if x)
+        likelihood = plan.get("mention_likelihood")
+        if isinstance(likelihood, (int, float)):
+            conclusion_mention_likelihoods.append(float(likelihood))
+
+        mention_delay: int | None = None
+        for turn_idx in assistant_turns_sorted:
+            if turn_idx < probe_turn:
+                continue
+            text = assistant_text_by_turn.get(turn_idx, "")
+            line_ok = (
+                bool(conclusion_line)
+                and lexical_overlap(conclusion_line, text) >= CONCLUSION_MENTION_THRESHOLD
+            )
+            kw_ok = False
+            if keywords:
+                hits = keyword_hits(keywords, text) or 0
+                required_hits = max(2, (len(keywords) + 1) // 2)
+                kw_ok = hits >= required_hits
+            if line_ok or kw_ok:
+                mention_delay = turn_idx - probe_turn
+                conclusion_any_mention_count += 1
+                conclusion_any_mention_delays.append(mention_delay)
+                if has_window:
+                    if mention_delay < delay_min:
+                        conclusion_plan_early_count += 1
+                    elif mention_delay > delay_max:
+                        conclusion_plan_late_count += 1
+                    else:
+                        conclusion_plan_within_window_count += 1
+                break
+
+        if mention_delay is None and has_window:
+            conclusion_plan_missing_count += 1
+
     conclusion_line_mention_rate = (
         conclusion_line_mention_count / conclusion_line_probe_count
         if conclusion_line_probe_count
@@ -205,6 +297,31 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     conclusion_line_immediate_mention_rate = (
         conclusion_line_immediate_count / conclusion_line_probe_count
         if conclusion_line_probe_count
+        else None
+    )
+    conclusion_any_mention_rate = (
+        conclusion_any_mention_count / conclusion_line_probe_count
+        if conclusion_line_probe_count
+        else None
+    )
+    conclusion_plan_within_window_rate = (
+        conclusion_plan_within_window_count / conclusion_plan_window_defined_count
+        if conclusion_plan_window_defined_count
+        else None
+    )
+    conclusion_plan_early_rate = (
+        conclusion_plan_early_count / conclusion_plan_window_defined_count
+        if conclusion_plan_window_defined_count
+        else None
+    )
+    conclusion_plan_late_rate = (
+        conclusion_plan_late_count / conclusion_plan_window_defined_count
+        if conclusion_plan_window_defined_count
+        else None
+    )
+    conclusion_plan_missing_rate = (
+        conclusion_plan_missing_count / conclusion_plan_window_defined_count
+        if conclusion_plan_window_defined_count
         else None
     )
     reply_word_counts = [len(re.findall(r"\w+", r.get("assistant", ""))) for r in assistant_rows]
@@ -465,6 +582,20 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "conclusion_line_mention_rate": conclusion_line_mention_rate,
         "avg_conclusion_line_mention_delay_turns": mean_or_none(conclusion_line_mention_delays),
         "conclusion_line_immediate_mention_rate": conclusion_line_immediate_mention_rate,
+        "conclusion_any_mention_count": conclusion_any_mention_count,
+        "conclusion_any_mention_rate": conclusion_any_mention_rate,
+        "avg_conclusion_any_mention_delay_turns": mean_or_none(conclusion_any_mention_delays),
+        "conclusion_plan_window_defined_count": conclusion_plan_window_defined_count,
+        "conclusion_plan_within_window_rate": conclusion_plan_within_window_rate,
+        "conclusion_plan_early_rate": conclusion_plan_early_rate,
+        "conclusion_plan_late_rate": conclusion_plan_late_rate,
+        "conclusion_plan_missing_rate": conclusion_plan_missing_rate,
+        "avg_planned_conclusion_delay_min_turns": mean_or_none(planned_conclusion_delay_mins),
+        "avg_planned_conclusion_delay_max_turns": mean_or_none(planned_conclusion_delay_maxs),
+        "avg_planned_conclusion_window_width_turns": mean_or_none(
+            planned_conclusion_window_widths
+        ),
+        "avg_conclusion_mention_likelihood": mean_or_none(conclusion_mention_likelihoods),
         "memory_capsule_count": len(capsules),
         "deferred_intent_backend": deferred_intent_backend,
         "deferred_intent_timing": deferred_intent_timing,
@@ -510,6 +641,8 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "plan_signal_counts": plan_signal_counts or None,
         "decision_strategy_counts": decision_strategy_counts or None,
         "decision_signal_counts": decision_signal_counts or None,
+        "conclusion_delay_strategy_counts": count_strings(conclusion_delay_strategies) or None,
+        "conclusion_delay_signal_counts": count_strings(conclusion_delay_signals) or None,
         "final_required_keyword_coverage": keyword_coverage(final_required, final_assistant),
         "conversation_required_keyword_coverage": keyword_coverage(conversation_required, conversation_text),
         "final_forbidden_keyword_hits": keyword_hits(final_forbidden, final_assistant),
@@ -549,7 +682,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "turns",
         "probe_count",
         "conclusion_line_mention_rate",
+        "conclusion_any_mention_rate",
+        "conclusion_plan_within_window_rate",
         "avg_conclusion_line_mention_delay_turns",
+        "avg_conclusion_any_mention_delay_turns",
         "deferred_intent_plan_count",
         "deferred_intent_fire_count",
         "deferred_intent_realization_rate",

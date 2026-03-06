@@ -99,6 +99,15 @@
 6. **usage-based efficiency**  
    `usage` が取れる provider では、turn あたり input/output token を比較する。
 
+7. **conclusion_line_mention_rate / avg_conclusion_line_mention_delay_turns**  
+   conclusion probe が出した `CONCLUSION:` 行が、どれくらいの遅延で assistant reply に「言及」されるか（観測ベース）。
+
+8. **conclusion_any_mention_rate**  
+   `conclusion_line` の lexical overlap だけでなく、probe が出した `keywords` による言及検出も含めた mention rate。
+
+9. **conclusion_plan_within_window_rate**  
+   probe が出す observe-only の言及プラン（`mention_delay_min_turns` / `mention_delay_max_turns`）に対して、実際の言及遅延がウィンドウ内に収まった割合。
+
 ### 5.2 スクリプト評価 spec から計算する指標
 
 `script.json` に `evaluation` セクションを足し、以下を計算する。

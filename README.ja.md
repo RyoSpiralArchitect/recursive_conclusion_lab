@@ -178,6 +178,16 @@ python recursive_conclusion_lab.py run-config \
 
 ## analyze_runs.py
 
+### 結論言及の「タメ」(observe-only)
+
+`conclusion_probe` は observe-only の「言及プラン」も併せて出力します（reply には注入しません）。
+
+- `keywords`: 言及検出用の 3–5 個のキーワード/フレーズ
+- `mention_delay_min_turns` / `mention_delay_max_turns`: 言及が出やすい予測ウィンドウ（probe からの turn 差）
+- `mention_likelihood`, `delay_strategy`, `delay_signals`
+
+`analyze_runs.py` で planned-vs-actual の指標（例: `conclusion_plan_within_window_rate`）を出力します。
+
 ```bash
 python analyze_runs.py \
   --log-dir compare_outputs/deferred_trigger \

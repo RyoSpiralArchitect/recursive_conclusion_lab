@@ -273,11 +273,120 @@ def lexical_overlap(a: str, b: str) -> float:
     return len(toks_a & toks_b) / len(toks_a | toks_b)
 
 
+def extract_probe_line_value(text: str, key: str) -> str:
+    pattern = rf"(?im)^\s*{re.escape(key)}\s*:\s*(.+?)\s*$"
+    match = re.search(pattern, text or "")
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def parse_probe_float(raw: str) -> Optional[float]:
+    text = compact_text(raw)
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value
+
+
+def parse_probe_int(raw: str) -> Optional[int]:
+    text = compact_text(raw)
+    if not text:
+        return None
+    match = re.search(r"-?\d+", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+
+def parse_probe_list(raw: str, *, max_items: int = 8, max_item_chars: int = 60) -> list[str]:
+    text = (raw or "").strip()
+    if not text:
+        return []
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            loaded = json.loads(text)
+        except Exception:
+            loaded = None
+        if isinstance(loaded, list):
+            items = [compact_text(str(v)) for v in loaded]
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in items:
+                item = item.strip().strip('"').strip("'")
+                if not item:
+                    continue
+                item = item[:max_item_chars]
+                key = item.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+                if len(out) >= max_items:
+                    break
+            return out
+
+    parts = re.split(r"[;,|\n]\s*", text)
+    out = []
+    seen = set()
+    for part in parts:
+        item = compact_text(part).strip().strip('"').strip("'")
+        if not item:
+            continue
+        item = item[:max_item_chars]
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def keyword_hits(keywords: list[str], text: str) -> Optional[int]:
+    if not keywords:
+        return None
+    lower = (text or "").lower()
+    hits = 0
+    for kw in keywords:
+        kw = compact_text(kw)
+        if not kw:
+            continue
+        if kw.lower() in lower:
+            hits += 1
+    return hits
+
+
+def keyword_coverage(keywords: list[str], text: str) -> Optional[float]:
+    if not keywords:
+        return None
+    hits = keyword_hits(keywords, text)
+    if hits is None:
+        return None
+    return hits / max(1, len(keywords))
+
+
 def extract_conclusion_line(text: str) -> str:
     match = re.search(r"(?im)^\s*conclusion\s*:\s*(.+?)\s*$", text or "")
     if not match:
         return ""
     return f"CONCLUSION: {match.group(1).strip()}"
+
+
+def extract_conclusion_probe_block(text: str) -> str:
+    lines: list[str] = []
+    for key in ("CONCLUSION", "CONFIDENCE", "EVIDENCE"):
+        value = extract_probe_line_value(text, key)
+        if value:
+            lines.append(f"{key}: {value}")
+    return "\n".join(lines).strip() or (text or "").strip()
 
 
 def strip_conclusion_prefix(line: str) -> str:
@@ -1306,6 +1415,7 @@ class RecursiveConclusionSession:
 
     DEFERRED_REALIZATION_THRESHOLD = 0.10
     CONCLUSION_MENTION_THRESHOLD = 0.10
+    CONCLUSION_KEYWORD_MENTION_MIN_HITS = 2
 
     def __init__(
         self,
@@ -1322,6 +1432,13 @@ class RecursiveConclusionSession:
         self.conclusion_hypotheses: list[str] = []
         self.latest_conclusion_probe_turn: Optional[int] = None
         self.latest_conclusion_line: str = ""
+        self.latest_conclusion_keywords: list[str] = []
+        self.latest_conclusion_mention_delay_min_turns: Optional[int] = None
+        self.latest_conclusion_mention_delay_max_turns: Optional[int] = None
+        self.latest_conclusion_mention_likelihood: Optional[float] = None
+        self.latest_conclusion_delay_strategy: str = ""
+        self.latest_conclusion_delay_signals: list[str] = []
+        self.latest_conclusion_delay_rationale: str = ""
         self.deferred_intents: list[DeferredIntent] = []
         self.turn_index = 0
         self.next_deferred_intent_index = 1
@@ -1496,6 +1613,13 @@ class RecursiveConclusionSession:
             CONCLUSION: <one or two sentences>
             CONFIDENCE: <0.00 to 1.00>
             EVIDENCE: <brief reason grounded in the transcript>
+            KEYWORDS: <3-5 distinctive keywords/phrases separated by ;>
+            MENTION_DELAY_MIN_TURNS: <integer, minimum turns to wait before the conclusion is likely to be said>
+            MENTION_DELAY_MAX_TURNS: <integer >= MIN, maximum turns until it is likely to be said>
+            MENTION_LIKELIHOOD: <0.00 to 1.00>
+            DELAY_STRATEGY: <one of: clarify_first | gather_constraints | build_context | avoid_premature_commitment | already_ready | other>
+            DELAY_SIGNALS: <2-6 short tags separated by ,>
+            DELAY_RATIONALE: <<= 140 chars, no chain-of-thought>
             """
         ).strip()
 
@@ -1509,15 +1633,81 @@ class RecursiveConclusionSession:
         )
         hypothesis = response.text.strip()
         if hypothesis:
+            hypothesis_for_injection = extract_conclusion_probe_block(hypothesis)
             conclusion_line = extract_conclusion_line(hypothesis)
-            self.conclusion_hypotheses.append(hypothesis)
+            keywords = parse_probe_list(
+                extract_probe_line_value(hypothesis, "KEYWORDS"),
+                max_items=5,
+                max_item_chars=64,
+            )
+            mention_delay_min_turns = parse_probe_int(
+                extract_probe_line_value(hypothesis, "MENTION_DELAY_MIN_TURNS")
+            )
+            mention_delay_max_turns = parse_probe_int(
+                extract_probe_line_value(hypothesis, "MENTION_DELAY_MAX_TURNS")
+            )
+            if mention_delay_min_turns is not None and mention_delay_min_turns < 0:
+                mention_delay_min_turns = 0
+            if mention_delay_max_turns is not None and mention_delay_max_turns < 0:
+                mention_delay_max_turns = 0
+            if (
+                mention_delay_min_turns is not None
+                and mention_delay_max_turns is not None
+                and mention_delay_max_turns < mention_delay_min_turns
+            ):
+                mention_delay_min_turns, mention_delay_max_turns = (
+                    mention_delay_max_turns,
+                    mention_delay_min_turns,
+                )
+            mention_likelihood = parse_probe_float(
+                extract_probe_line_value(hypothesis, "MENTION_LIKELIHOOD")
+            )
+            if mention_likelihood is not None:
+                mention_likelihood = max(0.0, min(1.0, mention_likelihood))
+            delay_strategy = truncate_text(
+                extract_probe_line_value(hypothesis, "DELAY_STRATEGY"), 48
+            )
+            delay_signals = parse_probe_list(
+                extract_probe_line_value(hypothesis, "DELAY_SIGNALS"),
+                max_items=6,
+                max_item_chars=80,
+            )
+            delay_rationale = truncate_text(
+                extract_probe_line_value(hypothesis, "DELAY_RATIONALE"), 160
+            )
+            self.conclusion_hypotheses.append(hypothesis_for_injection)
             self.latest_conclusion_probe_turn = self.turn_index
             self.latest_conclusion_line = conclusion_line
+            self.latest_conclusion_keywords = keywords
+            self.latest_conclusion_mention_delay_min_turns = mention_delay_min_turns
+            self.latest_conclusion_mention_delay_max_turns = mention_delay_max_turns
+            self.latest_conclusion_mention_likelihood = mention_likelihood
+            self.latest_conclusion_delay_strategy = delay_strategy
+            self.latest_conclusion_delay_signals = delay_signals
+            self.latest_conclusion_delay_rationale = delay_rationale
             self._log(
                 "conclusion_probe",
                 {
                     "hypothesis": hypothesis,
+                    "hypothesis_for_injection": hypothesis_for_injection,
                     "conclusion_line": conclusion_line,
+                    "keywords": keywords,
+                    "mention_delay_min_turns": mention_delay_min_turns,
+                    "mention_delay_max_turns": mention_delay_max_turns,
+                    "mention_earliest_turn": (
+                        self.turn_index + mention_delay_min_turns
+                        if mention_delay_min_turns is not None
+                        else None
+                    ),
+                    "mention_latest_turn": (
+                        self.turn_index + mention_delay_max_turns
+                        if mention_delay_max_turns is not None
+                        else None
+                    ),
+                    "mention_likelihood": mention_likelihood,
+                    "delay_strategy": delay_strategy,
+                    "delay_signals": delay_signals,
+                    "delay_rationale": delay_rationale,
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
@@ -2681,6 +2871,46 @@ class RecursiveConclusionSession:
                     self.turn_index - self.latest_conclusion_probe_turn
                 )
 
+        latest_conclusion_keywords = list(self.latest_conclusion_keywords or [])
+        latest_conclusion_keyword_hits: Optional[int] = None
+        latest_conclusion_keyword_coverage: Optional[float] = None
+        latest_conclusion_keyword_mentioned: Optional[bool] = None
+        if latest_conclusion_keywords:
+            latest_conclusion_keyword_hits = keyword_hits(
+                latest_conclusion_keywords, assistant_text
+            )
+            latest_conclusion_keyword_coverage = keyword_coverage(
+                latest_conclusion_keywords, assistant_text
+            )
+            required_hits = max(
+                self.CONCLUSION_KEYWORD_MENTION_MIN_HITS,
+                (len(latest_conclusion_keywords) + 1) // 2,
+            )
+            latest_conclusion_keyword_mentioned = (
+                latest_conclusion_keyword_hits is not None
+                and latest_conclusion_keyword_hits >= required_hits
+            )
+
+        latest_conclusion_mentioned_any: Optional[bool] = None
+        if latest_conclusion_line_mentioned is not None or latest_conclusion_keyword_mentioned is not None:
+            latest_conclusion_mentioned_any = bool(
+                latest_conclusion_line_mentioned or latest_conclusion_keyword_mentioned
+            )
+
+        latest_conclusion_plan_earliest_turn: Optional[int] = None
+        latest_conclusion_plan_latest_turn: Optional[int] = None
+        if self.latest_conclusion_probe_turn is not None:
+            if self.latest_conclusion_mention_delay_min_turns is not None:
+                latest_conclusion_plan_earliest_turn = (
+                    self.latest_conclusion_probe_turn
+                    + self.latest_conclusion_mention_delay_min_turns
+                )
+            if self.latest_conclusion_mention_delay_max_turns is not None:
+                latest_conclusion_plan_latest_turn = (
+                    self.latest_conclusion_probe_turn
+                    + self.latest_conclusion_mention_delay_max_turns
+                )
+
         action_map = {action["intent_id"]: dict(action) for action in deferred_actions}
         due_payloads: list[dict[str, Any]] = []
         for intent in due_intents:
@@ -2717,9 +2947,22 @@ class RecursiveConclusionSession:
             "conclusion_steer_injection": self.config.conclusion_steer_injection.value,
             "latest_conclusion_probe_turn": self.latest_conclusion_probe_turn,
             "latest_conclusion_line": latest_conclusion_line or None,
+            "latest_conclusion_keywords": latest_conclusion_keywords or None,
+            "latest_conclusion_keyword_hits": latest_conclusion_keyword_hits,
+            "latest_conclusion_keyword_coverage": latest_conclusion_keyword_coverage,
+            "latest_conclusion_keyword_mentioned": latest_conclusion_keyword_mentioned,
             "latest_conclusion_line_reply_overlap": latest_conclusion_line_reply_overlap,
             "latest_conclusion_line_mentioned": latest_conclusion_line_mentioned,
+            "latest_conclusion_mentioned_any": latest_conclusion_mentioned_any,
             "latest_conclusion_line_age_turns": latest_conclusion_line_age_turns,
+            "latest_conclusion_plan_delay_min_turns": self.latest_conclusion_mention_delay_min_turns,
+            "latest_conclusion_plan_delay_max_turns": self.latest_conclusion_mention_delay_max_turns,
+            "latest_conclusion_plan_earliest_turn": latest_conclusion_plan_earliest_turn,
+            "latest_conclusion_plan_latest_turn": latest_conclusion_plan_latest_turn,
+            "latest_conclusion_plan_likelihood": self.latest_conclusion_mention_likelihood,
+            "latest_conclusion_plan_strategy": self.latest_conclusion_delay_strategy or None,
+            "latest_conclusion_plan_signals": list(self.latest_conclusion_delay_signals or [])
+            or None,
             "planned_deferred_intent": planned_intent.to_dict() if planned_intent else None,
             "planned_deferred_intents": planned_intents_payload,
             "planned_deferred_intent_count": len(planned_intents_payload),
