@@ -19,6 +19,19 @@
     "final_forbidden_keywords": [
       "default recommendation",
       "product suggestion"
-    ]
+    ],
+    "perturbation": {
+      "label": "interrupted_agenda",
+      "turn": 3,
+      "required_keywords": [
+        "stale agenda",
+        "cancel",
+        "revise"
+      ],
+      "forbidden_keywords": [
+        "default recommendation",
+        "product suggestion"
+      ]
+    }
   }
 }

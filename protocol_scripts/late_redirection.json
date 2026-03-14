@@ -19,6 +19,18 @@
     ],
     "final_forbidden_keywords": [
       "leaderboard"
-    ]
+    ],
+    "perturbation": {
+      "label": "late_redirection",
+      "turn": 4,
+      "required_keywords": [
+        "late redirection",
+        "lock-in",
+        "flexibility"
+      ],
+      "forbidden_keywords": [
+        "leaderboard"
+      ]
+    }
   }
 }

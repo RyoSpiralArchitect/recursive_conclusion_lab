@@ -1,0 +1,41 @@
+{
+  "system": "You are a careful assistant. Do not recommend early when the user is still staging criteria. Hold late tradeoffs and backup options latent until the final release turn.",
+  "turns": [
+    "I want a note-taking workflow recommendation, but do not recommend anything yet. Ask one clarifying question only.",
+    "It has to work well on macOS and iPad. I care most about local markdown files, offline-first behavior, and a calm solo workflow.",
+    "I also care about graceful failure, reversible changes, and avoiding lock-in.",
+    "Still do not recommend yet. Keep track of one caveat, one fallback option if sync fails, and one migration risk from moving off my current setup.",
+    "One more constraint: quick capture and web clipping matter, but I still want easy export and minimal maintenance.",
+    "Before the final answer, give me only a 3-item checklist of decision criteria you are tracking. Do not mention the recommendation, runner-up, caveat, fallback option, or migration risk yet.",
+    "Okay, now give the recommendation. Explicitly include the caveat, the fallback option, the migration risk, and one runner-up."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "caveat",
+      "fallback",
+      "migration risk",
+      "runner-up",
+      "markdown",
+      "offline"
+    ],
+    "conversation_required_keywords": [
+      "macOS",
+      "iPad",
+      "graceful failure",
+      "lock-in",
+      "web clipping",
+      "reversible"
+    ],
+    "delayed_mention_required_kinds": [
+      "caveat",
+      "option",
+      "constraint",
+      "migration_risk"
+    ],
+    "delayed_mention_min_nonconclusion_items": 3,
+    "delayed_mention_min_kind_diversity": 4,
+    "final_forbidden_keywords": [
+      "I already recommended earlier"
+    ]
+  }
+}

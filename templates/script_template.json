@@ -8,7 +8,15 @@
   "evaluation": {
     "final_required_keywords": [],
     "conversation_required_keywords": [],
-    "final_forbidden_keywords": []
+    "final_forbidden_keywords": [],
+    "delayed_mention_required_kinds": [],
+    "delayed_mention_min_nonconclusion_items": 0,
+    "delayed_mention_min_kind_diversity": 0,
+    "perturbation": {
+      "label": "direction_change",
+      "turn": 2,
+      "required_keywords": [],
+      "forbidden_keywords": []
+    }
   }
 }
-

@@ -1,0 +1,54 @@
+{
+  "command": "compare-matrix",
+  "script": "protocol_scripts/late_redirection.json",
+  "providers": [
+    "openai=gpt-4.1-mini-2025-04-14"
+  ],
+  "out_dir": "compare_outputs/semantic_judge_matrix_gpt_only",
+  "repeats": 3,
+  "seed": 7,
+  "args": {
+    "window": 8,
+    "memory_every": 2,
+    "conclusion_every": 1,
+    "latent_convergence_every": 1,
+    "semantic_judge_backend": "llm",
+    "observer_provider": "openai",
+    "observer_model": "gpt-4.1-mini-2025-04-14",
+    "embedding_provider": "openai",
+    "embedding_model": "text-embedding-3-large",
+    "delayed_mention_leak_policy": "on",
+    "delayed_mention_leak_threshold": 0.05,
+    "delayed_mention_diversity_repair": "on",
+    "adaptive_hazard_policy": "adaptive",
+    "adaptive_hazard_profile": "balanced",
+    "adaptive_hazard_stage_policy": "flat",
+    "adaptive_hazard_embedding_guard": "off",
+    "temperature": 0.2,
+    "probe_max_tokens": 220,
+    "show_probes": false
+  },
+  "arms": [
+    {
+      "name": "llm_judge",
+      "description": "LLM judge only; GPT-only self-family evaluation.",
+      "args": {
+        "semantic_judge_backend": "llm"
+      }
+    },
+    {
+      "name": "embedding_judge",
+      "description": "Embedding judge only; OpenAI embeddings without LLM judge.",
+      "args": {
+        "semantic_judge_backend": "embedding"
+      }
+    },
+    {
+      "name": "both_judges",
+      "description": "Run both GPT-family LLM judge and OpenAI embedding judge.",
+      "args": {
+        "semantic_judge_backend": "both"
+      }
+    }
+  ]
+}

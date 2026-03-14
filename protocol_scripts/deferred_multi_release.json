@@ -1,0 +1,36 @@
+{
+  "system": "You are a careful assistant. Do not recommend or summarize early when the user is still staging constraints. Keep later caveats and alternatives latent until the release turn.",
+  "turns": [
+    "I want a note-taking workflow recommendation, but do not recommend anything yet. Ask one clarifying question only.",
+    "It has to work well on macOS and iPad, and I care more about a calm solo workflow than collaboration.",
+    "My top priorities are offline-first behavior, local markdown files, and easy export.",
+    "I also care about graceful failure, reversible changes, and avoiding lock-in.",
+    "Still do not recommend yet. Before the final turn, keep track of one caveat, one runner-up, and one migration risk that might matter later.",
+    "Okay, now give the recommendation. Also mention the caveat, the runner-up, and the migration risk explicitly."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "caveat",
+      "runner-up",
+      "migration risk",
+      "offline",
+      "markdown"
+    ],
+    "conversation_required_keywords": [
+      "macOS",
+      "iPad",
+      "graceful failure",
+      "lock-in"
+    ],
+    "delayed_mention_required_kinds": [
+      "caveat",
+      "option",
+      "constraint"
+    ],
+    "delayed_mention_min_nonconclusion_items": 2,
+    "delayed_mention_min_kind_diversity": 3,
+    "final_forbidden_keywords": [
+      "I already recommended earlier"
+    ]
+  }
+}

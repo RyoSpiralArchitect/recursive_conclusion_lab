@@ -127,9 +127,21 @@
 3. **final_forbidden_keyword_hits**  
    final reply に不要キーワードが何個入ったか。late redirection で古い方針を引きずっていないかの近似。
 
+4. **perturbation recovery metrics**  
+   `evaluation.perturbation` を script に入れると、`recovery_after_perturbation_rate`、
+   `time_to_recover_turns`、`probe_recovery_after_perturbation_rate`、
+   `probe_time_to_recover_turns`、`probe_to_reply_recovery_gap_turns`、
+   `post_perturbation_forbidden_turn_rate` を計算できる。
+
 ### 5.3 推奨の補助評価
 
 lexical 指標だけだと意味的な良し悪しを取りこぼす。最低でも以下のどちらかを追加するとよい。
+
+- **embedding judge**  
+  `--semantic-judge-backend embedding|both` と `--embedding-provider` / `--embedding-model`
+  を使うと、`avg_embedding_alignment`、`embedding_alignment_slope`、
+  `embedding_semantic_leakage_rate`、`avg_embedding_articulation_gap_turns` を計算できる。
+  `both` にすると `semantic_judge_disagreement_rate` も出る。
 
 - **人手評価 3 項目**  
   1. 現在のユーザー目標に答えているか  

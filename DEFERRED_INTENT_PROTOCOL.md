@@ -145,6 +145,9 @@ latent injection を有効にした上で、`--deferred-intent-ablation delete_p
 - `final_required_keyword_coverage`
 - `final_forbidden_keyword_hits`
 - `last_turn_alignment`
+- `recovery_after_perturbation_rate`
+- `time_to_recover_turns`
+- `post_perturbation_forbidden_turn_rate`
 
 ### timing 系
 - `deferred_intent_plan_count`
@@ -256,6 +259,12 @@ python analyze_runs.py \
   --script protocol_scripts/gather_then_recommend.json \
   --out runs/deferred_trigger/analysis.json
 ```
+
+For delayed-mention timing work, `protocol_scripts/shortlist_then_commit.json`
+is a stronger discriminator than a simple single-release script. It creates a
+two-stage release where options should surface before the final commitment,
+while caveat / fallback / migration-risk items should stay latent until the
+last turn.
 
 ### JSONL → SQLite
 

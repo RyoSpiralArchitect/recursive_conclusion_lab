@@ -1,0 +1,41 @@
+{
+  "system": "You are a careful assistant. Do not recommend early when the user is still staging criteria. Release candidate options before the final choice, but keep late tradeoffs and backup options latent until the last turn.",
+  "turns": [
+    "I want a note-taking workflow recommendation, but do not recommend anything yet. Ask one clarifying question only.",
+    "It has to work well on macOS and iPad. I care most about local markdown files, offline-first behavior, and a calm solo workflow.",
+    "I also care about graceful failure, reversible changes, avoiding lock-in, and easy export.",
+    "Keep track of one caveat, one fallback option if sync fails, one migration risk from moving off my current setup, and one runner-up.",
+    "Still do not recommend yet. On the next turn I only want a shortlist of two candidate setups with one sentence each. Do not pick the winner yet, and do not mention the caveat, fallback option, or migration risk yet.",
+    "Give the two-candidate shortlist now. Keep it terse and do not choose the winner yet.",
+    "Final turn: choose the winner. Explicitly include the caveat, the fallback option, the migration risk, and why the runner-up lost."
+  ],
+  "evaluation": {
+    "final_required_keywords": [
+      "caveat",
+      "fallback",
+      "migration risk",
+      "runner-up",
+      "markdown",
+      "offline"
+    ],
+    "conversation_required_keywords": [
+      "macOS",
+      "iPad",
+      "graceful failure",
+      "lock-in",
+      "reversible",
+      "export"
+    ],
+    "delayed_mention_required_kinds": [
+      "option",
+      "caveat",
+      "constraint",
+      "migration_risk"
+    ],
+    "delayed_mention_min_nonconclusion_items": 3,
+    "delayed_mention_min_kind_diversity": 4,
+    "final_forbidden_keywords": [
+      "I already chose the winner earlier"
+    ]
+  }
+}

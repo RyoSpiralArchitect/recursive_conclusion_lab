@@ -16,6 +16,7 @@
 3. **Latent convergence trace**
    - 結論をまだ明示していない段階でも、会話軌道がその結論へどの程度収束しているかを observe-only で計測します。
    - `latent_convergence_trace` として alignment / readiness / leakage risk / stage をログします。
+   - 必要なら embedding judge を並走させて、生成器とは別系統の semantic drift 指標も取れます。
 
 4. **Deferred utterance intents**
    - 「今はまだ言わないが、数ターン後に適切なら言う」という将来発話意図を side channel で作ります。
@@ -122,10 +123,25 @@ python recursive_conclusion_lab.py repl \
   "evaluation": {
     "final_required_keywords": ["baseline"],
     "conversation_required_keywords": [],
-    "final_forbidden_keywords": []
+    "final_forbidden_keywords": [],
+    "perturbation": {
+      "label": "late_redirection",
+      "turn": 4,
+      "required_keywords": ["late redirection", "lock-in", "flexibility"],
+      "forbidden_keywords": ["leaderboard"]
+    }
   }
 }
 ```
+
+`evaluation.perturbation` は任意です。入れると `analyze_runs.py` が以下を計算します。
+
+- `recovery_after_perturbation_rate`
+- `time_to_recover_turns`
+- `probe_recovery_after_perturbation_rate`
+- `probe_time_to_recover_turns`
+- `probe_to_reply_recovery_gap_turns`
+- `post_perturbation_forbidden_turn_rate`
 
 ### 結論 probe 比較
 
@@ -179,6 +195,9 @@ python recursive_conclusion_lab.py compare-matrix \
 ```
 
 `observe` / `latent_only` / `soft_fire` / `hard_fire` / `delete_planned` のような arm を並べる用途を想定しています。
+top-level に `repeats` と `seed` を置くと、arm matrix 全体を複数回まわせます。
+出力は `summary__soft_fire__run_001.json` のような per-run summary、
+`summary.json`、`analysis_runs.json`、`analysis_aggregate.json` まで揃います。
 
 ## ログ
 
@@ -210,11 +229,22 @@ python recursive_conclusion_lab.py compare-matrix \
 ### latent convergence
 
 `--latent-convergence-every N` を有効にすると、明示言及前の semantic drift を observe-only で追えます。
+`--semantic-judge-backend` は `off|llm|embedding|both` です。
+`--observer-provider` / `--observer-model` を指定すると、この judge だけを独立 observer に切り替えられます。
+その場合 `analyze_runs.py` は `latent_judge_source` / `latent_judge_provider` / `latent_judge_model`
+も出します。
+`--embedding-provider` / `--embedding-model` を指定すると embedding judge も使えます
+（現状の対応 provider は `openai` と `dummy`）。
 
 - `avg_latent_alignment`
 - `latent_alignment_slope`
 - `latent_semantic_leakage_rate`
 - `avg_articulation_gap_turns`
+- `avg_embedding_alignment`
+- `embedding_alignment_slope`
+- `embedding_semantic_leakage_rate`
+- `avg_embedding_articulation_gap_turns`
+- `semantic_judge_disagreement_rate`
 
 ### 言及遅延ターゲット（複数候補; 任意）
 
@@ -252,12 +282,71 @@ leak guard も比較できるようにしました。
 
 - `--delayed-mention-leak-policy on|off`
 - `--delayed-mention-leak-threshold <0.00-1.00>`
+- `--delayed-mention-min-nonconclusion-items <int>`
+- `--delayed-mention-min-kind-diversity <int>`
+- `--delayed-mention-diversity-repair on|off`
+- `--adaptive-hazard-policy static|adaptive`
+- `--adaptive-hazard-profile conservative|balanced|eager`
+- `--adaptive-hazard-stage-policy flat|kind_aware`
+- `--adaptive-hazard-embedding-guard off|on`
 
 guard が on のときは、current turn probability が threshold 未満の active delayed mention を
 private prompt 側で「まだ surface させない target」として明示します。latent な trajectory bias は残しつつ、
 早漏の explicit mention を抑えるための設定です。`analyze_runs.py` では
 `delayed_mention_leak_policy` / `delayed_mention_leak_threshold` /
 `avg_suppressed_delayed_mention_count` も見られます。
+
+さらに delayed mention planner には、`conclusion` に全部潰れないように
+non-conclusion item と kind diversity を soft に要求できます。たとえば `caveat` /
+`option` / `constraint` を明示的に残すことで、結論をあとで「ためる」必然を強めます。
+
+delayed mention の timing 比較を強めたいなら
+`protocol_scripts/shortlist_then_commit.json` が向いています。これは
+「shortlist を先に出し、winner と caveat / fallback / migration risk は最後に出す」
+という staged release を作るので、単純な single-release script より
+`static` / `adaptive` / `adaptive_guard` の差が見えやすくなります。
+
+いまの OpenAI baseline 比較をそのまま再実行するなら、次で足ります。
+
+```bash
+OPENAI_API_KEY=... scripts/run_shortlist_stage_policy_gpt4mini.sh
+```
+
+`--delayed-mention-diversity-repair on` のときは、最初の delayed mention plan が
+non-conclusion 数や kind diversity の minimum を満たさなかった場合に、compact な
+補助 probe を 1 回だけ追加して non-conclusion item を補います。確率的な planning は
+維持しつつ、「全部 conclusion に潰れる」コストを system 側で与える設計です。
+
+adaptive hazard を on にすると、planned hazard support 自体は固定したまま、最近の
+`latent_alignment` / `articulation_readiness` / `leakage_risk` / judge gap を見て
+current-turn の hazard mass と leak threshold を少しだけ上下させます。さらに単純に
+threshold を下げるのではなく、hazard profile の support peak に release を寄せるように
+補正します。turn を決め打ちせず、「タメ」を確率的に強めるための制御です。`analyze_runs.py` では
+`adaptive_hazard_policy` / `adaptive_hazard_profile` / `adaptive_hazard_stage_policy` /
+`avg_adaptive_hazard_multiplier` / `adaptive_hazard_intervention_rate` /
+`avg_adaptive_hazard_turn_prob_shift` / `avg_option_stage_adaptive_hazard_multiplier` /
+`avg_option_stage_adaptive_threshold_shift` /
+`avg_final_risk_packet_adaptive_hazard_multiplier` /
+`avg_final_risk_packet_adaptive_threshold_shift` / `avg_conclusion_adaptive_hazard_multiplier`
+も出力します。
+
+`--adaptive-hazard-stage-policy kind_aware` を使うと、staged release 向けに
+`option_stage` と `final_risk_packet` を別扱いします。kind ごとの multiplier /
+threshold shift に加えて、hazard profile も少しだけ stage-aware に後ろへ寄せます。
+ただし既定は `flat` のままにしていて、比較条件として回す前提です。
+
+kind diversity 系の評価としては
+`delayed_mention_kind_diversity` /
+`delayed_mention_required_kind_coverage` /
+`delayed_mention_min_nonconclusion_satisfied` /
+`delayed_mention_min_kind_diversity_satisfied` /
+`avg_delayed_mention_peak_support_ratio_at_mention` /
+`avg_conclusion_peak_support_ratio_at_mention`
+も出力します。
+
+`--adaptive-hazard-embedding-guard on` は、embedding judge が pre-peak で強い semantic drift を
+見たときに追加の hold penalty をかける experimental arm です。run によっては leakage を下げますが、
+release timing を hold しすぎることもあるので、既定の adaptive policy には入れず比較条件として扱うのが安全です。
 
 ```bash
 python analyze_runs.py \

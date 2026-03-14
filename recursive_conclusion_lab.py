@@ -24,6 +24,7 @@ import argparse
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -68,6 +69,16 @@ class ProviderResponse:
     request_id: Optional[str] = None
 
 
+@dataclass
+class EmbeddingResponse:
+    provider: str
+    model: str
+    embeddings: list[list[float]]
+    raw: dict[str, Any]
+    usage: Optional[dict[str, Any]] = None
+    request_id: Optional[str] = None
+
+
 class ConclusionMode(str, Enum):
     OBSERVE = "observe"
     SOFT_STEER = "soft_steer"
@@ -92,6 +103,39 @@ class DelayedMentionMode(str, Enum):
 class DelayedMentionLeakPolicy(str, Enum):
     OFF = "off"
     ON = "on"
+
+
+class DelayedMentionDiversityRepairPolicy(str, Enum):
+    OFF = "off"
+    ON = "on"
+
+
+class AdaptiveHazardPolicy(str, Enum):
+    STATIC = "static"
+    ADAPTIVE = "adaptive"
+
+
+class AdaptiveHazardProfile(str, Enum):
+    CONSERVATIVE = "conservative"
+    BALANCED = "balanced"
+    EAGER = "eager"
+
+
+class AdaptiveHazardEmbeddingGuard(str, Enum):
+    OFF = "off"
+    ON = "on"
+
+
+class AdaptiveHazardStagePolicy(str, Enum):
+    FLAT = "flat"
+    KIND_AWARE = "kind_aware"
+
+
+class SemanticJudgeBackend(str, Enum):
+    OFF = "off"
+    LLM = "llm"
+    EMBEDDING = "embedding"
+    BOTH = "both"
 
 
 class DeferredIntentMode(str, Enum):
@@ -145,12 +189,26 @@ class ExperimentConfig:
     conclusion_steer_injection: ConclusionSteerInjection = ConclusionSteerInjection.FULL
     delayed_mention_every: int = 0
     delayed_mention_item_limit: int = 3
+    delayed_mention_min_nonconclusion_items: int = 1
+    delayed_mention_min_kind_diversity: int = 2
+    delayed_mention_diversity_repair: DelayedMentionDiversityRepairPolicy = (
+        DelayedMentionDiversityRepairPolicy.ON
+    )
     delayed_mention_mode: DelayedMentionMode = DelayedMentionMode.OBSERVE
     delayed_mention_fire_prob: float = 0.35
     delayed_mention_fire_max_items: int = 2
     delayed_mention_leak_policy: DelayedMentionLeakPolicy = DelayedMentionLeakPolicy.ON
     delayed_mention_leak_threshold: float = 0.05
+    adaptive_hazard_policy: AdaptiveHazardPolicy = AdaptiveHazardPolicy.ADAPTIVE
+    adaptive_hazard_profile: AdaptiveHazardProfile = AdaptiveHazardProfile.BALANCED
+    adaptive_hazard_stage_policy: AdaptiveHazardStagePolicy = (
+        AdaptiveHazardStagePolicy.FLAT
+    )
+    adaptive_hazard_embedding_guard: AdaptiveHazardEmbeddingGuard = (
+        AdaptiveHazardEmbeddingGuard.OFF
+    )
     latent_convergence_every: int = 0
+    semantic_judge_backend: SemanticJudgeBackend = SemanticJudgeBackend.LLM
     deferred_intent_every: int = 0
     deferred_intent_mode: DeferredIntentMode = DeferredIntentMode.OBSERVE
     deferred_intent_strategy: DeferredIntentStrategy = DeferredIntentStrategy.TRIGGER
@@ -181,6 +239,12 @@ class EventRecord:
     turn_index: int
     event_type: str
     payload: dict[str, Any]
+
+
+@dataclass
+class CompareExecutionResult:
+    rows: list[dict[str, Any]]
+    log_paths: list[Path]
 
 
 @dataclass
@@ -230,6 +294,7 @@ class DelayedMentionItem:
     delay_strategy: str = ""
     delay_signals: list[str] = field(default_factory=list)
     delay_rationale: str = ""
+    release_stage_role: str = ""
     status: str = "active"
     mention_turn: Optional[int] = None
     terminal_reason: str = ""
@@ -319,6 +384,55 @@ def lexical_overlap(a: str, b: str) -> float:
     if not toks_a or not toks_b:
         return 0.0
     return len(toks_a & toks_b) / len(toks_a | toks_b)
+
+
+def normalize_vector(values: list[float]) -> list[float]:
+    norm = sum(v * v for v in values) ** 0.5
+    if norm <= 0.0:
+        return [0.0 for _ in values]
+    return [v / norm for v in values]
+
+
+def hashed_embedding_vector(text: str, *, dims: int = 128) -> list[float]:
+    dims = max(8, int(dims))
+    vec = [0.0] * dims
+    cleaned = compact_text(text).lower()
+    if not cleaned:
+        return vec
+
+    tokens = re.findall(r"\w+", cleaned)
+    features = list(tokens)
+    features.extend(f"{a}_{b}" for a, b in zip(tokens, tokens[1:]))
+    joined = re.sub(r"\s+", " ", cleaned)
+    features.extend(joined[idx : idx + 3] for idx in range(max(0, len(joined) - 2)))
+    if not features:
+        return vec
+
+    for feature in features:
+        digest = hashlib.sha256(feature.encode("utf-8")).digest()
+        slot = int.from_bytes(digest[:2], "big") % dims
+        sign = 1.0 if digest[2] % 2 == 0 else -1.0
+        weight = 1.0 + min(len(feature), 12) / 12.0
+        vec[slot] += sign * weight
+    return normalize_vector(vec)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> Optional[float]:
+    if not a or not b or len(a) != len(b):
+        return None
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return None
+    return max(-1.0, min(1.0, dot / (norm_a * norm_b)))
+
+
+def cosine_alignment(a: list[float], b: list[float]) -> Optional[float]:
+    similarity = cosine_similarity(a, b)
+    if similarity is None:
+        return None
+    return max(0.0, min(1.0, 0.5 * (similarity + 1.0)))
 
 
 def extract_probe_line_value(text: str, key: str) -> str:
@@ -419,6 +533,16 @@ def keyword_coverage(keywords: list[str], text: str) -> Optional[float]:
     if hits is None:
         return None
     return hits / max(1, len(keywords))
+
+
+def count_strings(values: Iterable[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        key = compact_text(str(value))
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def extract_conclusion_line(text: str) -> str:
@@ -684,6 +808,235 @@ def hazard_peak_probability(profile: list[dict[str, Any]]) -> float:
 def hazard_support_size(profile: list[dict[str, Any]]) -> int:
     normalized = parse_hazard_profile(profile)
     return len(normalized)
+
+
+def adaptive_hazard_profile_params(
+    profile: AdaptiveHazardProfile,
+) -> dict[str, float]:
+    if profile == AdaptiveHazardProfile.CONSERVATIVE:
+        return {
+            "boost_scale": 0.50,
+            "suppress_scale": 0.85,
+            "gap_damping": 2.80,
+            "min_multiplier": 0.30,
+            "max_multiplier": 1.35,
+            "threshold_raise": 0.16,
+            "peak_pull_scale": 0.95,
+            "peak_release_scale": 0.16,
+            "peak_target_ratio": 0.78,
+            "peak_release_ratio": 0.92,
+            "peak_pre_peak_penalty": 0.12,
+            "peak_release_bonus": 0.08,
+            "threshold_peak_raise": 0.18,
+            "threshold_peak_lower": 0.03,
+            "embedding_prepeak_target": 0.64,
+            "embedding_prepeak_scale": 0.90,
+            "threshold_embedding_raise": 0.22,
+        }
+    if profile == AdaptiveHazardProfile.EAGER:
+        return {
+            "boost_scale": 0.90,
+            "suppress_scale": 0.45,
+            "gap_damping": 1.60,
+            "min_multiplier": 0.45,
+            "max_multiplier": 2.10,
+            "threshold_raise": 0.08,
+            "peak_pull_scale": 0.55,
+            "peak_release_scale": 0.28,
+            "peak_target_ratio": 0.60,
+            "peak_release_ratio": 0.78,
+            "peak_pre_peak_penalty": 0.08,
+            "peak_release_bonus": 0.12,
+            "threshold_peak_raise": 0.10,
+            "threshold_peak_lower": 0.06,
+            "embedding_prepeak_target": 0.78,
+            "embedding_prepeak_scale": 0.40,
+            "threshold_embedding_raise": 0.10,
+        }
+    return {
+        "boost_scale": 0.70,
+        "suppress_scale": 0.65,
+        "gap_damping": 2.10,
+        "min_multiplier": 0.35,
+        "max_multiplier": 1.70,
+        "threshold_raise": 0.12,
+        "peak_pull_scale": 0.78,
+        "peak_release_scale": 0.20,
+        "peak_target_ratio": 0.68,
+        "peak_release_ratio": 0.85,
+        "peak_pre_peak_penalty": 0.10,
+        "peak_release_bonus": 0.10,
+        "threshold_peak_raise": 0.15,
+        "threshold_peak_lower": 0.04,
+        "embedding_prepeak_target": 0.70,
+        "embedding_prepeak_scale": 0.62,
+        "threshold_embedding_raise": 0.16,
+    }
+
+
+def classify_delayed_mention_stage_role(
+    *,
+    kind: str,
+    text: str,
+    delay_strategy: str = "",
+    delay_signals: Optional[list[str]] = None,
+) -> str:
+    kind_norm = compact_text(kind).lower()
+    blob_parts = [kind_norm, compact_text(text).lower(), compact_text(delay_strategy).lower()]
+    if delay_signals:
+        blob_parts.extend(compact_text(x).lower() for x in delay_signals if x)
+    blob = " ".join(part for part in blob_parts if part)
+
+    final_packet_hints = (
+        "fallback",
+        "backup",
+        "contingency",
+        "sync fail",
+        "fails",
+        "graceful failure",
+        "migration",
+        "risk",
+        "rollback",
+        "lock-in",
+        "caveat",
+    )
+    option_stage_hints = (
+        "shortlist",
+        "candidate",
+        "runner-up",
+        "runner up",
+        "alternative",
+        "front-runner",
+        "winner",
+        "short list",
+    )
+    support_stage_hints = (
+        "criteria",
+        "checklist",
+        "constraint",
+        "requirement",
+        "priority",
+        "decision",
+        "export",
+        "markdown",
+        "offline",
+    )
+
+    if kind_norm == "conclusion":
+        return "conclusion"
+    if kind_norm in {"caveat", "migration_risk"}:
+        return "final_risk_packet"
+    if any(hint in blob for hint in final_packet_hints):
+        return "final_risk_packet"
+    if kind_norm == "option":
+        return "option_stage"
+    if kind_norm in {"constraint", "definition"}:
+        return "support_stage"
+    if any(hint in blob for hint in option_stage_hints):
+        return "option_stage"
+    if any(hint in blob for hint in support_stage_hints):
+        return "support_stage"
+    return "support_stage"
+
+
+def adaptive_hazard_stage_role_params(
+    policy: AdaptiveHazardStagePolicy,
+    stage_role: str,
+) -> dict[str, float]:
+    if policy != AdaptiveHazardStagePolicy.KIND_AWARE:
+        return {
+            "focus_scale": 1.0,
+            "boost_bias": 0.0,
+            "suppress_bias": 0.0,
+            "peak_pull_scale": 1.0,
+            "peak_release_scale": 1.0,
+            "threshold_bias": 0.0,
+            "prepeak_release_ratio": 1.1,
+            "prepeak_release_bonus": 0.0,
+            "prepeak_hold_bonus": 0.0,
+        }
+    if stage_role == "option_stage":
+        return {
+            "focus_scale": 1.12,
+            "boost_bias": 0.04,
+            "suppress_bias": -0.05,
+            "peak_pull_scale": 0.70,
+            "peak_release_scale": 1.28,
+            "threshold_bias": -0.02,
+            "prepeak_release_ratio": 0.58,
+            "prepeak_release_bonus": 0.12,
+            "prepeak_hold_bonus": 0.0,
+        }
+    if stage_role == "final_risk_packet":
+        return {
+            "focus_scale": 0.96,
+            "boost_bias": -0.01,
+            "suppress_bias": 0.08,
+            "peak_pull_scale": 1.25,
+            "peak_release_scale": 0.92,
+            "threshold_bias": 0.02,
+            "prepeak_release_ratio": 1.1,
+            "prepeak_release_bonus": 0.0,
+            "prepeak_hold_bonus": 0.09,
+        }
+    if stage_role == "support_stage":
+        return {
+            "focus_scale": 1.04,
+            "boost_bias": 0.02,
+            "suppress_bias": -0.02,
+            "peak_pull_scale": 0.86,
+            "peak_release_scale": 1.10,
+            "threshold_bias": -0.008,
+            "prepeak_release_ratio": 0.72,
+            "prepeak_release_bonus": 0.05,
+            "prepeak_hold_bonus": 0.0,
+        }
+    return {
+        "focus_scale": 1.0,
+        "boost_bias": 0.0,
+        "suppress_bias": 0.0,
+        "peak_pull_scale": 1.0,
+        "peak_release_scale": 1.0,
+        "threshold_bias": 0.0,
+        "prepeak_release_ratio": 1.1,
+        "prepeak_release_bonus": 0.0,
+        "prepeak_hold_bonus": 0.0,
+    }
+
+
+def reshape_stage_role_hazard_profile(
+    *,
+    policy: AdaptiveHazardStagePolicy,
+    stage_role: str,
+    profile: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized = parse_hazard_profile(profile)
+    if policy != AdaptiveHazardStagePolicy.KIND_AWARE or not normalized:
+        return normalized
+    if stage_role in {"", "conclusion"}:
+        return normalized
+
+    peak_delay = hazard_peak_delay(normalized)
+    if peak_delay is None:
+        return normalized
+
+    target_peak_delay: Optional[int] = None
+    if stage_role == "support_stage":
+        target_peak_delay = 3
+    elif stage_role == "option_stage":
+        target_peak_delay = 4
+    elif stage_role == "final_risk_packet":
+        target_peak_delay = 5
+    if target_peak_delay is None or peak_delay >= target_peak_delay:
+        return normalized
+
+    shift = target_peak_delay - peak_delay
+    reshaped: list[dict[str, Any]] = []
+    for item in normalized:
+        delay = coerce_int(item.get("delay_turns")) or 0
+        prob = clamp01(item.get("prob"), default=0.0)
+        reshaped.append({"delay_turns": delay + shift, "prob": prob})
+    return parse_hazard_profile(reshaped)
 
 
 def format_hazard_profile_brief(
@@ -1148,6 +1501,22 @@ class BaseAdapter(abc.ABC):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
+        raise NotImplementedError
+
+
+class BaseEmbeddingAdapter(abc.ABC):
+    provider_name: str
+
+    def __init__(self, model: str) -> None:
+        self.model = model
+
+    @abc.abstractmethod
+    def embed(
+        self,
+        *,
+        inputs: list[str],
+        config: GenerationConfig,
+    ) -> EmbeddingResponse:
         raise NotImplementedError
 
 
@@ -1627,6 +1996,26 @@ class DummyAdapter(BaseAdapter):
         )
 
 
+class DummyEmbeddingAdapter(BaseEmbeddingAdapter):
+    provider_name = "dummy"
+
+    def embed(
+        self,
+        *,
+        inputs: list[str],
+        config: GenerationConfig,
+    ) -> EmbeddingResponse:
+        embeddings = [hashed_embedding_vector(text) for text in inputs]
+        return EmbeddingResponse(
+            provider=self.provider_name,
+            model=self.model,
+            embeddings=embeddings,
+            raw={"dummy": True, "input_count": len(inputs)},
+            usage={"input_tokens": 0},
+            request_id=f"dummy-embed-{random.randint(1000, 9999)}",
+        )
+
+
 class OpenAIResponsesAdapter(BaseAdapter):
     provider_name = "openai"
     url = "https://api.openai.com/v1/responses"
@@ -1686,6 +2075,62 @@ class OpenAIResponsesAdapter(BaseAdapter):
             usage=usage,
             finish_reason=finish_reason,
             request_id=request_id,
+        )
+
+
+class OpenAIEmbeddingsAdapter(BaseEmbeddingAdapter):
+    provider_name = "openai"
+    url = "https://api.openai.com/v1/embeddings"
+
+    def __init__(self, model: str, api_key: Optional[str] = None) -> None:
+        super().__init__(model=model)
+        self.api_key = api_key or require_env("OPENAI_API_KEY")
+
+    def embed(
+        self,
+        *,
+        inputs: list[str],
+        config: GenerationConfig,
+    ) -> EmbeddingResponse:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": inputs,
+            "encoding_format": "float",
+        }
+        data = post_json(
+            url=self.url,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            payload=payload,
+            timeout_seconds=config.timeout_seconds,
+        )
+        embeddings: list[list[float]] = []
+        for item in data.get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            raw_embedding = item.get("embedding")
+            if not isinstance(raw_embedding, list):
+                continue
+            vector = [
+                float(x)
+                for x in raw_embedding
+                if isinstance(x, (int, float))
+            ]
+            if vector:
+                embeddings.append(vector)
+        if len(embeddings) != len(inputs):
+            raise RuntimeError(
+                f"Embedding response length mismatch: expected {len(inputs)}, got {len(embeddings)}."
+            )
+        return EmbeddingResponse(
+            provider=self.provider_name,
+            model=self.model,
+            embeddings=embeddings,
+            raw=data,
+            usage=data.get("usage"),
+            request_id=data.get("id"),
         )
 
 
@@ -1939,6 +2384,46 @@ def build_adapter(provider: str, model: str) -> BaseAdapter:
     raise ValueError(f"Unsupported provider: {provider!r}")
 
 
+def build_embedding_adapter(provider: str, model: str) -> BaseEmbeddingAdapter:
+    provider = provider.strip().lower()
+    if provider == "openai":
+        return OpenAIEmbeddingsAdapter(model=model)
+    if provider == "dummy":
+        return DummyEmbeddingAdapter(model=model)
+    raise ValueError(
+        f"Unsupported embedding provider: {provider!r}. "
+        "Supported embedding providers are: openai, dummy."
+    )
+
+
+def build_optional_observer_adapter(args: argparse.Namespace) -> Optional[BaseAdapter]:
+    observer_provider = compact_text(str(getattr(args, "observer_provider", "") or "")).lower()
+    observer_model = compact_text(str(getattr(args, "observer_model", "") or ""))
+    if bool(observer_provider) != bool(observer_model):
+        raise ValueError(
+            "--observer-provider and --observer-model must be set together."
+        )
+    if not observer_provider:
+        return None
+    return build_adapter(observer_provider, observer_model)
+
+
+def build_optional_embedding_adapter(
+    args: argparse.Namespace,
+) -> Optional[BaseEmbeddingAdapter]:
+    embedding_provider = compact_text(
+        str(getattr(args, "embedding_provider", "") or "")
+    ).lower()
+    embedding_model = compact_text(str(getattr(args, "embedding_model", "") or ""))
+    if bool(embedding_provider) != bool(embedding_model):
+        raise ValueError(
+            "--embedding-provider and --embedding-model must be set together."
+        )
+    if not embedding_provider:
+        return None
+    return build_embedding_adapter(embedding_provider, embedding_model)
+
+
 # ----------------------------
 # Experiment engine
 # ----------------------------
@@ -1960,12 +2445,26 @@ class RecursiveConclusionSession:
         self,
         *,
         adapter: BaseAdapter,
+        observer_adapter: Optional[BaseAdapter] = None,
+        embedding_adapter: Optional[BaseEmbeddingAdapter] = None,
         config: ExperimentConfig,
         log_path: Optional[Path] = None,
     ) -> None:
         self.adapter = adapter
+        self.observer_adapter = observer_adapter or adapter
+        self.embedding_adapter = embedding_adapter
+        self.latent_judge_source = (
+            "independent_observer" if observer_adapter is not None else "generator_adapter"
+        )
         self.config = config
         self.log_path = log_path
+        if self.config.semantic_judge_backend in {
+            SemanticJudgeBackend.EMBEDDING,
+            SemanticJudgeBackend.BOTH,
+        } and self.embedding_adapter is None:
+            raise ValueError(
+                "semantic_judge_backend requires --embedding-provider and --embedding-model."
+            )
         self.history: list[ChatMessage] = []
         self.memory_capsules: list[str] = []
         self.conclusion_hypotheses: list[str] = []
@@ -1980,6 +2479,8 @@ class RecursiveConclusionSession:
         self.latest_conclusion_delay_signals: list[str] = []
         self.latest_conclusion_delay_rationale: str = ""
         self.latest_latent_convergence_trace: Optional[dict[str, Any]] = None
+        self.latest_embedding_convergence_trace: Optional[dict[str, Any]] = None
+        self.latest_adaptive_hazard_trace: Optional[dict[str, Any]] = None
         self.delayed_mentions: list[DelayedMentionItem] = []
         self.deferred_intents: list[DeferredIntent] = []
         self.turn_index = 0
@@ -2000,19 +2501,448 @@ class RecursiveConclusionSession:
     def _active_delayed_mentions(self) -> list[DelayedMentionItem]:
         return [item for item in self.delayed_mentions if item.status == "active"]
 
-    def _due_delayed_mentions(self) -> list[DelayedMentionItem]:
+    def _adaptive_hazard_enabled(self) -> bool:
+        return self.config.adaptive_hazard_policy == AdaptiveHazardPolicy.ADAPTIVE
+
+    def _adaptive_hazard_signal_snapshot(self) -> dict[str, Any]:
+        current_conclusion_text = strip_conclusion_prefix(self.latest_conclusion_line)
+
+        def trace_matches_current_conclusion(trace: dict[str, Any]) -> bool:
+            if trace.get("conclusion_probe_turn") == self.latest_conclusion_probe_turn:
+                return True
+            trace_conclusion_text = compact_text(str(trace.get("conclusion_line") or ""))
+            return bool(current_conclusion_text) and (
+                compact_text(current_conclusion_text) == trace_conclusion_text
+            )
+
+        latent = {}
+        if (
+            isinstance(self.latest_latent_convergence_trace, dict)
+            and trace_matches_current_conclusion(self.latest_latent_convergence_trace)
+        ):
+            latent = self.latest_latent_convergence_trace
+        embedding = {}
+        if (
+            isinstance(self.latest_embedding_convergence_trace, dict)
+            and trace_matches_current_conclusion(self.latest_embedding_convergence_trace)
+        ):
+            embedding = self.latest_embedding_convergence_trace
+        latent_alignment = latent.get("alignment")
+        embedding_alignment = embedding.get("alignment")
+        alignments = [
+            float(value)
+            for value in (latent_alignment, embedding_alignment)
+            if isinstance(value, (int, float))
+        ]
+        alignment = sum(alignments) / len(alignments) if alignments else None
+        readiness = (
+            float(latent.get("articulation_readiness"))
+            if isinstance(latent.get("articulation_readiness"), (int, float))
+            else None
+        )
+        leakage_risk = (
+            float(latent.get("leakage_risk"))
+            if isinstance(latent.get("leakage_risk"), (int, float))
+            else None
+        )
+        judge_gap = None
+        if isinstance(latent_alignment, (int, float)) and isinstance(
+            embedding_alignment, (int, float)
+        ):
+            judge_gap = abs(float(latent_alignment) - float(embedding_alignment))
+        stage = truncate_text(latent.get("trajectory_stage") or "", 24) or None
+        explicit = latent.get("explicit_mention_present")
+        if not isinstance(explicit, bool):
+            explicit = None
+        likelihood = (
+            float(self.latest_conclusion_mention_likelihood)
+            if isinstance(self.latest_conclusion_mention_likelihood, (int, float))
+            else None
+        )
+        return {
+            "policy": self.config.adaptive_hazard_policy.value,
+            "profile": self.config.adaptive_hazard_profile.value,
+            "latent_alignment": (
+                float(latent_alignment)
+                if isinstance(latent_alignment, (int, float))
+                else None
+            ),
+            "embedding_alignment": (
+                float(embedding_alignment)
+                if isinstance(embedding_alignment, (int, float))
+                else None
+            ),
+            "alignment": alignment,
+            "readiness": readiness,
+            "leakage_risk": leakage_risk,
+            "judge_gap": judge_gap,
+            "trajectory_stage": stage,
+            "explicit_mention_present": explicit,
+            "conclusion_likelihood": likelihood,
+        }
+
+    def _compute_adaptive_hazard_adjustment(
+        self,
+        *,
+        item_kind: str,
+        item_id: str,
+        item_text: str,
+        item_delay_strategy: str,
+        item_delay_signals: list[str],
+        item_release_stage_role: str,
+        created_turn: int,
+        hazard_profile: list[dict[str, Any]],
+        base_turn_prob: float,
+        base_threshold: Optional[float],
+        likelihood: Optional[float],
+        signal_snapshot: dict[str, Any],
+    ) -> dict[str, Any]:
+        peak_prob = hazard_peak_probability(hazard_profile) if hazard_profile else 0.0
+        peak_delay = hazard_peak_delay(hazard_profile) if hazard_profile else None
+        peak_turn = created_turn + peak_delay if peak_delay is not None else None
+        peak_support_ratio: Optional[float] = None
+        if peak_prob > 0.0:
+            peak_support_ratio = clamp01(base_turn_prob / peak_prob, default=0.0)
+        before_peak = peak_turn is not None and self.turn_index < peak_turn
+        at_peak = peak_turn is not None and self.turn_index == peak_turn
+        after_peak = peak_turn is not None and self.turn_index > peak_turn
+        release_stage_role = (
+            compact_text(item_release_stage_role) or ""
+        ) or classify_delayed_mention_stage_role(
+            kind=item_kind,
+            text=item_text,
+            delay_strategy=item_delay_strategy,
+            delay_signals=item_delay_signals,
+        )
+        adjustment = {
+            "item_id": item_id,
+            "kind": item_kind,
+            "text": truncate_text(item_text, 140),
+            "release_stage_role": release_stage_role,
+            "adaptive_hazard_stage_policy": self.config.adaptive_hazard_stage_policy.value,
+            "created_turn": created_turn,
+            "peak_turn": peak_turn,
+            "peak_probability": peak_prob if peak_prob > 0.0 else None,
+            "peak_support_ratio": peak_support_ratio,
+            "before_peak": before_peak if peak_turn is not None else None,
+            "at_peak": at_peak if peak_turn is not None else None,
+            "after_peak": after_peak if peak_turn is not None else None,
+            "base_turn_prob": float(base_turn_prob),
+            "effective_turn_prob": float(base_turn_prob),
+            "turn_prob_multiplier": 1.0,
+            "base_threshold": base_threshold,
+            "effective_threshold": base_threshold,
+            "threshold_shift": 0.0 if base_threshold is not None else None,
+            "reasons": [],
+            "signals": signal_snapshot,
+        }
+        if not self._adaptive_hazard_enabled():
+            return adjustment
+
+        params = adaptive_hazard_profile_params(self.config.adaptive_hazard_profile)
+        stage_role_params = adaptive_hazard_stage_role_params(
+            self.config.adaptive_hazard_stage_policy,
+            release_stage_role,
+        )
+        focus_weight = (1.0 if item_kind == "conclusion" else 0.65) * float(
+            stage_role_params["focus_scale"]
+        )
+        alignment = signal_snapshot.get("alignment")
+        embedding_alignment = signal_snapshot.get("embedding_alignment")
+        readiness = signal_snapshot.get("readiness")
+        leakage_risk = signal_snapshot.get("leakage_risk")
+        judge_gap = signal_snapshot.get("judge_gap")
+        stage = signal_snapshot.get("trajectory_stage")
+        explicit = signal_snapshot.get("explicit_mention_present")
+        effective_likelihood = (
+            float(likelihood)
+            if isinstance(likelihood, (int, float))
+            else signal_snapshot.get("conclusion_likelihood")
+        )
+
+        boost_signal = 0.0
+        if isinstance(alignment, (int, float)):
+            boost_signal += max(0.0, float(alignment) - 0.55)
+        if isinstance(readiness, (int, float)):
+            boost_signal += max(0.0, float(readiness) - 0.50)
+        if isinstance(effective_likelihood, (int, float)):
+            boost_signal += 0.5 * max(0.0, float(effective_likelihood) - 0.50)
+        if stage == "approaching":
+            boost_signal += 0.05
+        elif stage == "ready":
+            boost_signal += 0.12
+        elif stage == "explicit":
+            boost_signal += 0.08
+        boost_signal = max(0.0, boost_signal + float(stage_role_params["boost_bias"]))
+
+        suppress_signal = (
+            float(leakage_risk) if isinstance(leakage_risk, (int, float)) else 0.0
+        )
+        if stage == "latent":
+            suppress_signal = max(suppress_signal, 0.18)
+        elif stage == "diverged":
+            suppress_signal = max(suppress_signal, 0.85)
+        suppress_signal = max(
+            0.0,
+            suppress_signal + float(stage_role_params["suppress_bias"]),
+        )
+
+        peak_pull = 0.0
+        peak_release = 0.0
+        if isinstance(peak_support_ratio, (int, float)):
+            peak_ratio = float(peak_support_ratio)
+            peak_pull += max(0.0, params["peak_target_ratio"] - peak_ratio)
+            peak_release += max(0.0, peak_ratio - params["peak_release_ratio"])
+        if before_peak:
+            peak_pull += params["peak_pre_peak_penalty"]
+        elif at_peak:
+            peak_release += params["peak_release_bonus"]
+        elif after_peak and isinstance(peak_support_ratio, (int, float)):
+            if float(peak_support_ratio) >= params["peak_release_ratio"]:
+                peak_release += 0.5 * params["peak_release_bonus"]
+        if before_peak and isinstance(peak_support_ratio, (int, float)):
+            if (
+                float(peak_support_ratio)
+                >= float(stage_role_params["prepeak_release_ratio"])
+                and stage in {"approaching", "ready", "explicit"}
+            ):
+                peak_release += float(stage_role_params["prepeak_release_bonus"])
+            peak_pull += float(stage_role_params["prepeak_hold_bonus"])
+        peak_pull *= float(stage_role_params["peak_pull_scale"])
+        peak_release *= float(stage_role_params["peak_release_scale"])
+        adjustment["stage_boost_bias"] = float(stage_role_params["boost_bias"])
+        adjustment["stage_suppress_bias"] = float(stage_role_params["suppress_bias"])
+        adjustment["stage_threshold_bias"] = float(stage_role_params["threshold_bias"])
+        adjustment["stage_prepeak_release_bonus"] = float(
+            stage_role_params["prepeak_release_bonus"]
+        )
+        adjustment["stage_prepeak_hold_bonus"] = float(
+            stage_role_params["prepeak_hold_bonus"]
+        )
+
+        embedding_prepeak_penalty = 0.0
+        embedding_prepeak_peak_gap_factor = None
+        if (
+            self.config.adaptive_hazard_embedding_guard == AdaptiveHazardEmbeddingGuard.ON
+            and before_peak
+            and not explicit
+            and isinstance(embedding_alignment, (int, float))
+        ):
+            embedding_target = float(params["embedding_prepeak_target"])
+            denom = max(0.05, 1.0 - embedding_target)
+            embedding_prepeak_penalty = min(
+                1.0,
+                max(0.0, float(embedding_alignment) - embedding_target) / denom,
+            )
+            if isinstance(peak_support_ratio, (int, float)):
+                peak_gap_factor = max(
+                    0.0,
+                    float(params["peak_target_ratio"]) - float(peak_support_ratio),
+                ) / max(0.05, float(params["peak_target_ratio"]))
+                embedding_prepeak_peak_gap_factor = clamp01(peak_gap_factor, default=0.0)
+                embedding_prepeak_penalty *= embedding_prepeak_peak_gap_factor
+            if stage in {"latent", "approaching"} and embedding_prepeak_penalty > 0.0:
+                embedding_prepeak_penalty = min(
+                    1.0,
+                    embedding_prepeak_penalty + 0.12,
+                )
+            elif stage == "ready":
+                embedding_prepeak_penalty *= 0.45
+        adjustment["embedding_prepeak_penalty"] = embedding_prepeak_penalty
+        adjustment["embedding_prepeak_peak_gap_factor"] = embedding_prepeak_peak_gap_factor
+
+        confidence = 1.0
+        if isinstance(judge_gap, (int, float)):
+            confidence = max(
+                0.35,
+                1.0 - min(1.0, float(judge_gap) * params["gap_damping"]),
+            )
+
+        delta = (
+            params["boost_scale"] * boost_signal * focus_weight * confidence
+            + params["peak_release_scale"] * peak_release * focus_weight * confidence
+            - params["suppress_scale"] * suppress_signal * focus_weight
+            - params["peak_pull_scale"] * peak_pull * focus_weight
+            - params["embedding_prepeak_scale"] * embedding_prepeak_penalty * focus_weight
+        )
+        multiplier = min(
+            params["max_multiplier"],
+            max(params["min_multiplier"], 1.0 + delta),
+        )
+        if base_turn_prob <= 0.0:
+            multiplier = 1.0
+
+        effective_turn_prob = clamp01(base_turn_prob * multiplier, default=0.0)
+        adjustment["effective_turn_prob"] = effective_turn_prob
+        adjustment["turn_prob_multiplier"] = multiplier
+
+        if base_threshold is not None:
+            threshold_shift = (
+                params["threshold_raise"] * suppress_signal * focus_weight
+                + params["threshold_peak_raise"] * peak_pull * focus_weight
+                + params["threshold_embedding_raise"] * embedding_prepeak_penalty * focus_weight
+                - params["threshold_peak_lower"] * peak_release * focus_weight * confidence
+                + float(stage_role_params["threshold_bias"])
+            )
+            if explicit and not before_peak:
+                threshold_shift -= 0.02 * focus_weight
+            effective_threshold = clamp01(base_threshold + threshold_shift, default=base_threshold)
+            adjustment["effective_threshold"] = effective_threshold
+            adjustment["threshold_shift"] = effective_threshold - base_threshold
+
+        reasons: list[str] = []
+        if boost_signal >= 0.08:
+            reasons.append("boost:trajectory_ready")
+        elif boost_signal >= 0.03:
+            reasons.append("boost:trajectory_bias")
+        if suppress_signal >= 0.40:
+            reasons.append("suppress:leakage_risk")
+        elif suppress_signal >= 0.18:
+            reasons.append("suppress:latent_hold")
+        if peak_pull >= 0.08:
+            reasons.append("pull:toward_peak")
+        if before_peak:
+            reasons.append("hold:pre_peak")
+        elif peak_release >= 0.08:
+            reasons.append("release:peak_support")
+        if (
+            before_peak
+            and float(stage_role_params["prepeak_release_bonus"]) > 0.0
+            and isinstance(peak_support_ratio, (int, float))
+            and float(peak_support_ratio) >= float(stage_role_params["prepeak_release_ratio"])
+            and stage in {"approaching", "ready", "explicit"}
+        ):
+            reasons.append("release:stage_prepeak")
+        if float(stage_role_params["prepeak_hold_bonus"]) > 0.0 and before_peak:
+            reasons.append("hold:stage_packet")
+        if embedding_prepeak_penalty >= 0.08:
+            reasons.append("suppress:embedding_prepeak")
+        if release_stage_role:
+            reasons.append(f"release_stage:{release_stage_role}")
+        if stage:
+            reasons.append(f"stage:{stage}")
+        if isinstance(judge_gap, (int, float)) and float(judge_gap) >= 0.08:
+            reasons.append("dampen:judge_gap")
+        if explicit:
+            reasons.append("release:explicit_seen")
+        adjustment["reasons"] = reasons
+        return adjustment
+
+    def _build_adaptive_hazard_trace(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], Optional[dict[str, Any]]]:
+        signal_snapshot = self._adaptive_hazard_signal_snapshot()
+        base_threshold = (
+            self._delayed_mention_leak_threshold()
+            if self.config.delayed_mention_leak_policy == DelayedMentionLeakPolicy.ON
+            else None
+        )
+        adjustments: dict[str, dict[str, Any]] = {}
+        for item in self._active_delayed_mentions():
+            base_turn_prob = hazard_turn_probability(
+                item.hazard_profile,
+                created_turn=item.created_turn,
+                turn_index=self.turn_index,
+            )
+            adjustments[item.item_id] = self._compute_adaptive_hazard_adjustment(
+                item_kind=item.kind,
+                item_id=item.item_id,
+                item_text=item.text,
+                item_delay_strategy=item.delay_strategy,
+                item_delay_signals=list(item.delay_signals),
+                item_release_stage_role=item.release_stage_role,
+                created_turn=item.created_turn,
+                hazard_profile=item.hazard_profile,
+                base_turn_prob=base_turn_prob,
+                base_threshold=base_threshold,
+                likelihood=item.likelihood,
+                signal_snapshot=signal_snapshot,
+            )
+
+        conclusion_adjustment = None
+        if self.latest_conclusion_probe_turn is not None and self.latest_conclusion_mention_hazard_profile:
+            base_turn_prob = hazard_turn_probability(
+                self.latest_conclusion_mention_hazard_profile,
+                created_turn=self.latest_conclusion_probe_turn,
+                turn_index=self.turn_index,
+            )
+            conclusion_adjustment = self._compute_adaptive_hazard_adjustment(
+                item_kind="conclusion",
+                item_id="conclusion-plan",
+                item_text=strip_conclusion_prefix(self.latest_conclusion_line),
+                item_delay_strategy=self.latest_conclusion_delay_strategy,
+                item_delay_signals=list(self.latest_conclusion_delay_signals),
+                item_release_stage_role="conclusion",
+                created_turn=self.latest_conclusion_probe_turn,
+                hazard_profile=self.latest_conclusion_mention_hazard_profile,
+                base_turn_prob=base_turn_prob,
+                base_threshold=base_threshold,
+                likelihood=self.latest_conclusion_mention_likelihood,
+                signal_snapshot=signal_snapshot,
+            )
+            conclusion_adjustment["probe_turn"] = self.latest_conclusion_probe_turn
+            conclusion_adjustment["hazard_profile"] = list(
+                self.latest_conclusion_mention_hazard_profile
+            )
+
+        trace = {
+            "policy": self.config.adaptive_hazard_policy.value,
+            "profile": self.config.adaptive_hazard_profile.value,
+            "stage_policy": self.config.adaptive_hazard_stage_policy.value,
+            "signals": signal_snapshot,
+            "items": list(adjustments.values()),
+            "latest_conclusion": conclusion_adjustment,
+        }
+        self.latest_adaptive_hazard_trace = trace
+        self._log("adaptive_hazard_trace", trace)
+        return adjustments, conclusion_adjustment
+
+    def _delayed_mention_adjustment(
+        self,
+        item: DelayedMentionItem,
+        adjustments: Optional[dict[str, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        base_turn_prob = hazard_turn_probability(
+            item.hazard_profile,
+            created_turn=item.created_turn,
+            turn_index=self.turn_index,
+        )
+        base_threshold = (
+            self._delayed_mention_leak_threshold()
+            if self.config.delayed_mention_leak_policy == DelayedMentionLeakPolicy.ON
+            else None
+        )
+        if adjustments and isinstance(adjustments.get(item.item_id), dict):
+            return adjustments[item.item_id]
+        return {
+            "item_id": item.item_id,
+            "kind": item.kind,
+            "text": truncate_text(item.text, 140),
+            "release_stage_role": item.release_stage_role,
+            "adaptive_hazard_stage_policy": self.config.adaptive_hazard_stage_policy.value,
+            "created_turn": item.created_turn,
+            "base_turn_prob": base_turn_prob,
+            "effective_turn_prob": base_turn_prob,
+            "turn_prob_multiplier": 1.0,
+            "base_threshold": base_threshold,
+            "effective_threshold": base_threshold,
+            "threshold_shift": 0.0 if base_threshold is not None else None,
+            "reasons": [],
+            "signals": self._adaptive_hazard_signal_snapshot(),
+        }
+
+    def _due_delayed_mentions(
+        self,
+        *,
+        adaptive_adjustments: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> list[DelayedMentionItem]:
         due: list[DelayedMentionItem] = []
         for item in self._active_delayed_mentions():
             if not (item.earliest_turn <= self.turn_index <= item.latest_turn):
                 continue
-            if item.hazard_profile:
-                turn_prob = hazard_turn_probability(
-                    item.hazard_profile,
-                    created_turn=item.created_turn,
-                    turn_index=self.turn_index,
-                )
-                if turn_prob <= 0.0:
-                    continue
+            adjustment = self._delayed_mention_adjustment(item, adaptive_adjustments)
+            if adjustment.get("effective_turn_prob", 0.0) <= 0.0:
+                continue
             due.append(item)
         return due
 
@@ -2023,29 +2953,32 @@ class RecursiveConclusionSession:
         self,
         *,
         injected_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
+        adaptive_adjustments: Optional[dict[str, dict[str, Any]]] = None,
     ) -> list[DelayedMentionItem]:
         if self.config.delayed_mention_leak_policy != DelayedMentionLeakPolicy.ON:
             return []
-        threshold = self._delayed_mention_leak_threshold()
         injected_ids = {item.item_id for item in injected_delayed_mentions or []}
         suppressed: list[DelayedMentionItem] = []
         for item in self._active_delayed_mentions():
             if item.item_id in injected_ids:
                 continue
-            turn_prob = hazard_turn_probability(
-                item.hazard_profile,
-                created_turn=item.created_turn,
-                turn_index=self.turn_index,
+            adjustment = self._delayed_mention_adjustment(item, adaptive_adjustments)
+            turn_prob = float(adjustment.get("effective_turn_prob", 0.0) or 0.0)
+            threshold = clamp01(
+                adjustment.get("effective_threshold"),
+                default=self._delayed_mention_leak_threshold(),
             )
             if turn_prob >= threshold:
                 continue
             suppressed.append(item)
         suppressed.sort(
             key=lambda item: (
-                hazard_turn_probability(
-                    item.hazard_profile,
-                    created_turn=item.created_turn,
-                    turn_index=self.turn_index,
+                float(
+                    self._delayed_mention_adjustment(item, adaptive_adjustments).get(
+                        "effective_turn_prob",
+                        0.0,
+                    )
+                    or 0.0
                 ),
                 item.latest_turn,
                 item.earliest_turn,
@@ -2060,6 +2993,7 @@ class RecursiveConclusionSession:
         due_intents: Optional[list[DeferredIntent]] = None,
         injected_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
         suppressed_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
+        adaptive_delayed_mention_adjustments: Optional[dict[str, dict[str, Any]]] = None,
     ) -> str:
         parts: list[str] = []
         base = compact_text(self.config.base_system)
@@ -2124,22 +3058,29 @@ class RecursiveConclusionSession:
                 )
 
         if suppressed_delayed_mentions:
-            threshold = self._delayed_mention_leak_threshold()
-            bullets = "\n".join(
-                (
-                    f"- [{item.item_id}] p_now="
-                    f"{hazard_turn_probability(item.hazard_profile, created_turn=item.created_turn, turn_index=self.turn_index):.2f} "
-                    f"| {item.text}"
+            bullets_parts: list[str] = []
+            for item in suppressed_delayed_mentions:
+                adjustment = self._delayed_mention_adjustment(
+                    item,
+                    adaptive_delayed_mention_adjustments,
                 )
-                for item in suppressed_delayed_mentions
-            )
+                p_base = clamp01(adjustment.get("base_turn_prob"), default=0.0)
+                p_eff = clamp01(adjustment.get("effective_turn_prob"), default=p_base)
+                threshold = clamp01(
+                    adjustment.get("effective_threshold"),
+                    default=self._delayed_mention_leak_threshold(),
+                )
+                bullets_parts.append(
+                    f"- [{item.item_id}] p_base={p_base:.2f} p_eff={p_eff:.2f} threshold={threshold:.2f} | {item.text}"
+                )
+            bullets = "\n".join(bullets_parts)
             parts.append(
                 "Delayed mention targets currently remain latent (private; do NOT surface them explicitly yet):\n"
                 f"{bullets}\n\n"
                 "Rules:\n"
-                f"- Do not quote, paraphrase, or explicitly state these targets while their current turn probability stays below {threshold:.2f}.\n"
+                "- Do not quote, paraphrase, or explicitly state these targets while their current effective turn probability stays below the listed threshold.\n"
                 "- They may still shape internal trajectory, question choice, and ordering.\n"
-                "- Only surface them when they appear in a due-now section or their current turn probability clears the threshold."
+                "- Only surface them when they appear in a due-now section or their current effective turn probability clears the threshold."
             )
 
         if (
@@ -2364,6 +3305,7 @@ class RecursiveConclusionSession:
                         delay_strategy=delay_strategy,
                         delay_signals=list(delay_signals),
                         delay_rationale=delay_rationale,
+                        release_stage_role="conclusion",
                         status="active",
                     )
                     self.delayed_mentions.append(conclusion_plan_item)
@@ -2386,6 +3328,7 @@ class RecursiveConclusionSession:
                     existing.delay_strategy = delay_strategy
                     existing.delay_signals = list(delay_signals)
                     existing.delay_rationale = delay_rationale
+                    existing.release_stage_role = "conclusion"
                     existing.mention_turn = None
                     existing.terminal_reason = ""
                     conclusion_plan_item = existing
@@ -2440,82 +3383,58 @@ class RecursiveConclusionSession:
             return []
 
         limit = max(0, int(self.config.delayed_mention_item_limit))
-        source = textwrap.dedent(
-            f"""\
-            Memory capsules:
-            {render_capsules(self.memory_capsules)}
-
-            Recent dialogue window:
-            {render_messages(self._recent_window())}
-
-            Identify up to {limit} "delayed mention targets" that the assistant is likely to bring up later,
-            but should NOT mention immediately. These are not tasks; they are items that become relevant later.
-
-            Return STRICT JSON (no markdown, no code fences):
-            {{
-              "items": [
-                {{
-                  "kind": "caveat|definition|option|constraint|conclusion|other",
-                  "text": "<what to mention later (1-2 sentences max)>",
-                  "keywords": ["<3-5 distinctive phrases>"],
-                  "mention_delay_min_turns": <int>,
-                  "mention_delay_max_turns": <int>,
-                  "mention_hazard_profile": [{{"delay_turns": <int>=0, "prob": <0.00-1.00>}}, ...],
-                  "mention_likelihood": <0.00-1.00>,
-                  "delay_strategy": "<short label>",
-                  "delay_signals": ["<2-6 short tags>"],
-                  "delay_rationale": "<=140 chars; no chain-of-thought>"
-                }}
-              ]
-            }}
-            """
-        ).strip()
-
-        response = self.adapter.generate(
-            system=(
-                "Delayed mention planner. You observe dialogue trajectory and propose future mention targets. "
-                "Do not answer the user directly."
-            ),
-            messages=[ChatMessage(role="user", content=source)],
-            config=self.config.probe_config,
+        min_nonconclusion_items = min(
+            limit,
+            max(0, int(self.config.delayed_mention_min_nonconclusion_items or 0)),
         )
-        raw = (response.text or "").strip()
-        parsed = extract_json_value(raw)
-        if not isinstance(parsed, dict):
-            self._log(
-                "delayed_mention_plan_error",
-                {
-                    "error": "Planner output was not a JSON object.",
-                    "raw": raw,
-                    "usage": response.usage,
-                    "finish_reason": response.finish_reason,
-                    "request_id": response.request_id,
-                },
-            )
-            return []
-        items_raw = parsed.get("items")
-        if not isinstance(items_raw, list):
-            self._log(
-                "delayed_mention_plan_error",
-                {
-                    "error": "JSON must contain list field 'items'.",
-                    "raw": raw,
-                    "parsed_type": type(parsed.get("items")).__name__,
-                    "usage": response.usage,
-                    "finish_reason": response.finish_reason,
-                    "request_id": response.request_id,
-                },
-            )
-            return []
+        min_kind_diversity = min(
+            limit,
+            max(1, int(self.config.delayed_mention_min_kind_diversity or 1)),
+        )
+        diversity_repair = (
+            self.config.delayed_mention_diversity_repair
+            == DelayedMentionDiversityRepairPolicy.ON
+        )
+        planner_probe_max_tokens = max(
+            int(self.config.probe_config.max_tokens or 0),
+            150 + 90 * limit,
+        )
 
-        created: list[DelayedMentionItem] = []
-        for item_raw in items_raw[:limit]:
-            if not isinstance(item_raw, dict):
-                continue
+        def probe_config_with_budget(min_max_tokens: int) -> GenerationConfig:
+            return GenerationConfig(
+                temperature=self.config.probe_config.temperature,
+                max_tokens=max(int(self.config.probe_config.max_tokens or 0), min_max_tokens),
+                timeout_seconds=self.config.probe_config.timeout_seconds,
+            )
+
+        def summarize_plan(items: list[DelayedMentionItem]) -> dict[str, Any]:
+            kind_counts = count_strings(item.kind for item in items)
+            kind_diversity = len(kind_counts)
+            nonconclusion_count = sum(1 for item in items if item.kind != "conclusion")
+            return {
+                "min_nonconclusion_items": min_nonconclusion_items,
+                "min_kind_diversity": min_kind_diversity,
+                "nonconclusion_count": nonconclusion_count,
+                "kind_diversity": kind_diversity,
+                "kind_counts": kind_counts or None,
+                "satisfies_nonconclusion_min": (
+                    nonconclusion_count >= min_nonconclusion_items
+                ),
+                "satisfies_kind_diversity_min": kind_diversity >= min_kind_diversity,
+            }
+
+        def build_item_from_raw(
+            item_raw: dict[str, Any],
+            *,
+            allow_conclusion: bool = True,
+        ) -> Optional[DelayedMentionItem]:
             text = compact_text(str(item_raw.get("text") or ""))
             if not text:
-                continue
+                return None
             kind = truncate_text(item_raw.get("kind") or "other", 24) or "other"
+            kind = compact_text(kind).lower() or "other"
+            if not allow_conclusion and kind == "conclusion":
+                return None
             keywords = coerce_str_list(item_raw.get("keywords"))
             keywords = [truncate_text(x, 64) for x in keywords if x][:5]
 
@@ -2535,10 +3454,28 @@ class RecursiveConclusionSession:
             delay_signals = coerce_str_list(item_raw.get("delay_signals"))
             delay_signals = [truncate_text(x, 80) for x in delay_signals if x][:6]
             delay_rationale = truncate_text(item_raw.get("delay_rationale") or "", 160)
+            release_stage_role = classify_delayed_mention_stage_role(
+                kind=kind,
+                text=text,
+                delay_strategy=delay_strategy,
+                delay_signals=delay_signals,
+            )
+            mention_hazard_profile = reshape_stage_role_hazard_profile(
+                policy=self.config.adaptive_hazard_stage_policy,
+                stage_role=release_stage_role,
+                profile=mention_hazard_profile,
+            )
+            delay_min, delay_max = [
+                x - self.turn_index
+                for x in hazard_bounds_from_profile(
+                    created_turn=self.turn_index,
+                    profile=mention_hazard_profile,
+                )
+            ]
 
             item_id = f"dm-{self.next_delayed_mention_index:04d}"
             self.next_delayed_mention_index += 1
-            item = DelayedMentionItem(
+            return DelayedMentionItem(
                 item_id=item_id,
                 created_turn=self.turn_index,
                 kind=kind,
@@ -2551,10 +3488,263 @@ class RecursiveConclusionSession:
                 delay_strategy=delay_strategy,
                 delay_signals=delay_signals,
                 delay_rationale=delay_rationale,
+                release_stage_role=release_stage_role,
                 status="active",
             )
+
+        def merge_diverse_items(
+            primary: list[DelayedMentionItem],
+            supplemental: list[DelayedMentionItem],
+        ) -> list[DelayedMentionItem]:
+            combined = primary + supplemental
+            deduped: list[DelayedMentionItem] = []
+            seen_keys: set[str] = set()
+            for item in combined:
+                key = compact_text(item.text).lower()
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                deduped.append(item)
+
+            ordered = sorted(
+                deduped,
+                key=lambda item: (
+                    item.kind == "conclusion",
+                    -(item.likelihood or 0.0),
+                    item.latest_turn,
+                    item.item_id,
+                ),
+            )
+            selected: list[DelayedMentionItem] = []
+            selected_ids: set[str] = set()
+            seen_kinds: set[str] = set()
+            for item in ordered:
+                if len(selected) >= limit:
+                    break
+                if item.kind in seen_kinds:
+                    continue
+                selected.append(item)
+                selected_ids.add(item.item_id)
+                seen_kinds.add(item.kind)
+            for item in ordered:
+                if len(selected) >= limit:
+                    break
+                if item.item_id in selected_ids:
+                    continue
+                selected.append(item)
+                selected_ids.add(item.item_id)
+            return selected[:limit]
+
+        diversity_lines = [
+            "- Do not spend every slot on conclusion if other delayed targets are plausible.",
+            "- Separate conclusion from the supporting items that make it feel earned later.",
+        ]
+        if min_nonconclusion_items > 0:
+            diversity_lines.append(
+                f"- Return at least {min_nonconclusion_items} item(s) whose kind is not conclusion when plausible."
+            )
+        if min_kind_diversity > 1:
+            diversity_lines.append(
+                f"- Aim for at least {min_kind_diversity} distinct kinds across the returned items when plausible."
+            )
+        diversity_lines.append(
+            "- Useful non-conclusion kinds include caveat, option, constraint, definition, and migration risk."
+        )
+        diversity_guidance = "\n".join(diversity_lines)
+        compact_output_rules = "\n".join(
+            [
+                "- Keep each text to one short sentence or phrase, at most 18 words.",
+                "- Use 1-3 short keywords only.",
+                "- Use at most 2 hazard points per item.",
+                "- Omit delay_signals and delay_rationale unless truly needed.",
+                "- Prefer compact kind labels and compact delay_strategy labels.",
+            ]
+        )
+        source = textwrap.dedent(
+            f"""\
+            Memory capsules:
+            {render_capsules(self.memory_capsules)}
+
+            Recent dialogue window:
+            {render_messages(self._recent_window())}
+
+            Identify up to {limit} "delayed mention targets" that the assistant is likely to bring up later,
+            but should NOT mention immediately. These are not tasks; they are items that become relevant later.
+
+            Diversity requirements:
+            {diversity_guidance}
+
+            Compact output rules:
+            {compact_output_rules}
+
+            Return STRICT JSON (no markdown, no code fences):
+            {{
+              "items": [
+                {{
+                  "kind": "caveat|definition|option|constraint|migration_risk|conclusion|other",
+                  "text": "<short delayed mention target>",
+                  "keywords": ["<1-3 short phrases>"],
+                  "mention_hazard_profile": [{{"delay_turns": <int>=1, "prob": <0.00-1.00>}}, ...],
+                  "mention_likelihood": <0.00-1.00>,
+                  "delay_strategy": "<short label>"
+                }}
+              ]
+            }}
+            """
+        ).strip()
+
+        response = self.adapter.generate(
+            system=(
+                "Delayed mention planner. You observe dialogue trajectory and propose future mention targets. "
+                "Do not answer the user directly."
+            ),
+            messages=[ChatMessage(role="user", content=source)],
+            config=probe_config_with_budget(planner_probe_max_tokens),
+        )
+        raw = (response.text or "").strip()
+        parsed = extract_json_value(raw)
+        if not isinstance(parsed, dict):
+            self._log(
+                "delayed_mention_plan_error",
+                {
+                    "error": "Planner output was not a JSON object.",
+                    "raw": raw,
+                    "usage": response.usage,
+                    "finish_reason": response.finish_reason,
+                    "request_id": response.request_id,
+                    "probe_max_tokens": planner_probe_max_tokens,
+                },
+            )
+            return []
+        items_raw = parsed.get("items")
+        if not isinstance(items_raw, list):
+            self._log(
+                "delayed_mention_plan_error",
+                {
+                    "error": "JSON must contain list field 'items'.",
+                    "raw": raw,
+                    "parsed_type": type(parsed.get("items")).__name__,
+                    "usage": response.usage,
+                    "finish_reason": response.finish_reason,
+                    "request_id": response.request_id,
+                    "probe_max_tokens": planner_probe_max_tokens,
+                },
+            )
+            return []
+
+        created: list[DelayedMentionItem] = []
+        for item_raw in items_raw[:limit]:
+            if not isinstance(item_raw, dict):
+                continue
+            item = build_item_from_raw(item_raw)
+            if item is not None:
+                created.append(item)
+
+        repair_payload: Optional[dict[str, Any]] = None
+        plan_validation = summarize_plan(created)
+        if created and diversity_repair and (
+            not plan_validation["satisfies_nonconclusion_min"]
+            or not plan_validation["satisfies_kind_diversity_min"]
+        ):
+            missing_nonconclusion = max(
+                0,
+                min_nonconclusion_items - int(plan_validation["nonconclusion_count"] or 0),
+            )
+            missing_kind_diversity = max(
+                0,
+                min_kind_diversity - int(plan_validation["kind_diversity"] or 0),
+            )
+            repair_limit = min(limit, max(1, missing_nonconclusion, missing_kind_diversity))
+            repair_probe_max_tokens = max(
+                int(self.config.probe_config.max_tokens or 0),
+                120 + 80 * repair_limit,
+            )
+            used_kinds = sorted(
+                str(kind)
+                for kind in (plan_validation.get("kind_counts") or {}).keys()
+                if kind
+            )
+            repair_source = textwrap.dedent(
+                f"""\
+                Recent dialogue window:
+                {render_messages(self._recent_window())}
+
+                Your previous delayed-mention plan under-produced non-conclusion diversity.
+                Existing kinds: {", ".join(used_kinds) if used_kinds else "(none)"}
+                Existing plan:
+                {json.dumps([item.to_dict() for item in created], ensure_ascii=False, indent=2)}
+
+                Return up to {repair_limit} ADDITIONAL delayed mention targets that are NOT conclusion.
+                Requirements:
+                - Every item must use a kind other than conclusion.
+                - Prefer kinds not already used.
+                - Prioritize caveat, option, constraint, definition, migration_risk, or other concrete release-time support items.
+                - Do not repeat the existing items too closely.
+                - Keep each text to one short sentence or phrase, at most 18 words.
+                - Use 1-3 short keywords and at most 2 hazard points.
+                - Omit delay_signals and delay_rationale unless truly needed.
+
+                Return STRICT JSON (no markdown, no code fences):
+                {{
+                  "items": [
+                    {{
+                      "kind": "caveat|definition|option|constraint|migration_risk|other",
+                      "text": "<short delayed mention target>",
+                      "keywords": ["<1-3 short phrases>"],
+                      "mention_hazard_profile": [{{"delay_turns": <int>=1, "prob": <0.00-1.00>}}, ...],
+                      "mention_likelihood": <0.00-1.00>,
+                      "delay_strategy": "<short label>"
+                    }}
+                  ]
+                }}
+                """
+            ).strip()
+            repair_response = self.adapter.generate(
+                system=(
+                    "Delayed mention diversity repair planner. Generate only supplemental non-conclusion "
+                    "delayed mentions. Do not answer the user directly."
+                ),
+                messages=[ChatMessage(role="user", content=repair_source)],
+                config=probe_config_with_budget(repair_probe_max_tokens),
+            )
+            repair_raw = (repair_response.text or "").strip()
+            repair_parsed = extract_json_value(repair_raw)
+            repair_created: list[DelayedMentionItem] = []
+            repair_error: Optional[str] = None
+            if not isinstance(repair_parsed, dict):
+                repair_error = "Repair planner output was not a JSON object."
+            else:
+                repair_items_raw = repair_parsed.get("items")
+                if not isinstance(repair_items_raw, list):
+                    repair_error = "Repair JSON must contain list field 'items'."
+                else:
+                    for item_raw in repair_items_raw[:repair_limit]:
+                        if not isinstance(item_raw, dict):
+                            continue
+                        item = build_item_from_raw(item_raw, allow_conclusion=False)
+                        if item is not None:
+                            repair_created.append(item)
+            if repair_created:
+                created = merge_diverse_items(created, repair_created)
+            plan_validation = summarize_plan(created)
+            repair_payload = {
+                "requested_limit": repair_limit,
+                "missing_nonconclusion": missing_nonconclusion,
+                "missing_kind_diversity": missing_kind_diversity,
+                "created_count": len(repair_created),
+                "created_items": [item.to_dict() for item in repair_created],
+                "error": repair_error,
+                "raw": repair_raw,
+                "usage": repair_response.usage,
+                "finish_reason": repair_response.finish_reason,
+                "request_id": repair_response.request_id,
+                "probe_max_tokens": repair_probe_max_tokens,
+                "final_plan_validation": plan_validation,
+            }
+            self._log("delayed_mention_diversity_repair", repair_payload)
+
+        for item in created:
             self.delayed_mentions.append(item)
-            created.append(item)
 
         self._log(
             "delayed_mention_plan",
@@ -2563,12 +3753,28 @@ class RecursiveConclusionSession:
                 "created": bool(created),
                 "created_items": [item.to_dict() for item in created],
                 "created_count": len(created),
+                "plan_validation": plan_validation,
+                "diversity_repair_policy": self.config.delayed_mention_diversity_repair.value,
+                "diversity_repair_applied": repair_payload is not None,
                 "raw": raw,
                 "usage": response.usage,
                 "finish_reason": response.finish_reason,
                 "request_id": response.request_id,
+                "probe_max_tokens": planner_probe_max_tokens,
             },
         )
+        if created and (
+            not plan_validation["satisfies_nonconclusion_min"]
+            or not plan_validation["satisfies_kind_diversity_min"]
+        ):
+            self._log(
+                "delayed_mention_plan_warning",
+                {
+                    "warning": "Planner output did not satisfy delayed-mention diversity targets.",
+                    "plan_validation": plan_validation,
+                    "created_items": [item.to_dict() for item in created],
+                },
+            )
         return created
 
     def _probe_latent_convergence(
@@ -2620,7 +3826,7 @@ class RecursiveConclusionSession:
             """
         ).strip()
 
-        response = self.adapter.generate(
+        response = self.observer_adapter.generate(
             system=(
                 "Latent convergence trace. You observe dialogue dynamics and estimate semantic convergence "
                 "toward the latest conclusion without answering the user."
@@ -2652,6 +3858,9 @@ class RecursiveConclusionSession:
             "conclusion_line": conclusion_text,
             "planned_earliest_turn": planned_earliest_turn,
             "planned_latest_turn": planned_latest_turn,
+            "judge_source": self.latent_judge_source,
+            "judge_provider": self.observer_adapter.provider_name,
+            "judge_model": self.observer_adapter.model,
             "alignment": alignment,
             "articulation_readiness": readiness,
             "leakage_risk": leakage_risk,
@@ -2670,6 +3879,79 @@ class RecursiveConclusionSession:
         }
         self.latest_latent_convergence_trace = payload
         self._log("latent_convergence_trace", payload)
+        return payload
+
+    def _probe_embedding_convergence(
+        self,
+        *,
+        assistant_text: str,
+        planned_earliest_turn: Optional[int],
+        planned_latest_turn: Optional[int],
+        explicit_mention_present: Optional[bool],
+    ) -> Optional[dict[str, Any]]:
+        if self.config.latent_convergence_every <= 0:
+            return None
+        if self.turn_index == 0 or self.turn_index % self.config.latent_convergence_every != 0:
+            return None
+        if self.config.semantic_judge_backend not in {
+            SemanticJudgeBackend.EMBEDDING,
+            SemanticJudgeBackend.BOTH,
+        }:
+            return None
+        if self.embedding_adapter is None:
+            return None
+
+        conclusion_text = strip_conclusion_prefix(self.latest_conclusion_line)
+        if not conclusion_text:
+            return None
+
+        keyword_text = "; ".join(self.latest_conclusion_keywords or [])
+        inputs = [assistant_text, conclusion_text]
+        keyword_index: Optional[int] = None
+        if keyword_text:
+            keyword_index = len(inputs)
+            inputs.append(keyword_text)
+
+        response = self.embedding_adapter.embed(
+            inputs=inputs,
+            config=self.config.probe_config,
+        )
+        if len(response.embeddings) != len(inputs):
+            return None
+
+        assistant_vec = response.embeddings[0]
+        conclusion_vec = response.embeddings[1]
+        line_alignment = cosine_alignment(assistant_vec, conclusion_vec)
+        keyword_alignment = (
+            cosine_alignment(assistant_vec, response.embeddings[keyword_index])
+            if keyword_index is not None
+            else None
+        )
+        alignment_candidates = [
+            value
+            for value in (line_alignment, keyword_alignment)
+            if isinstance(value, float)
+        ]
+        alignment = max(alignment_candidates) if alignment_candidates else None
+        payload = {
+            "conclusion_probe_turn": self.latest_conclusion_probe_turn,
+            "conclusion_line": conclusion_text,
+            "planned_earliest_turn": planned_earliest_turn,
+            "planned_latest_turn": planned_latest_turn,
+            "judge_source": "embedding",
+            "judge_provider": self.embedding_adapter.provider_name,
+            "judge_model": self.embedding_adapter.model,
+            "alignment": alignment,
+            "line_alignment": line_alignment,
+            "keyword_alignment": keyword_alignment,
+            "alignment_rule": "max",
+            "explicit_mention_present": explicit_mention_present,
+            "raw": response.raw,
+            "usage": response.usage,
+            "request_id": response.request_id,
+        }
+        self.latest_embedding_convergence_trace = payload
+        self._log("embedding_convergence_trace", payload)
         return payload
 
     def _probe_deferred_intent_plans(self) -> list[DeferredIntent]:
@@ -3204,7 +4486,12 @@ class RecursiveConclusionSession:
         memory_capsule = self._probe_memory_capsule()
         conclusion = self._probe_conclusion()
         planned_delayed_mentions = self._probe_delayed_mentions()
-        due_delayed_mentions = self._due_delayed_mentions()
+        adaptive_delayed_mention_adjustments, adaptive_conclusion_hazard = (
+            self._build_adaptive_hazard_trace()
+        )
+        due_delayed_mentions = self._due_delayed_mentions(
+            adaptive_adjustments=adaptive_delayed_mention_adjustments
+        )
         injected_delayed_mentions: list[DelayedMentionItem] = []
         delayed_mention_fire_prob = max(
             0.0, min(1.0, float(self.config.delayed_mention_fire_prob or 0.0))
@@ -3220,10 +4507,12 @@ class RecursiveConclusionSession:
             due_sorted = sorted(
                 due_delayed_mentions,
                 key=lambda item: (
-                    -hazard_turn_probability(
-                        item.hazard_profile,
-                        created_turn=item.created_turn,
-                        turn_index=self.turn_index,
+                    -float(
+                        self._delayed_mention_adjustment(
+                            item,
+                            adaptive_delayed_mention_adjustments,
+                        ).get("effective_turn_prob", 0.0)
+                        or 0.0
                     ),
                     item.latest_turn,
                     item.earliest_turn,
@@ -3233,21 +4522,23 @@ class RecursiveConclusionSession:
             for item in due_sorted:
                 if len(injected_delayed_mentions) >= delayed_mention_fire_max_items:
                     break
-                hazard_turn_prob = (
-                    hazard_turn_probability(
-                        item.hazard_profile,
-                        created_turn=item.created_turn,
-                        turn_index=self.turn_index,
-                    )
-                    if item.hazard_profile
-                    else None
+                adjustment = self._delayed_mention_adjustment(
+                    item,
+                    adaptive_delayed_mention_adjustments,
+                )
+                hazard_turn_prob = clamp01(adjustment.get("base_turn_prob"), default=0.0)
+                adaptive_hazard_turn_prob = clamp01(
+                    adjustment.get("effective_turn_prob"),
+                    default=hazard_turn_prob,
                 )
                 effective_prob = delayed_mention_fire_prob
                 hazard_points = hazard_support_size(item.hazard_profile)
-                if isinstance(hazard_turn_prob, float):
+                if isinstance(adaptive_hazard_turn_prob, float):
                     effective_prob = min(
                         1.0,
-                        delayed_mention_fire_prob * max(1, hazard_points) * hazard_turn_prob,
+                        delayed_mention_fire_prob
+                        * max(1, hazard_points)
+                        * adaptive_hazard_turn_prob,
                     )
                 hazard_peak_prob = (
                     hazard_peak_probability(item.hazard_profile) if item.hazard_profile else None
@@ -3258,12 +4549,30 @@ class RecursiveConclusionSession:
                     {
                         "item_id": item.item_id,
                         "kind": item.kind,
+                        "release_stage_role": item.release_stage_role,
                         "draw": draw,
                         "prob": effective_prob,
                         "base_prob": delayed_mention_fire_prob,
                         "hazard_profile": list(item.hazard_profile),
                         "hazard_turn_prob": hazard_turn_prob,
+                        "adaptive_hazard_turn_prob": adaptive_hazard_turn_prob,
+                        "adaptive_hazard_multiplier": adjustment.get("turn_prob_multiplier"),
+                        "adaptive_hazard_threshold": adjustment.get("effective_threshold"),
+                        "adaptive_hazard_threshold_shift": adjustment.get("threshold_shift"),
+                        "adaptive_embedding_prepeak_penalty": adjustment.get(
+                            "embedding_prepeak_penalty"
+                        ),
+                        "adaptive_embedding_prepeak_peak_gap_factor": adjustment.get(
+                            "embedding_prepeak_peak_gap_factor"
+                        ),
+                        "adaptive_hazard_stage_policy": adjustment.get(
+                            "adaptive_hazard_stage_policy"
+                        ),
+                        "adaptive_hazard_reasons": list(adjustment.get("reasons") or []),
                         "hazard_peak_prob": hazard_peak_prob,
+                        "adaptive_peak_support_ratio": adjustment.get("peak_support_ratio"),
+                        "adaptive_before_peak": adjustment.get("before_peak"),
+                        "adaptive_at_peak": adjustment.get("at_peak"),
                         "hazard_support_size": hazard_points or None,
                         "inject": inject,
                     }
@@ -3276,7 +4585,8 @@ class RecursiveConclusionSession:
         deferred_actions: list[dict[str, Any]] = []
         ablation_actions: list[dict[str, Any]] = []
         suppressed_delayed_mentions = self._suppressed_delayed_mentions(
-            injected_delayed_mentions=injected_delayed_mentions
+            injected_delayed_mentions=injected_delayed_mentions,
+            adaptive_adjustments=adaptive_delayed_mention_adjustments,
         )
         inband_state: Optional[dict[str, Any]] = None
         inband_state_error: Optional[str] = None
@@ -3320,6 +4630,7 @@ class RecursiveConclusionSession:
                 due_intents=None,
                 injected_delayed_mentions=injected_delayed_mentions,
                 suppressed_delayed_mentions=suppressed_delayed_mentions,
+                adaptive_delayed_mention_adjustments=adaptive_delayed_mention_adjustments,
             )
             prev_assistant = next(
                 (m for m in reversed(self.history[:-1]) if m.role == "assistant"),
@@ -3949,6 +5260,7 @@ class RecursiveConclusionSession:
                 due_intents=due_intents,
                 injected_delayed_mentions=injected_delayed_mentions,
                 suppressed_delayed_mentions=suppressed_delayed_mentions,
+                adaptive_delayed_mention_adjustments=adaptive_delayed_mention_adjustments,
             )
             reply = self.adapter.generate(
                 system=system_prompt or None,
@@ -4026,13 +5338,59 @@ class RecursiveConclusionSession:
                 created_turn=self.latest_conclusion_probe_turn,
                 turn_index=self.turn_index,
             )
+        latest_conclusion_plan_adaptive_hazard_turn_prob: Optional[float] = None
+        latest_conclusion_plan_adaptive_multiplier: Optional[float] = None
+        latest_conclusion_plan_adaptive_threshold: Optional[float] = None
+        latest_conclusion_plan_adaptive_threshold_shift: Optional[float] = None
+        latest_conclusion_plan_adaptive_reasons: Optional[list[str]] = None
+        if isinstance(adaptive_conclusion_hazard, dict):
+            latest_conclusion_plan_adaptive_hazard_turn_prob = clamp01(
+                adaptive_conclusion_hazard.get("effective_turn_prob"),
+                default=latest_conclusion_plan_hazard_turn_prob or 0.0,
+            )
+            multiplier = adaptive_conclusion_hazard.get("turn_prob_multiplier")
+            if isinstance(multiplier, (int, float)):
+                latest_conclusion_plan_adaptive_multiplier = float(multiplier)
+            adaptive_threshold = adaptive_conclusion_hazard.get("effective_threshold")
+            if isinstance(adaptive_threshold, (int, float)):
+                latest_conclusion_plan_adaptive_threshold = float(adaptive_threshold)
+            threshold_shift = adaptive_conclusion_hazard.get("threshold_shift")
+            if isinstance(threshold_shift, (int, float)):
+                latest_conclusion_plan_adaptive_threshold_shift = float(threshold_shift)
+            reasons = adaptive_conclusion_hazard.get("reasons") or []
+            if isinstance(reasons, list):
+                latest_conclusion_plan_adaptive_reasons = [
+                    str(reason) for reason in reasons if reason
+                ]
 
-        latent_convergence = self._probe_latent_convergence(
+        latent_convergence = None
+        if self.config.semantic_judge_backend in {
+            SemanticJudgeBackend.LLM,
+            SemanticJudgeBackend.BOTH,
+        }:
+            latent_convergence = self._probe_latent_convergence(
+                assistant_text=assistant_text,
+                planned_earliest_turn=latest_conclusion_plan_earliest_turn,
+                planned_latest_turn=latest_conclusion_plan_latest_turn,
+                explicit_mention_present=latest_conclusion_mentioned_any,
+            )
+        embedding_convergence = self._probe_embedding_convergence(
             assistant_text=assistant_text,
             planned_earliest_turn=latest_conclusion_plan_earliest_turn,
             planned_latest_turn=latest_conclusion_plan_latest_turn,
             explicit_mention_present=latest_conclusion_mentioned_any,
         )
+        semantic_judge_alignment_gap: Optional[float] = None
+        if (
+            isinstance(latent_convergence, dict)
+            and isinstance(embedding_convergence, dict)
+            and isinstance(latent_convergence.get("alignment"), (int, float))
+            and isinstance(embedding_convergence.get("alignment"), (int, float))
+        ):
+            semantic_judge_alignment_gap = abs(
+                float(latent_convergence.get("alignment"))
+                - float(embedding_convergence.get("alignment"))
+            )
 
         injected_delayed_mention_ids = {item.item_id for item in injected_delayed_mentions}
         delayed_mention_actions: list[dict[str, Any]] = []
@@ -4041,15 +5399,19 @@ class RecursiveConclusionSession:
                 continue
             overlap_score = lexical_overlap(item.text, assistant_text)
             hits = keyword_hits(item.keywords, assistant_text) if item.keywords else None
-            hazard_turn_prob = (
-                hazard_turn_probability(
-                    item.hazard_profile,
-                    created_turn=item.created_turn,
-                    turn_index=self.turn_index,
-                )
-                if item.hazard_profile
-                else None
+            adjustment = self._delayed_mention_adjustment(
+                item,
+                adaptive_delayed_mention_adjustments,
             )
+            hazard_turn_prob = clamp01(adjustment.get("base_turn_prob"), default=0.0)
+            adaptive_hazard_turn_prob = clamp01(
+                adjustment.get("effective_turn_prob"),
+                default=hazard_turn_prob,
+            )
+            adaptive_hazard_multiplier = adjustment.get("turn_prob_multiplier")
+            adaptive_hazard_threshold = adjustment.get("effective_threshold")
+            adaptive_hazard_threshold_shift = adjustment.get("threshold_shift")
+            adaptive_hazard_reasons = list(adjustment.get("reasons") or [])
             required_hits: Optional[int] = None
             keyword_mentioned = False
             if item.keywords:
@@ -4068,6 +5430,7 @@ class RecursiveConclusionSession:
                 action = {
                     "item_id": item.item_id,
                     "kind": item.kind,
+                    "release_stage_role": item.release_stage_role,
                     "action": "mention",
                     "status_before": "active",
                     "status_after": item.status,
@@ -4077,6 +5440,31 @@ class RecursiveConclusionSession:
                     "latest_turn": item.latest_turn,
                     "hazard_profile": list(item.hazard_profile),
                     "hazard_turn_prob": hazard_turn_prob,
+                    "adaptive_hazard_turn_prob": adaptive_hazard_turn_prob,
+                    "adaptive_hazard_multiplier": adaptive_hazard_multiplier,
+                    "adaptive_hazard_threshold": adaptive_hazard_threshold,
+                    "adaptive_hazard_threshold_shift": adaptive_hazard_threshold_shift,
+                    "adaptive_embedding_prepeak_penalty": adjustment.get(
+                        "embedding_prepeak_penalty"
+                    ),
+                    "adaptive_embedding_prepeak_peak_gap_factor": adjustment.get(
+                        "embedding_prepeak_peak_gap_factor"
+                    ),
+                    "adaptive_hazard_stage_policy": adjustment.get(
+                        "adaptive_hazard_stage_policy"
+                    ),
+                    "adaptive_stage_boost_bias": adjustment.get("stage_boost_bias"),
+                    "adaptive_stage_suppress_bias": adjustment.get("stage_suppress_bias"),
+                    "adaptive_stage_threshold_bias": adjustment.get("stage_threshold_bias"),
+                    "adaptive_hazard_reasons": adaptive_hazard_reasons,
+                    "hazard_peak_prob": (
+                        hazard_peak_probability(item.hazard_profile)
+                        if item.hazard_profile
+                        else None
+                    ),
+                    "adaptive_peak_support_ratio": adjustment.get("peak_support_ratio"),
+                    "adaptive_before_peak": adjustment.get("before_peak"),
+                    "adaptive_at_peak": adjustment.get("at_peak"),
                     "mention_turn": item.mention_turn,
                     "delay_turns": (item.mention_turn or 0) - item.created_turn,
                     "within_window": item.earliest_turn <= self.turn_index <= item.latest_turn,
@@ -4093,6 +5481,7 @@ class RecursiveConclusionSession:
                 action = {
                     "item_id": item.item_id,
                     "kind": item.kind,
+                    "release_stage_role": item.release_stage_role,
                     "action": "expire",
                     "status_before": "active",
                     "status_after": item.status,
@@ -4102,6 +5491,31 @@ class RecursiveConclusionSession:
                     "latest_turn": item.latest_turn,
                     "hazard_profile": list(item.hazard_profile),
                     "hazard_turn_prob": hazard_turn_prob,
+                    "adaptive_hazard_turn_prob": adaptive_hazard_turn_prob,
+                    "adaptive_hazard_multiplier": adaptive_hazard_multiplier,
+                    "adaptive_hazard_threshold": adaptive_hazard_threshold,
+                    "adaptive_hazard_threshold_shift": adaptive_hazard_threshold_shift,
+                    "adaptive_embedding_prepeak_penalty": adjustment.get(
+                        "embedding_prepeak_penalty"
+                    ),
+                    "adaptive_embedding_prepeak_peak_gap_factor": adjustment.get(
+                        "embedding_prepeak_peak_gap_factor"
+                    ),
+                    "adaptive_hazard_stage_policy": adjustment.get(
+                        "adaptive_hazard_stage_policy"
+                    ),
+                    "adaptive_stage_boost_bias": adjustment.get("stage_boost_bias"),
+                    "adaptive_stage_suppress_bias": adjustment.get("stage_suppress_bias"),
+                    "adaptive_stage_threshold_bias": adjustment.get("stage_threshold_bias"),
+                    "adaptive_hazard_reasons": adaptive_hazard_reasons,
+                    "hazard_peak_prob": (
+                        hazard_peak_probability(item.hazard_profile)
+                        if item.hazard_profile
+                        else None
+                    ),
+                    "adaptive_peak_support_ratio": adjustment.get("peak_support_ratio"),
+                    "adaptive_before_peak": adjustment.get("before_peak"),
+                    "adaptive_at_peak": adjustment.get("at_peak"),
                     "mention_turn": None,
                     "delay_turns": None,
                     "within_window": False,
@@ -4150,6 +5564,15 @@ class RecursiveConclusionSession:
         payload = {
             "user": user_text,
             "assistant": assistant_text,
+            "semantic_judge_backend": self.config.semantic_judge_backend.value,
+            "adaptive_hazard_policy": self.config.adaptive_hazard_policy.value,
+            "adaptive_hazard_profile": self.config.adaptive_hazard_profile.value,
+            "adaptive_hazard_stage_policy": (
+                self.config.adaptive_hazard_stage_policy.value
+            ),
+            "adaptive_hazard_embedding_guard": (
+                self.config.adaptive_hazard_embedding_guard.value
+            ),
             "memory_capsule": memory_capsule,
             "conclusion_probe": conclusion,
             "conclusion_steer_strength": self.config.conclusion_steer_strength.value,
@@ -4174,6 +5597,21 @@ class RecursiveConclusionSession:
                 else None
             ),
             "latest_conclusion_plan_hazard_turn_prob": latest_conclusion_plan_hazard_turn_prob,
+            "latest_conclusion_plan_adaptive_hazard_turn_prob": (
+                latest_conclusion_plan_adaptive_hazard_turn_prob
+            ),
+            "latest_conclusion_plan_adaptive_multiplier": (
+                latest_conclusion_plan_adaptive_multiplier
+            ),
+            "latest_conclusion_plan_adaptive_threshold": (
+                latest_conclusion_plan_adaptive_threshold
+            ),
+            "latest_conclusion_plan_adaptive_threshold_shift": (
+                latest_conclusion_plan_adaptive_threshold_shift
+            ),
+            "latest_conclusion_plan_adaptive_reasons": (
+                latest_conclusion_plan_adaptive_reasons
+            ),
             "latest_conclusion_plan_likelihood": self.latest_conclusion_mention_likelihood,
             "latest_conclusion_plan_strategy": self.latest_conclusion_delay_strategy or None,
             "latest_conclusion_plan_signals": list(self.latest_conclusion_delay_signals or [])
@@ -4205,7 +5643,39 @@ class RecursiveConclusionSession:
             "latent_convergence_evidence": (
                 latent_convergence.get("evidence") if latent_convergence else None
             ),
+            "latent_convergence_judge_source": (
+                latent_convergence.get("judge_source") if latent_convergence else None
+            ),
+            "latent_convergence_judge_provider": (
+                latent_convergence.get("judge_provider") if latent_convergence else None
+            ),
+            "latent_convergence_judge_model": (
+                latent_convergence.get("judge_model") if latent_convergence else None
+            ),
             "latent_convergence_trace": latent_convergence,
+            "embedding_convergence_alignment": (
+                embedding_convergence.get("alignment") if embedding_convergence else None
+            ),
+            "embedding_convergence_line_alignment": (
+                embedding_convergence.get("line_alignment") if embedding_convergence else None
+            ),
+            "embedding_convergence_keyword_alignment": (
+                embedding_convergence.get("keyword_alignment")
+                if embedding_convergence
+                else None
+            ),
+            "embedding_convergence_judge_source": (
+                embedding_convergence.get("judge_source") if embedding_convergence else None
+            ),
+            "embedding_convergence_judge_provider": (
+                embedding_convergence.get("judge_provider") if embedding_convergence else None
+            ),
+            "embedding_convergence_judge_model": (
+                embedding_convergence.get("judge_model") if embedding_convergence else None
+            ),
+            "embedding_convergence_trace": embedding_convergence,
+            "semantic_judge_alignment_gap": semantic_judge_alignment_gap,
+            "adaptive_hazard_trace": self.latest_adaptive_hazard_trace,
             "planned_delayed_mentions": (
                 [item.to_dict() for item in planned_delayed_mentions]
                 if planned_delayed_mentions
@@ -4216,18 +5686,39 @@ class RecursiveConclusionSession:
                 {
                     "item_id": item.item_id,
                     "kind": item.kind,
+                    "release_stage_role": item.release_stage_role,
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
                     "hazard_profile": list(item.hazard_profile),
                     "hazard_turn_prob": (
-                        hazard_turn_probability(
-                            item.hazard_profile,
-                            created_turn=item.created_turn,
-                            turn_index=self.turn_index,
-                        )
-                        if item.hazard_profile
-                        else None
+                        self._delayed_mention_adjustment(
+                            item,
+                            adaptive_delayed_mention_adjustments,
+                        ).get("base_turn_prob")
+                    ),
+                    "adaptive_hazard_turn_prob": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("effective_turn_prob"),
+                    "adaptive_hazard_multiplier": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("turn_prob_multiplier"),
+                    "adaptive_hazard_threshold": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("effective_threshold"),
+                    "adaptive_hazard_threshold_shift": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("threshold_shift"),
+                    "adaptive_hazard_reasons": list(
+                        self._delayed_mention_adjustment(
+                            item,
+                            adaptive_delayed_mention_adjustments,
+                        ).get("reasons")
+                        or []
                     ),
                     "likelihood": item.likelihood,
                     "text": truncate_text(item.text, 140),
@@ -4238,18 +5729,39 @@ class RecursiveConclusionSession:
                 {
                     "item_id": item.item_id,
                     "kind": item.kind,
+                    "release_stage_role": item.release_stage_role,
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
                     "hazard_profile": list(item.hazard_profile),
                     "hazard_turn_prob": (
-                        hazard_turn_probability(
-                            item.hazard_profile,
-                            created_turn=item.created_turn,
-                            turn_index=self.turn_index,
-                        )
-                        if item.hazard_profile
-                        else None
+                        self._delayed_mention_adjustment(
+                            item,
+                            adaptive_delayed_mention_adjustments,
+                        ).get("base_turn_prob")
+                    ),
+                    "adaptive_hazard_turn_prob": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("effective_turn_prob"),
+                    "adaptive_hazard_multiplier": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("turn_prob_multiplier"),
+                    "adaptive_hazard_threshold": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("effective_threshold"),
+                    "adaptive_hazard_threshold_shift": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("threshold_shift"),
+                    "adaptive_hazard_reasons": list(
+                        self._delayed_mention_adjustment(
+                            item,
+                            adaptive_delayed_mention_adjustments,
+                        ).get("reasons")
+                        or []
                     ),
                     "likelihood": item.likelihood,
                     "text": truncate_text(item.text, 140),
@@ -4258,6 +5770,15 @@ class RecursiveConclusionSession:
             ],
             "delayed_mention_actions": delayed_mention_actions,
             "delayed_mention_mode": self.config.delayed_mention_mode.value,
+            "delayed_mention_min_nonconclusion_items": (
+                self.config.delayed_mention_min_nonconclusion_items
+            ),
+            "delayed_mention_min_kind_diversity": (
+                self.config.delayed_mention_min_kind_diversity
+            ),
+            "delayed_mention_diversity_repair": (
+                self.config.delayed_mention_diversity_repair.value
+            ),
             "delayed_mention_fire_prob": delayed_mention_fire_prob,
             "delayed_mention_fire_max_items": delayed_mention_fire_max_items,
             "delayed_mention_leak_policy": self.config.delayed_mention_leak_policy.value,
@@ -4266,16 +5787,42 @@ class RecursiveConclusionSession:
                 {
                     "item_id": item.item_id,
                     "kind": item.kind,
+                    "release_stage_role": item.release_stage_role,
                     "created_turn": item.created_turn,
                     "earliest_turn": item.earliest_turn,
                     "latest_turn": item.latest_turn,
                     "hazard_profile": list(item.hazard_profile),
-                    "hazard_turn_prob": hazard_turn_probability(
-                        item.hazard_profile,
-                        created_turn=item.created_turn,
-                        turn_index=self.turn_index,
+                    "hazard_turn_prob": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("base_turn_prob"),
+                    "adaptive_hazard_turn_prob": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("effective_turn_prob"),
+                    "adaptive_hazard_multiplier": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("turn_prob_multiplier"),
+                    "threshold": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("effective_threshold"),
+                    "base_threshold": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("base_threshold"),
+                    "adaptive_hazard_threshold_shift": self._delayed_mention_adjustment(
+                        item,
+                        adaptive_delayed_mention_adjustments,
+                    ).get("threshold_shift"),
+                    "adaptive_hazard_reasons": list(
+                        self._delayed_mention_adjustment(
+                            item,
+                            adaptive_delayed_mention_adjustments,
+                        ).get("reasons")
+                        or []
                     ),
-                    "threshold": self._delayed_mention_leak_threshold(),
                     "likelihood": item.likelihood,
                     "text": truncate_text(item.text, 140),
                 }
@@ -4367,6 +5914,21 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         conclusion_steer_injection=ConclusionSteerInjection(args.conclusion_steer_injection),
         delayed_mention_every=getattr(args, "delayed_mention_every", 0),
         delayed_mention_item_limit=max(0, int(getattr(args, "delayed_mention_item_limit", 3) or 0)),
+        delayed_mention_min_nonconclusion_items=max(
+            0,
+            int(getattr(args, "delayed_mention_min_nonconclusion_items", 1) or 0),
+        ),
+        delayed_mention_min_kind_diversity=max(
+            1,
+            int(getattr(args, "delayed_mention_min_kind_diversity", 2) or 1),
+        ),
+        delayed_mention_diversity_repair=DelayedMentionDiversityRepairPolicy(
+            getattr(
+                args,
+                "delayed_mention_diversity_repair",
+                DelayedMentionDiversityRepairPolicy.ON.value,
+            )
+        ),
         delayed_mention_mode=DelayedMentionMode(
             getattr(args, "delayed_mention_mode", DelayedMentionMode.OBSERVE.value)
         ),
@@ -4385,8 +5947,35 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
             getattr(args, "delayed_mention_leak_threshold", 0.05),
             default=0.05,
         ),
+        adaptive_hazard_policy=AdaptiveHazardPolicy(
+            getattr(args, "adaptive_hazard_policy", AdaptiveHazardPolicy.ADAPTIVE.value)
+        ),
+        adaptive_hazard_profile=AdaptiveHazardProfile(
+            getattr(
+                args,
+                "adaptive_hazard_profile",
+                AdaptiveHazardProfile.BALANCED.value,
+            )
+        ),
+        adaptive_hazard_stage_policy=AdaptiveHazardStagePolicy(
+            getattr(
+                args,
+                "adaptive_hazard_stage_policy",
+                AdaptiveHazardStagePolicy.FLAT.value,
+            )
+        ),
+        adaptive_hazard_embedding_guard=AdaptiveHazardEmbeddingGuard(
+            getattr(
+                args,
+                "adaptive_hazard_embedding_guard",
+                AdaptiveHazardEmbeddingGuard.OFF.value,
+            )
+        ),
         latent_convergence_every=max(
             0, int(getattr(args, "latent_convergence_every", 0) or 0)
+        ),
+        semantic_judge_backend=SemanticJudgeBackend(
+            getattr(args, "semantic_judge_backend", SemanticJudgeBackend.LLM.value)
         ),
         deferred_intent_every=args.deferred_intent_every,
         deferred_intent_mode=DeferredIntentMode(args.deferred_intent_mode),
@@ -4439,9 +6028,17 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
 
 def run_repl(args: argparse.Namespace) -> int:
     adapter = build_adapter(args.provider, args.model)
+    observer_adapter = build_optional_observer_adapter(args)
+    embedding_adapter = build_optional_embedding_adapter(args)
     cfg = make_experiment_config_from_args(args)
     log_path = Path(args.log) if args.log else None
-    session = RecursiveConclusionSession(adapter=adapter, config=cfg, log_path=log_path)
+    session = RecursiveConclusionSession(
+        adapter=adapter,
+        observer_adapter=observer_adapter,
+        embedding_adapter=embedding_adapter,
+        config=cfg,
+        log_path=log_path,
+    )
 
     print(f"[provider={adapter.provider_name} model={adapter.model}]")
     print("Type /exit to quit.\n")
@@ -4473,10 +6070,35 @@ def print_probe_outputs(result: dict[str, Any]) -> None:
     if isinstance(latent_trace, dict):
         print(
             "[latent convergence]\n"
+            f"judge={latent_trace.get('judge_source')} "
+            f"{latent_trace.get('judge_provider')}/{latent_trace.get('judge_model')} "
             f"alignment={latent_trace.get('alignment')} "
             f"readiness={latent_trace.get('articulation_readiness')} "
             f"leakage_risk={latent_trace.get('leakage_risk')} "
             f"stage={latent_trace.get('trajectory_stage')}\n"
+        )
+    embedding_trace = result.get("embedding_convergence_trace")
+    if isinstance(embedding_trace, dict):
+        print(
+            "[embedding convergence]\n"
+            f"judge={embedding_trace.get('judge_source')} "
+            f"{embedding_trace.get('judge_provider')}/{embedding_trace.get('judge_model')} "
+            f"alignment={embedding_trace.get('alignment')} "
+            f"line={embedding_trace.get('line_alignment')} "
+            f"keywords={embedding_trace.get('keyword_alignment')}\n"
+        )
+    adaptive_trace = result.get("adaptive_hazard_trace")
+    if isinstance(adaptive_trace, dict):
+        signals = adaptive_trace.get("signals") or {}
+        print(
+            "[adaptive hazard]\n"
+            f"policy={adaptive_trace.get('policy')} "
+            f"profile={adaptive_trace.get('profile')} "
+            f"alignment={signals.get('alignment')} "
+            f"readiness={signals.get('readiness')} "
+            f"leakage_risk={signals.get('leakage_risk')} "
+            f"judge_gap={signals.get('judge_gap')} "
+            f"stage={signals.get('trajectory_stage')}\n"
         )
 
     planned_delayed_mentions = result.get("planned_delayed_mentions") or []
@@ -4500,9 +6122,11 @@ def print_probe_outputs(result: dict[str, Any]) -> None:
             if not isinstance(item, dict):
                 continue
             turn_prob = item.get("hazard_turn_prob")
+            adaptive_turn_prob = item.get("adaptive_hazard_turn_prob")
             threshold = item.get("threshold")
             print(
-                f"- {item.get('item_id')}: p_now={float(turn_prob):.3f} "
+                f"- {item.get('item_id')}: p_base={float(turn_prob):.3f} "
+                f"p_eff={float(adaptive_turn_prob):.3f} "
                 f"threshold={float(threshold):.3f} | {item.get('text')}"
             )
         print()
@@ -4543,10 +6167,25 @@ def print_probe_outputs(result: dict[str, Any]) -> None:
         print()
 
 
-def write_summary_rows(path: Path, rows: list[dict[str, Any]]) -> Path:
+def write_summary_rows(path: Path, payload: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def derive_repeat_seed(
+    base_seed: Optional[int],
+    *,
+    arm_name: str,
+    provider: str,
+    model: str,
+    run_name: str,
+) -> Optional[int]:
+    if base_seed is None:
+        return None
+    material = f"{int(base_seed)}|{arm_name}|{provider}|{model}|{run_name}".encode("utf-8")
+    digest = hashlib.sha256(material).digest()
+    return int.from_bytes(digest[:8], "big") % (2**31)
 
 
 def build_compare_log_path(
@@ -4555,9 +6194,11 @@ def build_compare_log_path(
     provider: str,
     model: str,
     arm_name: str = "",
+    run_name: str = "",
 ) -> Path:
     prefix = f"arm_{sanitize_filename(arm_name)}___" if arm_name else ""
-    return out_dir / f"{prefix}{provider}__{sanitize_filename(model)}.jsonl"
+    suffix = f"__{sanitize_filename(run_name)}" if run_name else ""
+    return out_dir / f"{prefix}{provider}__{sanitize_filename(model)}{suffix}.jsonl"
 
 
 def write_compare_summary(
@@ -4565,12 +6206,19 @@ def write_compare_summary(
     rows: list[dict[str, Any]],
     *,
     arm_name: str = "",
+    run_name: str = "",
+    prefix: str = "summary",
 ) -> Path:
-    filename = f"summary__{sanitize_filename(arm_name)}.json" if arm_name else "summary.json"
+    parts = [prefix]
+    if arm_name:
+        parts.append(sanitize_filename(arm_name))
+    if run_name:
+        parts.append(sanitize_filename(run_name))
+    filename = "__".join(parts) + ".json"
     return write_summary_rows(out_dir / filename, rows)
 
 
-def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
+def execute_compare(args: argparse.Namespace) -> CompareExecutionResult:
     script_path = Path(args.script)
     script_system, turns = load_script(script_path)
     provider_specs = parse_provider_specs(args.providers)
@@ -4579,20 +6227,45 @@ def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
     arm_description = compact_text(str(getattr(args, "arm_description", "") or ""))
+    run_name = compact_text(str(getattr(args, "run_name", "") or ""))
+    run_index = coerce_int(getattr(args, "run_index", None))
+    base_seed = coerce_int(getattr(args, "random_seed", None))
 
     rows: list[dict[str, Any]] = []
+    log_paths: list[Path] = []
     if arm_name:
         print(f"=== arm: {arm_name} ===")
+    if run_name:
+        print(f"=== repeat: {run_name} ===")
     for provider, model in provider_specs:
+        effective_seed = derive_repeat_seed(
+            base_seed,
+            arm_name=arm_name,
+            provider=provider,
+            model=model,
+            run_name=run_name,
+        )
+        if effective_seed is not None:
+            random.seed(effective_seed)
         adapter = build_adapter(provider, model)
+        observer_adapter = build_optional_observer_adapter(args)
+        embedding_adapter = build_optional_embedding_adapter(args)
         cfg = make_experiment_config_from_args(args, base_system=script_system)
         log_path = build_compare_log_path(
             out_dir,
             provider=provider,
             model=model,
             arm_name=arm_name,
+            run_name=run_name,
         )
-        session = RecursiveConclusionSession(adapter=adapter, config=cfg, log_path=log_path)
+        log_paths.append(log_path)
+        session = RecursiveConclusionSession(
+            adapter=adapter,
+            observer_adapter=observer_adapter,
+            embedding_adapter=embedding_adapter,
+            config=cfg,
+            log_path=log_path,
+        )
 
         print(f"=== {provider} / {model} ===")
         for turn_no, user_text in enumerate(turns, start=1):
@@ -4604,6 +6277,18 @@ def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
                 {
                     "arm": arm_name or None,
                     "arm_description": arm_description or None,
+                    "run_name": run_name or None,
+                    "run_index": run_index,
+                    "random_seed": effective_seed,
+                    "semantic_judge_backend": result["semantic_judge_backend"],
+                    "adaptive_hazard_policy": result["adaptive_hazard_policy"],
+                    "adaptive_hazard_profile": result["adaptive_hazard_profile"],
+                    "adaptive_hazard_stage_policy": result[
+                        "adaptive_hazard_stage_policy"
+                    ],
+                    "adaptive_hazard_embedding_guard": result[
+                        "adaptive_hazard_embedding_guard"
+                    ],
                     "provider": provider,
                     "model": model,
                     "turn": turn_no,
@@ -4613,6 +6298,15 @@ def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "conclusion_probe": result["conclusion_probe"],
                     "delayed_mention_leak_policy": result["delayed_mention_leak_policy"],
                     "delayed_mention_leak_threshold": result["delayed_mention_leak_threshold"],
+                    "delayed_mention_min_nonconclusion_items": result[
+                        "delayed_mention_min_nonconclusion_items"
+                    ],
+                    "delayed_mention_min_kind_diversity": result[
+                        "delayed_mention_min_kind_diversity"
+                    ],
+                    "delayed_mention_diversity_repair": result[
+                        "delayed_mention_diversity_repair"
+                    ],
                     "suppressed_delayed_mention_count": len(
                         result.get("suppressed_delayed_mentions") or []
                     ),
@@ -4624,6 +6318,28 @@ def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
                     "latent_convergence_readiness": result["latent_convergence_readiness"],
                     "latent_convergence_leakage_risk": result["latent_convergence_leakage_risk"],
                     "latent_convergence_stage": result["latent_convergence_stage"],
+                    "latent_convergence_judge_source": result["latent_convergence_judge_source"],
+                    "latent_convergence_judge_provider": result["latent_convergence_judge_provider"],
+                    "latent_convergence_judge_model": result["latent_convergence_judge_model"],
+                    "embedding_convergence_alignment": result["embedding_convergence_alignment"],
+                    "embedding_convergence_judge_provider": result["embedding_convergence_judge_provider"],
+                    "embedding_convergence_judge_model": result["embedding_convergence_judge_model"],
+                    "semantic_judge_alignment_gap": result["semantic_judge_alignment_gap"],
+                    "latest_conclusion_plan_hazard_turn_prob": result[
+                        "latest_conclusion_plan_hazard_turn_prob"
+                    ],
+                    "latest_conclusion_plan_adaptive_hazard_turn_prob": result[
+                        "latest_conclusion_plan_adaptive_hazard_turn_prob"
+                    ],
+                    "latest_conclusion_plan_adaptive_multiplier": result[
+                        "latest_conclusion_plan_adaptive_multiplier"
+                    ],
+                    "latest_conclusion_plan_adaptive_threshold": result[
+                        "latest_conclusion_plan_adaptive_threshold"
+                    ],
+                    "latest_conclusion_plan_adaptive_threshold_shift": result[
+                        "latest_conclusion_plan_adaptive_threshold_shift"
+                    ],
                     "probe_reply_overlap": result["probe_reply_overlap"],
                     "usage": result["usage"],
                 }
@@ -4634,15 +6350,16 @@ def execute_compare(args: argparse.Namespace) -> list[dict[str, Any]]:
             )
         print()
 
-    return rows
+    return CompareExecutionResult(rows=rows, log_paths=log_paths)
 
 
 def run_compare(args: argparse.Namespace) -> int:
-    rows = execute_compare(args)
+    execution = execute_compare(args)
     summary_path = write_compare_summary(
         Path(args.out_dir or "compare_outputs"),
-        rows,
+        execution.rows,
         arm_name=compact_text(str(getattr(args, "arm_name", "") or "")),
+        run_name=compact_text(str(getattr(args, "run_name", "") or "")),
     )
     print(f"Wrote {summary_path}")
     return 0
@@ -4711,11 +6428,23 @@ def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
     arms = data.get("arms")
     if not isinstance(arms, list) or not arms:
         raise ValueError("compare-matrix config requires non-empty list field 'arms'.")
+    repeats = max(1, int(coerce_int(data.get("repeats")) or 1))
+    base_seed = coerce_int(data.get("seed"))
+    if base_seed is None:
+        args_block = data.get("args") or {}
+        if isinstance(args_block, dict):
+            base_seed = coerce_int(args_block.get("random_seed"))
 
     out_dir = Path(str(data.get("out_dir") or data.get("out-dir") or "compare_outputs"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     combined_rows: list[dict[str, Any]] = []
+    analysis_rows: list[dict[str, Any]] = []
+    from analyze_runs import aggregate_summary_rows, load_evaluation_spec, summarize_log
+
+    script_value = data.get("script")
+    script_path = Path(str(script_value)) if isinstance(script_value, str) and script_value else None
+    evaluation = load_evaluation_spec(script_path)
     for idx, arm in enumerate(arms, start=1):
         if not isinstance(arm, dict):
             raise ValueError(f"Arm {idx} must be an object.")
@@ -4724,33 +6453,79 @@ def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
         arm_args = arm.get("args") or {}
         if not isinstance(arm_args, dict):
             raise ValueError(f"Arm {arm_name!r} field 'args' must be an object.")
+        arm_rows: list[dict[str, Any]] = []
+        for repeat_idx in range(1, repeats + 1):
+            run_name = f"run_{repeat_idx:03d}" if repeats > 1 else ""
+            compare_args = build_compare_args_from_config(
+                data,
+                out_dir_override=str(out_dir),
+                args_override=arm_args,
+                arm_name=arm_name,
+                arm_description=arm_description,
+            )
+            compare_args.run_name = run_name
+            compare_args.run_index = repeat_idx
+            if base_seed is not None:
+                compare_args.random_seed = base_seed + (repeat_idx - 1)
+            execution = execute_compare(compare_args)
+            arm_rows.extend(execution.rows)
+            combined_rows.extend(execution.rows)
+            if run_name:
+                run_summary_path = write_compare_summary(
+                    out_dir,
+                    execution.rows,
+                    arm_name=arm_name,
+                    run_name=run_name,
+                )
+                print(f"Wrote {run_summary_path}")
 
-        compare_args = build_compare_args_from_config(
-            data,
-            out_dir_override=str(out_dir),
-            args_override=arm_args,
-            arm_name=arm_name,
-            arm_description=arm_description,
-        )
-        rows = execute_compare(compare_args)
-        combined_rows.extend(rows)
+            for log_path in execution.log_paths:
+                summary_row = summarize_log(log_path, evaluation)
+                summary_row["arm_description"] = arm_description or None
+                if repeat_idx and summary_row.get("run_index") is None:
+                    summary_row["run_index"] = repeat_idx
+                if run_name and not summary_row.get("run_name"):
+                    summary_row["run_name"] = run_name
+                if base_seed is not None:
+                    summary_row["random_seed"] = derive_repeat_seed(
+                        base_seed + (repeat_idx - 1),
+                        arm_name=arm_name,
+                        provider=str(summary_row.get("provider") or ""),
+                        model=str(summary_row.get("model") or ""),
+                        run_name=run_name,
+                    )
+                analysis_rows.append(summary_row)
+
+        rows = arm_rows
         arm_summary_path = write_compare_summary(out_dir, rows, arm_name=arm_name)
         print(f"Wrote {arm_summary_path}")
 
     matrix_summary_path = write_compare_summary(out_dir, combined_rows)
+    analysis_runs_path = write_summary_rows(out_dir / "analysis_runs.json", analysis_rows)
+    analysis_aggregate_rows = aggregate_summary_rows(analysis_rows)
+    analysis_aggregate_path = write_summary_rows(
+        out_dir / "analysis_aggregate.json",
+        analysis_aggregate_rows,
+    )
     manifest_path = write_summary_rows(
         out_dir / "arms.json",
-        [
-            {
-                "name": compact_text(str(arm.get("name") or f"arm_{idx:02d}")),
-                "description": compact_text(str(arm.get("description") or "")) or None,
-                "args": arm.get("args") or {},
-            }
-            for idx, arm in enumerate(arms, start=1)
-            if isinstance(arm, dict)
-        ],
+        {
+            "repeats": repeats,
+            "seed": base_seed,
+            "arms": [
+                {
+                    "name": compact_text(str(arm.get("name") or f"arm_{idx:02d}")),
+                    "description": compact_text(str(arm.get("description") or "")) or None,
+                    "args": arm.get("args") or {},
+                }
+                for idx, arm in enumerate(arms, start=1)
+                if isinstance(arm, dict)
+            ],
+        },
     )
     print(f"Wrote {matrix_summary_path}")
+    print(f"Wrote {analysis_runs_path}")
+    print(f"Wrote {analysis_aggregate_path}")
     print(f"Wrote {manifest_path}")
     return 0
 
@@ -4839,6 +6614,12 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--provider", required=True, help="openai | anthropic | mistral | gemini | hf | dummy")
             p.add_argument("--model", required=True, help="Model id for the selected provider.")
         p.add_argument("--system", default="", help="Base system prompt.")
+        p.add_argument(
+            "--random-seed",
+            type=int,
+            default=None,
+            help="Optional seed for harness-side stochastic components such as soft-fire sampling.",
+        )
         p.add_argument("--window", type=int, default=8, help="How many recent messages to reload each turn.")
         p.add_argument("--memory-every", type=int, default=3, help="Create a new memory capsule every N user turns. 0 disables.")
         p.add_argument("--memory-limit", type=int, default=4, help="Maximum number of memory capsules to retain.")
@@ -4873,6 +6654,33 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=3,
             help="Maximum number of delayed mention targets to plan per probe.",
+        )
+        p.add_argument(
+            "--delayed-mention-min-nonconclusion-items",
+            type=int,
+            default=1,
+            help=(
+                "Soft planner target: ask for at least this many delayed mentions whose kind is not "
+                "'conclusion' when plausible."
+            ),
+        )
+        p.add_argument(
+            "--delayed-mention-min-kind-diversity",
+            type=int,
+            default=2,
+            help=(
+                "Soft planner target for the minimum number of distinct delayed-mention kinds "
+                "to return when plausible."
+            ),
+        )
+        p.add_argument(
+            "--delayed-mention-diversity-repair",
+            choices=[m.value for m in DelayedMentionDiversityRepairPolicy],
+            default=DelayedMentionDiversityRepairPolicy.ON.value,
+            help=(
+                "If the first delayed-mention plan lacks enough non-conclusion items or kind diversity, "
+                "run one supplemental non-conclusion probe."
+            ),
         )
         p.add_argument(
             "--delayed-mention-mode",
@@ -4911,13 +6719,84 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         p.add_argument(
+            "--adaptive-hazard-policy",
+            choices=[m.value for m in AdaptiveHazardPolicy],
+            default=AdaptiveHazardPolicy.ADAPTIVE.value,
+            help=(
+                "Whether current-turn hazard probabilities remain static or are adaptively "
+                "scaled from recent semantic convergence traces."
+            ),
+        )
+        p.add_argument(
+            "--adaptive-hazard-profile",
+            choices=[m.value for m in AdaptiveHazardProfile],
+            default=AdaptiveHazardProfile.BALANCED.value,
+            help=(
+                "Adaptive hazard temperament: conservative delays more, balanced mixes hold/release, "
+                "and eager releases earlier."
+            ),
+        )
+        p.add_argument(
+            "--adaptive-hazard-stage-policy",
+            choices=[m.value for m in AdaptiveHazardStagePolicy],
+            default=AdaptiveHazardStagePolicy.FLAT.value,
+            help=(
+                "Whether adaptive hazard treats delayed mentions uniformly or separates "
+                "option-stage items from final-stage risk packets."
+            ),
+        )
+        p.add_argument(
+            "--adaptive-hazard-embedding-guard",
+            choices=[m.value for m in AdaptiveHazardEmbeddingGuard],
+            default=AdaptiveHazardEmbeddingGuard.OFF.value,
+            help=(
+                "Optional pre-peak semantic leakage guard driven by embedding alignment. "
+                "Keep this off unless you are explicitly comparing its effect."
+            ),
+        )
+        p.add_argument(
             "--latent-convergence-every",
             type=int,
             default=0,
             help=(
-                "Run an observe-only latent convergence trace every N turns after replies. "
+                "Run semantic judges every N turns after replies. "
                 "0 disables."
             ),
+        )
+        p.add_argument(
+            "--semantic-judge-backend",
+            choices=[m.value for m in SemanticJudgeBackend],
+            default=SemanticJudgeBackend.LLM.value,
+            help=(
+                "Which semantic judge to run at each latent-convergence step: "
+                "llm, embedding, both, or off."
+            ),
+        )
+        p.add_argument(
+            "--observer-provider",
+            default="",
+            help=(
+                "Optional independent observer provider for latent convergence judging. "
+                "If unset, the generator adapter judges its own replies."
+            ),
+        )
+        p.add_argument(
+            "--observer-model",
+            default="",
+            help="Model id for --observer-provider.",
+        )
+        p.add_argument(
+            "--embedding-provider",
+            default="",
+            help=(
+                "Optional embedding provider for semantic judging. "
+                "Required when --semantic-judge-backend is embedding or both."
+            ),
+        )
+        p.add_argument(
+            "--embedding-model",
+            default="",
+            help="Model id for --embedding-provider.",
         )
         p.add_argument(
             "--deferred-intent-every",
