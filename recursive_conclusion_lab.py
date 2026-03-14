@@ -939,6 +939,32 @@ def classify_delayed_mention_stage_role(
     return "support_stage"
 
 
+def normalize_release_stage_role(value: Any) -> str:
+    stage_role = compact_text(str(value or "")).lower()
+    aliases = {
+        "option": "option_stage",
+        "shortlist": "option_stage",
+        "candidate_stage": "option_stage",
+        "support": "support_stage",
+        "criteria_stage": "support_stage",
+        "pre_commit_support": "support_stage",
+        "final_packet": "final_risk_packet",
+        "risk_packet": "final_risk_packet",
+        "late_packet": "final_risk_packet",
+        "final_commit": "conclusion",
+        "commit": "conclusion",
+    }
+    stage_role = aliases.get(stage_role, stage_role)
+    if stage_role in {
+        "option_stage",
+        "support_stage",
+        "final_risk_packet",
+        "conclusion",
+    }:
+        return stage_role
+    return ""
+
+
 def adaptive_hazard_stage_role_params(
     policy: AdaptiveHazardStagePolicy,
     stage_role: str,
@@ -3454,12 +3480,23 @@ class RecursiveConclusionSession:
             delay_signals = coerce_str_list(item_raw.get("delay_signals"))
             delay_signals = [truncate_text(x, 80) for x in delay_signals if x][:6]
             delay_rationale = truncate_text(item_raw.get("delay_rationale") or "", 160)
-            release_stage_role = classify_delayed_mention_stage_role(
+            planner_release_stage_role = normalize_release_stage_role(
+                item_raw.get("release_stage_role") or item_raw.get("stage_delay_target")
+            )
+            heuristic_release_stage_role = classify_delayed_mention_stage_role(
                 kind=kind,
                 text=text,
                 delay_strategy=delay_strategy,
                 delay_signals=delay_signals,
             )
+            release_stage_role = (
+                planner_release_stage_role or heuristic_release_stage_role
+            )
+            if (
+                planner_release_stage_role in {"option_stage", "support_stage"}
+                and heuristic_release_stage_role == "final_risk_packet"
+            ):
+                release_stage_role = heuristic_release_stage_role
             mention_hazard_profile = reshape_stage_role_hazard_profile(
                 policy=self.config.adaptive_hazard_stage_policy,
                 stage_role=release_stage_role,
@@ -3550,6 +3587,9 @@ class RecursiveConclusionSession:
         diversity_lines.append(
             "- Useful non-conclusion kinds include caveat, option, constraint, definition, and migration risk."
         )
+        diversity_lines.append(
+            "- Use release_stage_role=option_stage for shortlist candidates, support_stage for checklist/support items, and final_risk_packet for caveat/fallback/migration-risk items that should wait for the final packet."
+        )
         diversity_guidance = "\n".join(diversity_lines)
         compact_output_rules = "\n".join(
             [
@@ -3582,6 +3622,7 @@ class RecursiveConclusionSession:
               "items": [
                 {{
                   "kind": "caveat|definition|option|constraint|migration_risk|conclusion|other",
+                  "release_stage_role": "option_stage|support_stage|final_risk_packet|conclusion",
                   "text": "<short delayed mention target>",
                   "keywords": ["<1-3 short phrases>"],
                   "mention_hazard_profile": [{{"delay_turns": <int>=1, "prob": <0.00-1.00>}}, ...],
@@ -3679,6 +3720,7 @@ class RecursiveConclusionSession:
                 - Every item must use a kind other than conclusion.
                 - Prefer kinds not already used.
                 - Prioritize caveat, option, constraint, definition, migration_risk, or other concrete release-time support items.
+                - Use release_stage_role=option_stage for shortlist candidates, support_stage for checklist/support items, and final_risk_packet for caveat/fallback/migration-risk items that should wait until the final packet.
                 - Do not repeat the existing items too closely.
                 - Keep each text to one short sentence or phrase, at most 18 words.
                 - Use 1-3 short keywords and at most 2 hazard points.
@@ -3689,6 +3731,7 @@ class RecursiveConclusionSession:
                   "items": [
                     {{
                       "kind": "caveat|definition|option|constraint|migration_risk|other",
+                      "release_stage_role": "option_stage|support_stage|final_risk_packet",
                       "text": "<short delayed mention target>",
                       "keywords": ["<1-3 short phrases>"],
                       "mention_hazard_profile": [{{"delay_turns": <int>=1, "prob": <0.00-1.00>}}, ...],
