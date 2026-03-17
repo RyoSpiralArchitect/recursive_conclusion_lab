@@ -328,6 +328,35 @@ scripts/build_staged_release_human_eval_set.sh
 `eval_items.jsonl`、`booklet.md`、`answer_sheet.csv`、`blind_key.json` と、
 各 item ごとの Markdown packet を `packets/` に書き出します。
 
+live な qualitative playtest 用には、minimal local web app も使えます。
+
+```bash
+pip install -r playtest_requirements.txt
+scripts/run_playtest_server.sh
+```
+
+この backend は crash-tolerant な session API を持っていて、`playtest_ui/dist/` があれば
+build 済み UI も `http://127.0.0.1:8787` からそのまま配信します。
+
+frontend を開発しながら使うなら、別ターミナルで:
+
+```bash
+cd playtest_ui
+npm install
+npm run dev
+```
+
+dev 中は `http://127.0.0.1:5173`、`npm run build` 後は `http://127.0.0.1:8787` を開いてください。
+これは benchmark 用ではなく、人間が transcript と live trace と観察メモを見ながら洗うための UI です。
+
+- `static` / `adaptive_flat` / `adaptive_kind_aware` の session を作成・再開できる
+- protocol script の turn を seed として流し込み、その後は自由対話に切り替えられる
+- transcript、conclusion state、delayed mention pressure、軽い live metrics を横で見られる
+- observer note を書きながら、backend が turn ごとに session を保存する
+
+session snapshot は `playtest_sessions/` に保存されるので、server が turn の途中で落ちても
+直前の user draft を復元できます。
+
 `--delayed-mention-diversity-repair on` のときは、最初の delayed mention plan が
 non-conclusion 数や kind diversity の minimum を満たさなかった場合に、compact な
 補助 probe を 1 回だけ追加して non-conclusion item を補います。確率的な planning は

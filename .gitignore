@@ -15,5 +15,8 @@ ENV/
 build/
 dist/
 *.egg-info/
+playtest_ui/node_modules/
+playtest_ui/dist/
+playtest_sessions/
 
 runs/

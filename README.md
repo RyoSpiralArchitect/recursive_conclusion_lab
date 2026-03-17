@@ -328,6 +328,35 @@ This writes `human_eval_sets/staged_release_pairwise_v1/` with:
 `manifest.json`, `eval_items.jsonl`, `booklet.md`, `answer_sheet.csv`, `blind_key.json`,
 and one Markdown packet per item under `packets/`.
 
+For live qualitative playtesting, a minimal local web app is available:
+
+```bash
+pip install -r playtest_requirements.txt
+scripts/run_playtest_server.sh
+```
+
+That backend exposes a crash-tolerant session API and, if `playtest_ui/dist/` exists, also serves the
+built UI directly on `http://127.0.0.1:8787`.
+
+For frontend development, run Vite in another terminal:
+
+```bash
+cd playtest_ui
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173` in dev mode, or `http://127.0.0.1:8787` after `npm run build`.
+The UI is meant for human-side inspection rather than benchmarking:
+
+- create or resume sessions for `static`, `adaptive_flat`, and `adaptive_kind_aware`
+- seed a session from protocol script turns, then diverge into free dialogue
+- watch transcript, conclusion state, delayed-mention pressure, and lightweight live metrics side by side
+- keep freeform observer notes while the backend saves the session after every turn
+
+Session snapshots are written under `playtest_sessions/` and recover the last pending user draft if
+the server dies mid-turn.
+
 When `--delayed-mention-diversity-repair on`, the harness will make one compact supplemental probe if
 the first delayed-mention plan fails the non-conclusion or kind-diversity minimums. This keeps the
 pressure probabilistic, but makes the planner pay a real cost for collapsing everything into a single
