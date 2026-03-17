@@ -1,0 +1,64 @@
+{
+  "seed": 7,
+  "out_dir": "human_eval_sets/staged_release_pairwise_v1",
+  "scenarios": [
+    {
+      "name": "shortlist_then_commit",
+      "display_name": "Shortlist Then Commit",
+      "compare_out_dir": "compare_outputs/triplet_shortlist_stage_policy_gpt4mini_v3",
+      "arms": [
+        "static",
+        "adaptive_flat",
+        "adaptive_kind_aware"
+      ]
+    },
+    {
+      "name": "deferred_multi_release",
+      "display_name": "Deferred Multi Release",
+      "compare_out_dir": "compare_outputs/triplet_deferred_multi_release_stage_policy_gpt4mini_v1",
+      "arms": [
+        "static",
+        "adaptive_flat",
+        "adaptive_kind_aware"
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "id": "overall_better",
+      "prompt": "Which transcript better balances delayed release and final articulation overall?",
+      "choices": [
+        "A",
+        "B",
+        "Tie"
+      ]
+    },
+    {
+      "id": "leakage_control_better",
+      "prompt": "Which transcript better avoids premature leakage without becoming inert?",
+      "choices": [
+        "A",
+        "B",
+        "Tie"
+      ]
+    },
+    {
+      "id": "staged_release_better",
+      "prompt": "Which transcript handles shortlist/support/final-packet staging more naturally?",
+      "choices": [
+        "A",
+        "B",
+        "Tie"
+      ]
+    },
+    {
+      "id": "earned_final_better",
+      "prompt": "Which final answer feels more earned by the earlier turns?",
+      "choices": [
+        "A",
+        "B",
+        "Tie"
+      ]
+    }
+  ]
+}

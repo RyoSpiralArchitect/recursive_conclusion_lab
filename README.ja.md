@@ -312,6 +312,22 @@ delayed mention の timing 比較を強めたいなら
 OPENAI_API_KEY=... scripts/run_shortlist_stage_policy_gpt4mini.sh
 ```
 
+対応する `deferred_multi_release` の stage-policy 比較を作るには、次を使います。
+
+```bash
+OPENAI_API_KEY=... scripts/run_deferred_multi_release_stage_policy_gpt4mini.sh
+```
+
+この 2 つの compare output から blind な pairwise human-eval packet を組むには、次で足ります。
+
+```bash
+scripts/build_staged_release_human_eval_set.sh
+```
+
+出力先は `human_eval_sets/staged_release_pairwise_v1/` で、`manifest.json`、
+`eval_items.jsonl`、`booklet.md`、`answer_sheet.csv`、`blind_key.json` と、
+各 item ごとの Markdown packet を `packets/` に書き出します。
+
 `--delayed-mention-diversity-repair on` のときは、最初の delayed mention plan が
 non-conclusion 数や kind diversity の minimum を満たさなかった場合に、compact な
 補助 probe を 1 回だけ追加して non-conclusion item を補います。確率的な planning は

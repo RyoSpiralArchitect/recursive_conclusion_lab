@@ -312,6 +312,22 @@ To rerun the current OpenAI baseline comparison directly, use:
 OPENAI_API_KEY=... scripts/run_shortlist_stage_policy_gpt4mini.sh
 ```
 
+To build the matching `deferred_multi_release` stage-policy comparison, use:
+
+```bash
+OPENAI_API_KEY=... scripts/run_deferred_multi_release_stage_policy_gpt4mini.sh
+```
+
+To build a blinded pairwise human-eval packet set from those two compare outputs, use:
+
+```bash
+scripts/build_staged_release_human_eval_set.sh
+```
+
+This writes `human_eval_sets/staged_release_pairwise_v1/` with:
+`manifest.json`, `eval_items.jsonl`, `booklet.md`, `answer_sheet.csv`, `blind_key.json`,
+and one Markdown packet per item under `packets/`.
+
 When `--delayed-mention-diversity-repair on`, the harness will make one compact supplemental probe if
 the first delayed-mention plan fails the non-conclusion or kind-diversity minimums. This keeps the
 pressure probabilistic, but makes the planner pay a real cost for collapsing everything into a single
