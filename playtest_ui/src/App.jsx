@@ -1,34 +1,16 @@
 import { startTransition, useDeferredValue, useEffect, useState } from "react";
+import { FileCheck2, MessagesSquare } from "lucide-react";
 
+import { fetchJson } from "./api";
+import BlindReview from "./BlindReview";
 const emptyCreateForm = {
   title: "",
-  script_id: "shortlist_then_commit",
-  arm_preset: "adaptive_kind_aware",
-  provider: "openai",
-  model: "gpt-4.1-mini-2025-04-14",
-  semantic_judge_backend: "both",
+  script_id: "",
+  arm_preset: "",
+  provider: "",
+  model: "",
+  semantic_judge_backend: "",
 };
-
-async function fetchJson(url, options) {
-  const response = await fetch(url, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(options?.headers || {}),
-    },
-    ...options,
-  });
-  if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
-    try {
-      const payload = await response.json();
-      if (payload?.detail) {
-        detail = String(payload.detail);
-      }
-    } catch {}
-    throw new Error(detail);
-  }
-  return response.json();
-}
 
 function formatNumber(value) {
   if (typeof value !== "number" || Number.isNaN(value)) {
@@ -79,6 +61,8 @@ function collectMetrics(session) {
 }
 
 function App() {
+  const [workspace, setWorkspace] = useState("");
+  const [serverMode, setServerMode] = useState("");
   const [options, setOptions] = useState(null);
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
@@ -97,13 +81,32 @@ function App() {
   useEffect(() => {
     async function bootstrap() {
       try {
+        const health = await fetchJson("/api/health");
+        const mode = health.workspace_mode === "review" ? "review" : "full";
+        setServerMode(mode);
+        if (mode === "review") {
+          setWorkspace("review");
+          setStatus("Ready");
+          return;
+        }
         const [optionsPayload, sessionsPayload] = await Promise.all([
           fetchJson("/api/options"),
           fetchJson("/api/sessions"),
         ]);
         startTransition(() => {
+          setWorkspace("playtest");
           setOptions(optionsPayload);
           setSessions(sessionsPayload.sessions || []);
+          setCreateForm((previous) => ({
+            ...previous,
+            script_id: previous.script_id || optionsPayload.default_script_id,
+            arm_preset: previous.arm_preset || optionsPayload.default_arm_preset,
+            provider: previous.provider || optionsPayload.default_provider,
+            model: previous.model || optionsPayload.default_model,
+            semantic_judge_backend:
+              previous.semantic_judge_backend ||
+              optionsPayload.default_semantic_judge_backend,
+          }));
           if ((sessionsPayload.sessions || []).length > 0) {
             setActiveSessionId(sessionsPayload.sessions[0].session_id);
           }
@@ -287,17 +290,54 @@ function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">Recursive Conclusion Lab</p>
-          <h1>Playtest Console</h1>
+          <h1>
+            {workspace === "playtest"
+              ? "Playtest Console"
+              : workspace === "review"
+                ? "Blind Review"
+                : "Loading"}
+          </h1>
         </div>
-        <div className="topbar-status">
-          <span className="status-chip">{status}</span>
-          {loadingSession ? <span className="status-chip muted">Loading session…</span> : null}
-          {savingNotes ? <span className="status-chip muted">Saving notes…</span> : null}
+        <div className="topbar-tools">
+          {serverMode === "full" ? (
+            <div className="workspace-switch" role="tablist" aria-label="Workspace">
+              <button
+                aria-selected={workspace === "playtest"}
+                className={workspace === "playtest" ? "active" : ""}
+                onClick={() => setWorkspace("playtest")}
+                role="tab"
+                type="button"
+              >
+                <MessagesSquare size={16} />
+                Playtest
+              </button>
+              <button
+                aria-selected={workspace === "review"}
+                className={workspace === "review" ? "active" : ""}
+                onClick={() => setWorkspace("review")}
+                role="tab"
+                type="button"
+              >
+                <FileCheck2 size={16} />
+                Blind Review
+              </button>
+            </div>
+          ) : null}
+          {workspace === "playtest" ? (
+            <div className="topbar-status">
+              <span className="status-chip">{status}</span>
+              {loadingSession ? <span className="status-chip muted">Loading session…</span> : null}
+              {savingNotes ? <span className="status-chip muted">Saving notes…</span> : null}
+            </div>
+          ) : null}
         </div>
       </header>
 
-      {error ? <div className="error-banner">{error}</div> : null}
+      {workspace === "playtest" && error ? <div className="error-banner">{error}</div> : null}
 
+      {!workspace ? null : workspace === "review" ? (
+        <BlindReview />
+      ) : (
       <div className="layout">
         <aside className="panel sidebar">
           <section className="panel-section">
@@ -609,6 +649,7 @@ function App() {
           </section>
         </aside>
       </div>
+      )}
     </div>
   );
 }

@@ -326,7 +326,15 @@ scripts/build_staged_release_human_eval_set.sh
 
 This writes `human_eval_sets/staged_release_pairwise_v1/` with:
 `manifest.json`, `eval_items.jsonl`, `booklet.md`, `answer_sheet.csv`, `blind_key.json`,
-and one Markdown packet per item under `packets/`.
+`READY.json`, and one Markdown packet per item under `packets/`. Publication is complete only when
+`READY.json` exists. Rebuilding removes that marker first, so the review server ignores interrupted output.
+
+`manifest.json` and `eval_items.jsonl` form the reviewer-safe public packet. They omit arm names,
+providers, models, and input paths. A/B-to-arm mappings, the seed, source digest, and private config
+are stored only in `blind_key.json`; do not expose that file to a reviewer during evaluation. Generated
+keys under `human_eval_sets/` are gitignored. Share the public packet, booklet/packet Markdown,
+answer sheet, and readiness marker, but retain the key on the research side. The builder also rejects
+divergent user-turn sequences across arms and assigns opaque item IDs that do not encode pair order.
 
 For live qualitative playtesting, a minimal local web app is available:
 
@@ -347,14 +355,41 @@ npm run dev
 ```
 
 Open `http://127.0.0.1:5173` in dev mode, or `http://127.0.0.1:8787` after `npm run build`.
-The UI is meant for human-side inspection rather than benchmarking:
+The full app separates two workspaces. Treat this full mode as a researcher console because its
+Playtest endpoints expose arm and model configuration.
+
+`Playtest` is an unblinded researcher console for human-side inspection rather than benchmarking:
 
 - create or resume sessions for `static`, `adaptive_flat`, and `adaptive_kind_aware`
 - seed a session from protocol script turns, then diverge into free dialogue
 - watch transcript, conclusion state, delayed-mention pressure, and lightweight live metrics side by side
 - keep freeform observer notes while the backend saves the session after every turn
 
-Session snapshots are written under `playtest_sessions/` and recover the last pending user draft if
+`Blind Review` reads `eval_items.jsonl` and collects pairwise judgments without exposing arms,
+providers, models, or machine metrics:
+
+- compare response A/B beneath each shared user turn
+- record `A / B / Tie`, confidence, evidence, and counterevidence for every rubric question
+- keep insufficient-evidence `Abstain` separate from `Tie` and require a reason
+- append corrections with `supersedes` instead of overwriting earlier judgment events
+- seal only after every item is complete, then write raw unblinded counts and digests to research artifacts
+
+Review events, `unblinded_results.json`, and `seal_receipt.json` are stored under
+`blind_review_sessions/<session-id>/`. The reviewer UI remains blinded after sealing and shows only the
+receipt; inspect `unblinded_results.json` later from the research side. Blind Review makes no model API calls.
+
+Run a reviewer-facing instance with the Playtest UI and APIs disabled:
+
+```bash
+EVAL_SETS_DIR=examples/human_eval_sets scripts/run_blind_review_server.sh
+```
+
+Review mode is currently designed for one trusted local rater on the loopback interface; it is not an
+authenticated multi-rater service. Pairwise judgments support relative arm preference. They do not by
+themselves identify the exact turn at which a conclusion became ready, so that stronger timing claim still
+needs an absolute readiness-turn annotation in a later evaluation layer.
+
+Playtest session snapshots are written under `playtest_sessions/` and recover the last pending user draft if
 the server dies mid-turn.
 
 When `--delayed-mention-diversity-repair on`, the harness will make one compact supplemental probe if

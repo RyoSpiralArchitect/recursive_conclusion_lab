@@ -325,8 +325,16 @@ scripts/build_staged_release_human_eval_set.sh
 ```
 
 出力先は `human_eval_sets/staged_release_pairwise_v1/` で、`manifest.json`、
-`eval_items.jsonl`、`booklet.md`、`answer_sheet.csv`、`blind_key.json` と、
-各 item ごとの Markdown packet を `packets/` に書き出します。
+`eval_items.jsonl`、`booklet.md`、`answer_sheet.csv`、`blind_key.json`、`READY.json` と、
+各 item ごとの Markdown packet を `packets/` に書き出します。`READY.json` がある場合だけ
+publish 完了です。再 build では最初に marker を外すため、途中で落ちた出力を review server は読みません。
+
+`manifest.json` と `eval_items.jsonl` は reviewer-safe な公開 packet です。arm 名、provider、
+model、入力 path は含みません。A/B と実 arm の対応、seed、source digest、private config は
+`blind_key.json` だけに保存されます。評価中はこのファイルを reviewer に渡さないでください。
+`human_eval_sets/` 以下の生成 key は gitignore 対象です。公開 packet、booklet/Markdown packet、
+answer sheet、readiness marker だけを reviewer 側へ渡し、key は research 側に保持します。
+builder は arm 間で user turn 列が同一であることも検査し、比較組を表さない opaque item ID を振ります。
 
 live な qualitative playtest 用には、minimal local web app も使えます。
 
@@ -347,14 +355,41 @@ npm run dev
 ```
 
 dev 中は `http://127.0.0.1:5173`、`npm run build` 後は `http://127.0.0.1:8787` を開いてください。
-これは benchmark 用ではなく、人間が transcript と live trace と観察メモを見ながら洗うための UI です。
+full mode の app には 2 つの workspace があります。ただし Playtest API は arm / model 設定を返すため、
+この full mode 全体を researcher console として扱ってください。
+
+`Playtest` は benchmark 用ではなく、人間が transcript と live trace と観察メモを見ながら
+洗うための非盲検 UI です。
 
 - `static` / `adaptive_flat` / `adaptive_kind_aware` の session を作成・再開できる
 - protocol script の turn を seed として流し込み、その後は自由対話に切り替えられる
 - transcript、conclusion state、delayed mention pressure、軽い live metrics を横で見られる
 - observer note を書きながら、backend が turn ごとに session を保存する
 
-session snapshot は `playtest_sessions/` に保存されるので、server が turn の途中で落ちても
+`Blind Review` は `eval_items.jsonl` を読み、arm / provider / model / machine metric を隠したまま
+pairwise 判断を収集します。
+
+- 同じ user turn の下で response A/B を比較する
+- 各 rubric に `A / B / Tie`、confidence、evidence、counterevidence を記録する
+- 判断不能は `Tie` と分けて、理由つきの `Abstain` として保存する
+- 判断の訂正は古い event を上書きせず、`supersedes` つきで追記する
+- 全 item 完了後にだけ seal し、research artifact に設問別 raw count と digest を書き出す
+
+review event、`unblinded_results.json`、`seal_receipt.json` は
+`blind_review_sessions/<session-id>/` に保存されます。seal 後も reviewer UI は blind のままで、
+receipt だけを表示します。unblinded result は後から research 側で確認します。モデル API は呼びません。
+
+reviewer に渡す instance は、Playtest UI/API を閉じた mode で起動します。
+
+```bash
+EVAL_SETS_DIR=examples/human_eval_sets scripts/run_blind_review_server.sh
+```
+
+現時点の review mode は loopback 上の「信頼された local rater 1 人」用で、認証つき multi-rater service
+ではありません。また pairwise 判断から分かるのは arm 間の相対的な好みです。「結論を言う準備が
+整った正確な turn」という強い timing claim には、次の評価層で absolute readiness-turn annotation が要ります。
+
+playtest session snapshot は `playtest_sessions/` に保存されるので、server が turn の途中で落ちても
 直前の user draft を復元できます。
 
 `--delayed-mention-diversity-repair on` のときは、最初の delayed mention plan が
