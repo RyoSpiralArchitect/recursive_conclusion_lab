@@ -3,6 +3,16 @@ import { FileCheck2, MessagesSquare } from "lucide-react";
 
 import { fetchJson } from "./api";
 import BlindReview from "./BlindReview";
+const modelControlDefaults = {
+  reasoning_effort: "auto",
+  probe_reasoning_effort: "auto",
+  reasoning_mode: "auto",
+  probe_reasoning_mode: "auto",
+  reasoning_context: "auto",
+  probe_reasoning_context: "auto",
+  text_verbosity: "auto",
+  probe_text_verbosity: "auto",
+};
 const emptyCreateForm = {
   title: "",
   script_id: "",
@@ -10,6 +20,7 @@ const emptyCreateForm = {
   provider: "",
   model: "",
   semantic_judge_backend: "",
+  ...modelControlDefaults,
 };
 
 function formatNumber(value) {
@@ -60,6 +71,23 @@ function collectMetrics(session) {
   ];
 }
 
+function formatRestoreWarning(loadErrors, totalCount) {
+  if (!Array.isArray(loadErrors) || loadErrors.length === 0) {
+    return "";
+  }
+  const visibleErrors = loadErrors.slice(0, 3);
+  const count = Math.max(Number(totalCount) || 0, loadErrors.length);
+  const details = visibleErrors
+    .map(
+      (item) =>
+        `${item.session_id || "unknown"}: ${item.message || "restore failed"}`,
+    )
+    .join(" · ");
+  const remaining = count - visibleErrors.length;
+  const suffix = remaining > 0 ? ` · ${remaining} more` : "";
+  return `Saved session restore failed (${count}). ${details}${suffix}`;
+}
+
 function App() {
   const [workspace, setWorkspace] = useState("");
   const [serverMode, setServerMode] = useState("");
@@ -72,6 +100,7 @@ function App() {
   const [notesDraft, setNotesDraft] = useState("");
   const deferredNotes = useDeferredValue(notesDraft);
   const [error, setError] = useState("");
+  const [restoreWarning, setRestoreWarning] = useState("");
   const [status, setStatus] = useState("Loading…");
   const [creating, setCreating] = useState(false);
   const [sending, setSending] = useState(false);
@@ -97,6 +126,12 @@ function App() {
           setWorkspace("playtest");
           setOptions(optionsPayload);
           setSessions(sessionsPayload.sessions || []);
+          setRestoreWarning(
+            formatRestoreWarning(
+              sessionsPayload.load_errors,
+              sessionsPayload.load_error_count,
+            ),
+          );
           setCreateForm((previous) => ({
             ...previous,
             script_id: previous.script_id || optionsPayload.default_script_id,
@@ -197,6 +232,9 @@ function App() {
     const payload = await fetchJson("/api/sessions");
     startTransition(() => {
       setSessions(payload.sessions || []);
+      setRestoreWarning(
+        formatRestoreWarning(payload.load_errors, payload.load_error_count),
+      );
     });
   }
 
@@ -266,6 +304,32 @@ function App() {
   const metrics = collectMetrics(activeSession);
   const scriptTurns = activeSession?.script?.turns || [];
   const lastResult = activeSession?.last_result || {};
+  const providerModelProfiles = (options?.model_profiles || []).filter(
+    (profile) => profile.provider === createForm.provider,
+  );
+  const suggestedModels = providerModelProfiles.flatMap(
+    (profile) => profile.models || [],
+  );
+  const selectedModelProfile = providerModelProfiles.find((profile) =>
+    (profile.models || []).includes(createForm.model),
+  );
+  const selectedCapabilities = selectedModelProfile?.capabilities || {};
+  const selectedDefaults = selectedModelProfile?.defaults || {};
+
+  function renderSettingOptions(values, defaultValue) {
+    return (
+      <>
+        <option value="auto">
+          Default{defaultValue ? `: ${defaultValue}` : ""}
+        </option>
+        {(values || []).map((value) => (
+          <option key={value} value={value}>
+            {value}
+          </option>
+        ))}
+      </>
+    );
+  }
   const delayedCollections = [
     {
       label: "Planned",
@@ -333,7 +397,16 @@ function App() {
         </div>
       </header>
 
-      {workspace === "playtest" && error ? <div className="error-banner">{error}</div> : null}
+      {workspace === "playtest" && restoreWarning ? (
+        <div className="error-banner" role="alert">
+          {restoreWarning}
+        </div>
+      ) : null}
+      {workspace === "playtest" && error ? (
+        <div className="error-banner" role="alert">
+          {error}
+        </div>
+      ) : null}
 
       {!workspace ? null : workspace === "review" ? (
         <BlindReview />
@@ -403,6 +476,11 @@ function App() {
                     setCreateForm((previous) => ({
                       ...previous,
                       provider: event.target.value,
+                      model:
+                        event.target.value === options?.default_provider
+                          ? options?.default_model || ""
+                          : "",
+                      ...modelControlDefaults,
                     }))
                   }
                 >
@@ -416,15 +494,166 @@ function App() {
               <label className="field">
                 <span>Model</span>
                 <input
+                  list="model-suggestions"
+                  required
                   value={createForm.model}
                   onChange={(event) =>
                     setCreateForm((previous) => ({
                       ...previous,
                       model: event.target.value,
+                      ...modelControlDefaults,
                     }))
                   }
                 />
+                <datalist id="model-suggestions">
+                  {suggestedModels.map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
               </label>
+              {selectedModelProfile ? (
+                <details className="model-controls">
+                  <summary>Generation controls</summary>
+                  <div className="model-control-grid">
+                    <label className="field">
+                      <span>Reply effort</span>
+                      <select
+                        value={createForm.reasoning_effort}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            reasoning_effort: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.reasoning_efforts,
+                          selectedDefaults.reasoning_effort,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Probe effort</span>
+                      <select
+                        value={createForm.probe_reasoning_effort}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            probe_reasoning_effort: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.reasoning_efforts,
+                          selectedDefaults.reasoning_effort,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Reply mode</span>
+                      <select
+                        value={createForm.reasoning_mode}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            reasoning_mode: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.reasoning_modes,
+                          selectedDefaults.reasoning_mode,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Probe mode</span>
+                      <select
+                        value={createForm.probe_reasoning_mode}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            probe_reasoning_mode: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.reasoning_modes,
+                          selectedDefaults.reasoning_mode,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Reply context</span>
+                      <select
+                        value={createForm.reasoning_context}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            reasoning_context: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.reasoning_contexts,
+                          selectedDefaults.reasoning_context,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Probe context</span>
+                      <select
+                        value={createForm.probe_reasoning_context}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            probe_reasoning_context: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.reasoning_contexts,
+                          selectedDefaults.reasoning_context,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Reply verbosity</span>
+                      <select
+                        value={createForm.text_verbosity}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            text_verbosity: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.text_verbosity_levels,
+                          selectedDefaults.text_verbosity,
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>Probe verbosity</span>
+                      <select
+                        value={createForm.probe_text_verbosity}
+                        onChange={(event) =>
+                          setCreateForm((previous) => ({
+                            ...previous,
+                            probe_text_verbosity: event.target.value,
+                          }))
+                        }
+                      >
+                        {renderSettingOptions(
+                          selectedCapabilities.text_verbosity_levels,
+                          selectedDefaults.text_verbosity,
+                        )}
+                      </select>
+                    </label>
+                  </div>
+                </details>
+              ) : null}
               <button className="primary-button" disabled={creating} type="submit">
                 {creating ? "Creating…" : "Create Session"}
               </button>

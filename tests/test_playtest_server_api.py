@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from __future__ import annotations
 
+import json
+import os
 import shutil
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -67,6 +70,19 @@ class PlaytestServerApiTests(unittest.TestCase):
         options = self.client.get("/api/options")
         self.assertEqual(options.status_code, 200)
         self.assertIn("dummy", options.json()["providers"])
+        self.assertEqual(
+            options.json()["providers"],
+            ["openai", "anthropic", "mistral", "gemini", "hf", "dummy"],
+        )
+        gpt56_profile = next(
+            profile
+            for profile in options.json()["model_profiles"]
+            if profile["id"] == "openai.gpt-5.6.v1"
+        )
+        self.assertEqual(
+            gpt56_profile["models"],
+            ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        )
 
         created = self.client.post(
             "/api/sessions",
@@ -120,6 +136,306 @@ class PlaytestServerApiTests(unittest.TestCase):
             self.assertEqual(
                 restored.json()["notes"],
                 "Observe whether the answer commits too early.",
+            )
+        finally:
+            restarted_client.close()
+
+    def test_gpt56_generation_config_survives_keyless_restart(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            created = self.client.post(
+                "/api/sessions",
+                json={
+                    "title": "GPT-5.6 offline restart",
+                    "provider": "openai",
+                    "model": "gpt-5.6-terra",
+                    "observer_provider": "openai",
+                    "observer_model": "gpt-5.6-luna",
+                    "script_id": "free_chat",
+                    "arm_preset": "static",
+                    "semantic_judge_backend": "off",
+                    "reasoning_effort": "medium",
+                    "reasoning_mode": "pro",
+                    "reasoning_context": "all_turns",
+                    "text_verbosity": "high",
+                    "probe_reasoning_effort": "none",
+                    "probe_reasoning_mode": "standard",
+                    "probe_reasoning_context": "current_turn",
+                    "probe_text_verbosity": "low",
+                },
+            )
+            self.assertEqual(created.status_code, 200, created.text)
+            created_payload = created.json()
+            session_id = created_payload["session_id"]
+            saved_payload = json.loads(
+                (self.playtest_sessions_dir / session_id / "session.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(saved_payload["version"], 2)
+
+            reply_config = created_payload["config"]["reply_config"]
+            self.assertEqual(reply_config["temperature"], 0.2)
+            self.assertEqual(reply_config["reasoning_effort"], "medium")
+            self.assertEqual(reply_config["reasoning_mode"], "pro")
+            self.assertEqual(reply_config["reasoning_context"], "all_turns")
+            self.assertEqual(reply_config["text_verbosity"], "high")
+            self.assertEqual(reply_config["model_profile_id"], "openai.gpt-5.6.v1")
+            self.assertEqual(reply_config["model_profile_version"], 1)
+
+            probe_config = created_payload["config"]["probe_config"]
+            self.assertEqual(probe_config["temperature"], 0.0)
+            self.assertEqual(probe_config["reasoning_effort"], "none")
+            self.assertEqual(probe_config["reasoning_mode"], "standard")
+            self.assertEqual(probe_config["reasoning_context"], "current_turn")
+            self.assertEqual(probe_config["text_verbosity"], "low")
+            self.assertEqual(probe_config["model_profile_id"], "openai.gpt-5.6.v1")
+            self.assertEqual(probe_config["model_profile_version"], 1)
+
+            observer_config = created_payload["config"]["observer_config"]
+            self.assertEqual(observer_config, probe_config)
+
+            restarted_client = TestClient(
+                build_app(
+                    sessions_dir=self.playtest_sessions_dir,
+                    allowed_origins=[],
+                    eval_sets_dir=self.eval_sets_dir,
+                    review_sessions_dir=self.review_sessions_dir,
+                )
+            )
+            try:
+                restored = restarted_client.get(f"/api/sessions/{session_id}")
+                self.assertEqual(restored.status_code, 200, restored.text)
+                restored_payload = restored.json()
+                self.assertEqual(restored_payload["provider"], "openai")
+                self.assertEqual(restored_payload["model"], "gpt-5.6-terra")
+                self.assertEqual(
+                    restored_payload["config"]["reply_config"], reply_config
+                )
+                self.assertEqual(
+                    restored_payload["config"]["probe_config"], probe_config
+                )
+                self.assertEqual(
+                    restored_payload["config"]["observer_config"], observer_config
+                )
+            finally:
+                restarted_client.close()
+
+    def test_cross_provider_observer_gets_its_own_auto_profile(self) -> None:
+        created = self.client.post(
+            "/api/sessions",
+            json={
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "observer_provider": "anthropic",
+                "observer_model": "claude-offline",
+                "script_id": "free_chat",
+                "arm_preset": "static",
+                "semantic_judge_backend": "off",
+                "probe_reasoning_effort": "medium",
+                "probe_reasoning_mode": "pro",
+                "probe_reasoning_context": "all_turns",
+                "probe_text_verbosity": "high",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        config = created.json()["config"]
+        self.assertEqual(config["probe_config"]["reasoning_effort"], "medium")
+        observer_config = config["observer_config"]
+        self.assertEqual(observer_config["model_profile_id"], "anthropic.default")
+        self.assertIsNone(observer_config["reasoning_effort"])
+        self.assertIsNone(observer_config["reasoning_mode"])
+        self.assertIsNone(observer_config["reasoning_context"])
+        self.assertIsNone(observer_config["text_verbosity"])
+
+    def test_legacy_session_is_migrated_to_durable_profile_pins(self) -> None:
+        created = self.client.post(
+            "/api/sessions",
+            json={
+                "provider": "openai",
+                "model": "gpt-4.1-mini-2025-04-14",
+                "script_id": "free_chat",
+                "arm_preset": "static",
+                "semantic_judge_backend": "off",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        session_id = created.json()["session_id"]
+        session_json = self.playtest_sessions_dir / session_id / "session.json"
+        legacy = json.loads(session_json.read_text(encoding="utf-8"))
+        legacy["version"] = 1
+        legacy["config"].pop("observer_config", None)
+        for label in ("reply_config", "probe_config"):
+            legacy["config"][label].pop("model_profile_id", None)
+            legacy["config"][label].pop("model_profile_version", None)
+            legacy["config"][label]["reasoning_effort"] = None
+            legacy["config"][label]["reasoning_mode"] = None
+            legacy["config"][label]["reasoning_context"] = None
+        session_json.write_text(
+            json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        restarted_client = TestClient(
+            build_app(
+                sessions_dir=self.playtest_sessions_dir,
+                allowed_origins=[],
+                eval_sets_dir=self.eval_sets_dir,
+                review_sessions_dir=self.review_sessions_dir,
+            )
+        )
+        try:
+            restored = restarted_client.get(f"/api/sessions/{session_id}")
+            self.assertEqual(restored.status_code, 200, restored.text)
+        finally:
+            restarted_client.close()
+
+        migrated = json.loads(session_json.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["version"], 2)
+        for label in ("reply_config", "probe_config", "observer_config"):
+            self.assertEqual(
+                migrated["config"][label]["model_profile_id"],
+                "openai.default",
+            )
+            self.assertEqual(
+                migrated["config"][label]["model_profile_version"],
+                1,
+            )
+
+    def test_unpinned_legacy_exact_profile_is_not_inferred(self) -> None:
+        created = self.client.post(
+            "/api/sessions",
+            json={
+                "provider": "openai",
+                "model": "gpt-5.6-terra",
+                "script_id": "free_chat",
+                "arm_preset": "static",
+                "semantic_judge_backend": "off",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        session_id = created.json()["session_id"]
+        session_json = self.playtest_sessions_dir / session_id / "session.json"
+        legacy = json.loads(session_json.read_text(encoding="utf-8"))
+        legacy["version"] = 1
+        legacy["config"].pop("observer_config", None)
+        for label in ("reply_config", "probe_config"):
+            legacy["config"][label].pop("model_profile_id", None)
+            legacy["config"][label].pop("model_profile_version", None)
+            legacy["config"][label]["reasoning_effort"] = None
+            legacy["config"][label]["reasoning_mode"] = None
+            legacy["config"][label]["reasoning_context"] = None
+        session_json.write_text(
+            json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        restarted_client = TestClient(
+            build_app(
+                sessions_dir=self.playtest_sessions_dir,
+                allowed_origins=[],
+                eval_sets_dir=self.eval_sets_dir,
+                review_sessions_dir=self.review_sessions_dir,
+            )
+        )
+        try:
+            listing = restarted_client.get("/api/sessions")
+            self.assertEqual(listing.status_code, 200, listing.text)
+            self.assertEqual(listing.json()["sessions"], [])
+            self.assertEqual(
+                listing.json()["load_errors"][0]["code"],
+                "legacy_profile_ambiguous",
+            )
+            self.assertNotIn("gpt-5.6-terra", listing.text)
+        finally:
+            restarted_client.close()
+
+        self.assertEqual(
+            json.loads(session_json.read_text(encoding="utf-8"))["version"],
+            1,
+        )
+
+    def test_already_pinned_v1_exact_profile_migrates(self) -> None:
+        created = self.client.post(
+            "/api/sessions",
+            json={
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "script_id": "free_chat",
+                "arm_preset": "static",
+                "semantic_judge_backend": "off",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        session_id = created.json()["session_id"]
+        session_json = self.playtest_sessions_dir / session_id / "session.json"
+        pinned_v1 = json.loads(session_json.read_text(encoding="utf-8"))
+        pinned_v1["version"] = 1
+        session_json.write_text(
+            json.dumps(pinned_v1, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        restarted_client = TestClient(
+            build_app(
+                sessions_dir=self.playtest_sessions_dir,
+                allowed_origins=[],
+                eval_sets_dir=self.eval_sets_dir,
+                review_sessions_dir=self.review_sessions_dir,
+            )
+        )
+        try:
+            restored = restarted_client.get(f"/api/sessions/{session_id}")
+            self.assertEqual(restored.status_code, 200, restored.text)
+        finally:
+            restarted_client.close()
+        self.assertEqual(
+            json.loads(session_json.read_text(encoding="utf-8"))["version"],
+            2,
+        )
+
+    def test_profile_version_mismatch_is_fail_closed_and_reported(self) -> None:
+        created = self.client.post(
+            "/api/sessions",
+            json={
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "script_id": "free_chat",
+                "arm_preset": "static",
+                "semantic_judge_backend": "off",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        session_id = created.json()["session_id"]
+        session_json = self.playtest_sessions_dir / session_id / "session.json"
+        payload = json.loads(session_json.read_text(encoding="utf-8"))
+        payload["config"]["reply_config"]["model_profile_version"] = 999
+        session_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        restarted_client = TestClient(
+            build_app(
+                sessions_dir=self.playtest_sessions_dir,
+                allowed_origins=[],
+                eval_sets_dir=self.eval_sets_dir,
+                review_sessions_dir=self.review_sessions_dir,
+            )
+        )
+        try:
+            listing = restarted_client.get("/api/sessions")
+            self.assertEqual(listing.status_code, 200, listing.text)
+            self.assertEqual(listing.json()["sessions"], [])
+            self.assertEqual(listing.json()["load_error_count"], 1)
+            self.assertEqual(listing.json()["load_errors"][0]["session_id"], session_id)
+            self.assertEqual(
+                listing.json()["load_errors"][0]["code"],
+                "model_profile_mismatch",
+            )
+            self.assertNotIn("999", listing.text)
+            self.assertEqual(
+                restarted_client.get(f"/api/sessions/{session_id}").status_code,
+                404,
             )
         finally:
             restarted_client.close()

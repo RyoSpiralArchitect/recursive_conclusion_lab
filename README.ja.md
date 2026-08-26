@@ -36,6 +36,82 @@
 - `hf`
 - `dummy`（API キー不要のローカル擬似プロバイダ）
 
+## Model profile と GPT-5.6
+
+provider adapter は wire protocol を担当し、exact-ID の model profile は model family ごとの
+capability と lab default を担当します。利用側の安定した契約は引き続き `BaseAdapter` と
+`build_adapter(provider, model)` で、その内側に adapter registry と profile resolver があります。
+
+OpenAI profile は現在、次の model ID だけを exact match で認識します。
+
+- `gpt-5.6`（GPT-5.6 Sol を指す OpenAI alias）
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+
+この family で扱える設定は次の通りです。
+
+- reasoning effort: `none | low | medium | high | xhigh | max`
+- reasoning mode: `standard | pro`
+- reasoning context: `current_turn | all_turns`
+- text verbosity: `low | medium | high`
+
+CLI では各設定に `auto` も指定できます。`auto` は profile 解決用の sentinel で、provider へは
+送信しません。GPT-5.6 に対するこの lab の既定値は effort=`none`、mode=`standard`、
+context=`current_turn` です。text verbosity は明示指定しない限り未設定のままです。これは
+visible token の余裕と turn-local な実験条件を保つための lab 固有の既定値であり、OpenAI service
+全体の既定値を説明するものではありません。
+
+adapter は既存の stateless な Responses 動作を維持します。`store=false`、chat message の手動 replay、
+`previous_response_id` なしのままです。`all_turns` を選ぶと request field は設定されますが、この PR で
+call 間や arm 間の persisted reasoning reuse が追加されるわけではありません。
+
+reply と probe は別々に設定できます。
+
+```bash
+python recursive_conclusion_lab.py repl \
+  --provider openai \
+  --model gpt-5.6-terra \
+  --reasoning-effort low \
+  --probe-reasoning-effort none \
+  --reasoning-mode standard \
+  --probe-reasoning-mode standard \
+  --reasoning-context current_turn \
+  --probe-reasoning-context current_turn \
+  --text-verbosity medium \
+  --probe-text-verbosity low \
+  --max-tokens 1200 \
+  --probe-max-tokens 360
+```
+
+GPT-5.6 profile は送信する reasoning effort が `none` のときだけ `temperature` を送ります。
+effort が `none` 以外なら `temperature` を payload から外し、その省略を adapter metadata に
+記録します。また OpenAI の `max_output_tokens` は visible output と reasoning token の両方を
+含む上限です。reasoning 条件に余裕が必要なら `--max-tokens` または `--probe-max-tokens` を
+増やしてください。
+
+Playtest session は reply、probe、独立 observer の解決済み control と、exact profile ID / version を
+保存します。後から profile が一致しなくなった場合は、異なる生成条件で黙って再開せず、session list に
+復元エラーを出して停止します。
+独立 observer が generator と異なる profile を使う場合、generator 専用の probe control は継承しません。
+明示する場合は `--observer-reasoning-*` と `--observer-text-verbosity` を使います。既存の version-1
+Playtest snapshot は、従来どおりの generic profile か、すでに完全な pin を持つ場合だけ初回 load 時に
+移行します。現在 exact profile に一致する未固定の旧 snapshot は、過去の wire semantics を安全に
+復元できないため fail closed します。
+
+同じ request shape を使う OpenAI Responses の model family を足すときは `ModelProfile` を
+`register_model_profile(...)` で登録します。別 provider や別 request shape には `BaseAdapter` の実装も
+必要で、`ADAPTER_REGISTRY.register(...)` へ登録します。既存の `build_adapter(...)` 呼び出し側は
+変更不要です。embedding adapter は引き続き別 registry で管理します。capability value は lowercase の
+canonical string とし、`auto` は profile default を選ぶ予約語です。
+
+profile 登録、request construction、offline parser test は、特定 API account の live access、quota、
+必要な service tier を保証せず、live provider validation を行ったことも意味しません。実行前に
+OpenAI 公式の [model catalog](https://developers.openai.com/api/docs/models)、
+[GPT-5.6 guidance](https://developers.openai.com/api/docs/guides/latest-model)、
+[reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)、
+[Responses API reference](https://developers.openai.com/api/docs/api-reference/responses/create) を確認してください。
+
 ## 必要環境変数
 
 - `OPENAI_API_KEY`

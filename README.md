@@ -25,6 +25,83 @@ Embedding-based semantic judging currently supports:
 - `openai`
 - `dummy`
 
+## Model profiles and GPT-5.6
+
+Provider adapters own the wire protocol, while exact-ID model profiles own model-family
+capabilities and lab defaults. `BaseAdapter` and `build_adapter(provider, model)` remain the
+stable consumer contract; the adapter registry and profile resolver sit behind them.
+
+The OpenAI profile currently recognizes these exact model IDs:
+
+- `gpt-5.6` (the OpenAI alias for GPT-5.6 Sol)
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+
+For this family, the harness supports:
+
+- reasoning effort: `none | low | medium | high | xhigh | max`
+- reasoning mode: `standard | pro`
+- reasoning context: `current_turn | all_turns`
+- text verbosity: `low | medium | high`
+
+The CLI also accepts `auto` for each setting. `auto` is a profile-resolution sentinel and is
+not sent to the provider. The GPT-5.6 lab defaults resolve to `none` effort, `standard` mode,
+and `current_turn` context; text verbosity remains unset unless requested. These deliberate lab
+defaults preserve visible-token headroom and turn-local experimental behavior. They are not a
+claim about OpenAI's service-wide defaults.
+
+The adapter keeps the existing stateless Responses behavior: `store=false`, manual chat-message
+replay, and no `previous_response_id`. Selecting `all_turns` sets the request field but does not,
+in this PR, add persisted reasoning reuse across calls or arms.
+
+Reply and probe controls can be set independently:
+
+```bash
+python recursive_conclusion_lab.py repl \
+  --provider openai \
+  --model gpt-5.6-terra \
+  --reasoning-effort low \
+  --probe-reasoning-effort none \
+  --reasoning-mode standard \
+  --probe-reasoning-mode standard \
+  --reasoning-context current_turn \
+  --probe-reasoning-context current_turn \
+  --text-verbosity medium \
+  --probe-text-verbosity low \
+  --max-tokens 1200 \
+  --probe-max-tokens 360
+```
+
+The GPT-5.6 profile sends `temperature` only when the reasoning effort sent is `none`. At any
+non-`none` effort it omits `temperature` and records that omission in adapter metadata. OpenAI's
+`max_output_tokens` limit includes both visible output and reasoning tokens, so raise
+`--max-tokens` or `--probe-max-tokens` when a reasoning condition needs more headroom.
+
+Playtest sessions persist the resolved reply, probe, and independent-observer controls together
+with the exact profile ID and version. A later profile mismatch fails closed and is reported in the
+session list instead of silently resuming an experiment with different generation semantics.
+When an independent observer uses a different profile, generator-only probe controls are not
+inherited; use the `--observer-reasoning-*` and `--observer-text-verbosity` flags to set them
+explicitly. Compatible version-1 Playtest snapshots are pinned and migrated on their first load:
+automatic migration is limited to unchanged generic profiles or snapshots that already carry
+complete pins. An unpinned legacy snapshot that now matches an exact profile fails closed because
+its earlier wire semantics cannot be reconstructed safely.
+
+To add another OpenAI Responses model family with the same request shape, register a
+`ModelProfile` with `register_model_profile(...)`. A different provider or request shape also needs
+a `BaseAdapter` implementation registered through `ADAPTER_REGISTRY.register(...)`; existing
+`build_adapter(...)` callers do not need to change. Embedding adapters remain in their separate
+registry. Capability values are lowercase canonical strings, and `auto` is reserved for selecting
+the profile default.
+
+Profile registration, request construction, and offline parser tests do not imply that a given
+API account has live access, quota, or the required service tier, and do not constitute a live
+provider validation. Check the official OpenAI [model catalog](https://developers.openai.com/api/docs/models),
+[GPT-5.6 guidance](https://developers.openai.com/api/docs/guides/latest-model),
+[reasoning guide](https://developers.openai.com/api/docs/guides/reasoning), and
+[Responses API reference](https://developers.openai.com/api/docs/api-reference/responses/create) before a live run.
+
 ## Requirements
 
 - Python 3.9+

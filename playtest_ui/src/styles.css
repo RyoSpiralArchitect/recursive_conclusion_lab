@@ -194,6 +194,7 @@ textarea:focus-visible {
   color: var(--danger);
   margin: 0 auto 14px;
   max-width: 1800px;
+  overflow-wrap: anywhere;
   padding: 10px 12px;
 }
 
@@ -259,6 +260,25 @@ textarea:focus-visible {
   color: var(--ink);
   min-width: 0;
   padding: 9px 10px;
+}
+
+.model-controls {
+  border-bottom: 1px solid var(--line);
+  border-top: 1px solid var(--line);
+  padding: 9px 0;
+}
+
+.model-controls summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.model-control-grid {
+  display: grid;
+  gap: 10px;
+  padding-top: 11px;
 }
 
 .primary-button,

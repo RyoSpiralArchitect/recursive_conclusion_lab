@@ -49,13 +49,19 @@ from recursive_conclusion_lab import (
     DeferredIntentTiming,
     ExperimentConfig,
     GenerationConfig,
+    ModelProfilePinError,
     RecursiveConclusionSession,
     SemanticJudgeBackend,
     SteerStrength,
+    available_embedding_provider_names,
+    available_provider_names,
     build_adapter,
     build_embedding_adapter,
+    canonical_embedding_provider_name,
+    canonical_provider_name,
     compact_text,
     load_script,
+    model_profile_catalog,
     strip_rcl_state,
 )
 
@@ -71,11 +77,17 @@ DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-4.1-mini-2025-04-14"
 DEFAULT_EMBEDDING_PROVIDER = "openai"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+SESSION_SCHEMA_VERSION = 2
+PUBLIC_LOAD_ERROR_LIMIT = 20
 
 DEFAULT_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
     "http://localhost:5173",
 ]
+
+
+class AmbiguousLegacyProfileError(ModelProfilePinError):
+    pass
 
 
 def json_ready(value: Any) -> Any:
@@ -98,11 +110,31 @@ def json_ready(value: Any) -> Any:
 
 
 def generation_config_from_dict(data: dict[str, Any]) -> GenerationConfig:
+    temperature_raw = data.get("temperature", 0.2)
+    profile_id_raw = data.get("model_profile_id")
+    profile_version_raw = data.get("model_profile_version")
     return GenerationConfig(
-        temperature=float(data.get("temperature", 0.2) or 0.2),
+        temperature=(
+            float(temperature_raw) if temperature_raw is not None else 0.2
+        ),
         max_tokens=int(data.get("max_tokens", 900) or 900),
         timeout_seconds=int(data.get("timeout_seconds", 120) or 120),
+        reasoning_effort=optional_generation_setting(data.get("reasoning_effort")),
+        reasoning_mode=optional_generation_setting(data.get("reasoning_mode")),
+        reasoning_context=optional_generation_setting(data.get("reasoning_context")),
+        text_verbosity=optional_generation_setting(data.get("text_verbosity")),
+        model_profile_id=(
+            str(profile_id_raw).strip() if profile_id_raw is not None else None
+        ),
+        model_profile_version=(
+            int(profile_version_raw) if profile_version_raw is not None else None
+        ),
     )
+
+
+def optional_generation_setting(value: Any) -> Optional[str]:
+    cleaned = str(value or "").strip().lower()
+    return None if not cleaned or cleaned == "auto" else cleaned
 
 
 def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
@@ -243,6 +275,11 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         show_probe_outputs=bool(data.get("show_probe_outputs", False)),
         reply_config=generation_config_from_dict(dict(data.get("reply_config") or {})),
         probe_config=generation_config_from_dict(dict(data.get("probe_config") or {})),
+        observer_config=(
+            generation_config_from_dict(dict(data["observer_config"]))
+            if isinstance(data.get("observer_config"), dict)
+            else None
+        ),
     )
 
 
@@ -587,6 +624,18 @@ class CreateSessionRequest(BaseModel):
     script_id: str = "free_chat"
     arm_preset: str = "adaptive_kind_aware"
     semantic_judge_backend: str = SemanticJudgeBackend.BOTH.value
+    reasoning_effort: Optional[str] = None
+    probe_reasoning_effort: Optional[str] = None
+    reasoning_mode: Optional[str] = None
+    probe_reasoning_mode: Optional[str] = None
+    reasoning_context: Optional[str] = None
+    probe_reasoning_context: Optional[str] = None
+    text_verbosity: Optional[str] = None
+    probe_text_verbosity: Optional[str] = None
+    observer_reasoning_effort: Optional[str] = None
+    observer_reasoning_mode: Optional[str] = None
+    observer_reasoning_context: Optional[str] = None
+    observer_text_verbosity: Optional[str] = None
 
 
 class TurnRequest(BaseModel):
@@ -616,6 +665,7 @@ class SessionManager:
         self.sessions_dir = sessions_dir
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._records: dict[str, PlaytestRecord] = {}
+        self._load_errors: list[dict[str, str]] = []
         self._lock = threading.RLock()
         self._load_existing()
 
@@ -629,31 +679,136 @@ class SessionManager:
         for session_json in sorted(self.sessions_dir.glob("*/session.json")):
             try:
                 payload = json.loads(session_json.read_text(encoding="utf-8"))
-                record = self._restore_record(payload, session_json.parent)
-            except Exception:
+                schema_version = int(payload.get("version", 1) or 1)
+                if schema_version < 1 or schema_version > SESSION_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"Unsupported saved session schema version: {schema_version}."
+                    )
+                record = self._restore_record(
+                    payload,
+                    session_json.parent,
+                    schema_version=schema_version,
+                )
+                if schema_version < SESSION_SCHEMA_VERSION:
+                    self._save_record(record, touch_updated_at=False)
+            except Exception as exc:
+                self._load_errors.append(
+                    self._public_load_error(session_json.parent.name, exc)
+                )
                 continue
             self._records[record.session_id] = record
 
+    @staticmethod
+    def _public_load_error(session_id: str, exc: Exception) -> dict[str, str]:
+        if isinstance(exc, AmbiguousLegacyProfileError):
+            return {
+                "session_id": session_id,
+                "code": "legacy_profile_ambiguous",
+                "message": (
+                    "This legacy session predates exact model-profile provenance; "
+                    "it was not resumed with inferred generation semantics."
+                ),
+            }
+        if isinstance(exc, ModelProfilePinError):
+            return {
+                "session_id": session_id,
+                "code": "model_profile_mismatch",
+                "message": (
+                    "The pinned model profile is missing or no longer matches; "
+                    "the session was not resumed."
+                ),
+            }
+        if isinstance(exc, OSError):
+            return {
+                "session_id": session_id,
+                "code": "storage_error",
+                "message": "The saved session could not be read or migrated.",
+            }
+        return {
+            "session_id": session_id,
+            "code": "invalid_snapshot",
+            "message": "The saved session is invalid or incompatible and was not resumed.",
+        }
+
     def _restore_record(
-        self, payload: dict[str, Any], storage_dir: Path
+        self,
+        payload: dict[str, Any],
+        storage_dir: Path,
+        *,
+        schema_version: int,
     ) -> PlaytestRecord:
-        provider = str(payload.get("provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER)
+        session_id = compact_text(str(payload.get("session_id") or ""))
+        if not session_id or session_id != storage_dir.name:
+            raise ValueError("Saved session id does not match its storage directory.")
+        provider = canonical_provider_name(
+            str(payload.get("provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER)
+        )
         model = str(payload.get("model", DEFAULT_MODEL) or DEFAULT_MODEL)
-        observer_provider = str(payload.get("observer_provider", provider) or provider)
+        observer_provider = canonical_provider_name(
+            str(payload.get("observer_provider", provider) or provider)
+        )
         observer_model = str(payload.get("observer_model", model) or model)
-        embedding_provider = str(
-            payload.get("embedding_provider", DEFAULT_EMBEDDING_PROVIDER)
-            or DEFAULT_EMBEDDING_PROVIDER
+        embedding_provider = canonical_embedding_provider_name(
+            str(
+                payload.get("embedding_provider", DEFAULT_EMBEDDING_PROVIDER)
+                or DEFAULT_EMBEDDING_PROVIDER
+            )
         )
         embedding_model = str(
             payload.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
             or DEFAULT_EMBEDDING_MODEL
         )
         config = experiment_config_from_dict(dict(payload.get("config") or {}))
+        generation_adapter = build_adapter(provider, model)
+        observer_generation_adapter = build_adapter(
+            observer_provider, observer_model
+        )
+        if schema_version >= SESSION_SCHEMA_VERSION:
+            pinned_configs = {
+                "reply_config": config.reply_config,
+                "probe_config": config.probe_config,
+                "observer_config": config.observer_config,
+            }
+            for label, generation_config in pinned_configs.items():
+                if generation_config is None or (
+                    generation_config.model_profile_id is None
+                    or generation_config.model_profile_version is None
+                ):
+                    raise ModelProfilePinError(
+                        f"Saved {label} is missing its model profile pin."
+                    )
+        else:
+            legacy_configs = (
+                ("reply_config", config.reply_config, generation_adapter),
+                ("probe_config", config.probe_config, generation_adapter),
+                (
+                    "observer_config",
+                    config.observer_config,
+                    observer_generation_adapter,
+                ),
+            )
+            for label, generation_config, adapter in legacy_configs:
+                has_profile_id = (
+                    generation_config is not None
+                    and generation_config.model_profile_id is not None
+                )
+                has_profile_version = (
+                    generation_config is not None
+                    and generation_config.model_profile_version is not None
+                )
+                if has_profile_id != has_profile_version:
+                    raise ModelProfilePinError(
+                        f"Saved {label} has an incomplete model profile pin."
+                    )
+                if not has_profile_id and adapter.model_profile.model_ids:
+                    raise AmbiguousLegacyProfileError(
+                        f"Saved {label} predates exact profile provenance for "
+                        f"{adapter.provider_name}={adapter.model!r}."
+                    )
         log_path = storage_dir / "events.jsonl"
         session = RecursiveConclusionSession(
-            adapter=build_adapter(provider, model),
-            observer_adapter=build_adapter(observer_provider, observer_model),
+            adapter=generation_adapter,
+            observer_adapter=observer_generation_adapter,
             embedding_adapter=(
                 build_embedding_adapter(embedding_provider, embedding_model)
                 if config.semantic_judge_backend
@@ -665,7 +820,7 @@ class SessionManager:
         )
         restore_session_state(session, dict(payload.get("session_state") or {}))
         return PlaytestRecord(
-            session_id=str(payload.get("session_id")),
+            session_id=session_id,
             title=str(payload.get("title", "") or ""),
             created_at=float(payload.get("created_at", time.time()) or time.time()),
             updated_at=float(payload.get("updated_at", time.time()) or time.time()),
@@ -693,11 +848,14 @@ class SessionManager:
             session=session,
         )
 
-    def _save_record(self, record: PlaytestRecord) -> None:
-        record.updated_at = time.time()
+    def _save_record(
+        self, record: PlaytestRecord, *, touch_updated_at: bool = True
+    ) -> None:
+        if touch_updated_at:
+            record.updated_at = time.time()
         record.storage_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": SESSION_SCHEMA_VERSION,
             "session_id": record.session_id,
             "title": record.title,
             "created_at": record.created_at,
@@ -717,10 +875,18 @@ class SessionManager:
             "config": json_ready(record.session.config),
             "session_state": serialize_session_state(record.session),
         }
-        self._session_json_path(record.session_id).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        session_json = self._session_json_path(record.session_id)
+        temporary = session_json.with_name(
+            f".{session_json.name}.{secrets.token_hex(4)}.tmp"
         )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, session_json)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _default_title(self, script_id: str, arm_preset: str) -> str:
         script_label = SCRIPT_INDEX.get(script_id, {}).get("label") or humanize_name(
@@ -763,6 +929,16 @@ class SessionManager:
                     }
                 )
             return items
+
+    def load_errors(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [
+                dict(item) for item in self._load_errors[:PUBLIC_LOAD_ERROR_LIMIT]
+            ]
+
+    def load_error_count(self) -> int:
+        with self._lock:
+            return len(self._load_errors)
 
     def get_record(self, session_id: str) -> PlaytestRecord:
         with self._lock:
@@ -808,9 +984,13 @@ class SessionManager:
             request.semantic_judge_backend or SemanticJudgeBackend.BOTH.value
         )
 
-        provider = compact_text(request.provider).lower() or DEFAULT_PROVIDER
-        model = compact_text(request.model) or DEFAULT_MODEL
-        observer_provider = (
+        provider = canonical_provider_name(
+            compact_text(request.provider).lower() or DEFAULT_PROVIDER
+        )
+        model = compact_text(request.model)
+        if not model:
+            raise ValueError("model must not be blank")
+        observer_provider = canonical_provider_name(
             compact_text(request.observer_provider or "").lower() or provider
         )
         observer_model = compact_text(request.observer_model or "") or model
@@ -830,6 +1010,9 @@ class SessionManager:
                     if embedding_provider == "dummy"
                     else DEFAULT_EMBEDDING_MODEL
                 )
+            embedding_provider = canonical_embedding_provider_name(
+                embedding_provider
+            )
 
         session_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
         storage_dir = self._session_dir(session_id)
@@ -839,6 +1022,45 @@ class SessionManager:
             arm_preset=request.arm_preset,
             semantic_judge_backend=semantic_judge_backend,
         )
+        config.reply_config = dataclasses.replace(
+            config.reply_config,
+            reasoning_effort=optional_generation_setting(request.reasoning_effort),
+            reasoning_mode=optional_generation_setting(request.reasoning_mode),
+            reasoning_context=optional_generation_setting(request.reasoning_context),
+            text_verbosity=optional_generation_setting(request.text_verbosity),
+        )
+        config.probe_config = dataclasses.replace(
+            config.probe_config,
+            reasoning_effort=optional_generation_setting(
+                request.probe_reasoning_effort
+            ),
+            reasoning_mode=optional_generation_setting(request.probe_reasoning_mode),
+            reasoning_context=optional_generation_setting(
+                request.probe_reasoning_context
+            ),
+            text_verbosity=optional_generation_setting(request.probe_text_verbosity),
+        )
+        observer_controls = {
+            "reasoning_effort": optional_generation_setting(
+                request.observer_reasoning_effort
+            ),
+            "reasoning_mode": optional_generation_setting(
+                request.observer_reasoning_mode
+            ),
+            "reasoning_context": optional_generation_setting(
+                request.observer_reasoning_context
+            ),
+            "text_verbosity": optional_generation_setting(
+                request.observer_text_verbosity
+            ),
+        }
+        if any(value is not None for value in observer_controls.values()):
+            config.observer_config = GenerationConfig(
+                temperature=config.probe_config.temperature,
+                max_tokens=config.probe_config.max_tokens,
+                timeout_seconds=config.probe_config.timeout_seconds,
+                **observer_controls,
+            )
         session = RecursiveConclusionSession(
             adapter=build_adapter(provider, model),
             observer_adapter=build_adapter(observer_provider, observer_model),
@@ -974,12 +1196,18 @@ def build_app(
             "semantic_judge_backends": [
                 backend.value for backend in SemanticJudgeBackend
             ],
-            "providers": ["openai", "anthropic", "mistral", "gemini", "hf", "dummy"],
+            "providers": list(available_provider_names()),
+            "embedding_providers": list(available_embedding_provider_names()),
+            "model_profiles": model_profile_catalog(),
         }
 
     @app.get("/api/sessions")
     def list_sessions() -> dict[str, Any]:
-        return {"sessions": manager.list_summaries()}
+        return {
+            "sessions": manager.list_summaries(),
+            "load_errors": manager.load_errors(),
+            "load_error_count": manager.load_error_count(),
+        }
 
     @app.post("/api/sessions")
     def create_session(request: CreateSessionRequest) -> dict[str, Any]:

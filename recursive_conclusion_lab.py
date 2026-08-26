@@ -30,10 +30,9 @@ import os
 from pathlib import Path
 import random
 import re
-import sys
 import textwrap
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 # ----------------------------
@@ -56,6 +55,240 @@ class GenerationConfig:
     temperature: float = 0.2
     max_tokens: int = 900
     timeout_seconds: int = 120
+    reasoning_effort: Optional[str] = None
+    reasoning_mode: Optional[str] = None
+    reasoning_context: Optional[str] = None
+    text_verbosity: Optional[str] = None
+    model_profile_id: Optional[str] = None
+    model_profile_version: Optional[int] = None
+
+
+class ModelProfilePinError(ValueError):
+    pass
+
+
+class TemperaturePolicy(str, Enum):
+    ALWAYS = "always"
+    REASONING_NONE_ONLY = "reasoning_none_only"
+    NEVER = "never"
+
+
+@dataclass(frozen=True)
+class ModelCapabilities:
+    reasoning_efforts: tuple[str, ...] = ()
+    reasoning_modes: tuple[str, ...] = ()
+    reasoning_contexts: tuple[str, ...] = ()
+    text_verbosity_levels: tuple[str, ...] = ()
+    temperature_policy: TemperaturePolicy = TemperaturePolicy.ALWAYS
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    profile_id: str
+    provider: str
+    model_ids: tuple[str, ...]
+    capabilities: ModelCapabilities
+    default_reasoning_effort: Optional[str] = None
+    default_reasoning_mode: Optional[str] = None
+    default_reasoning_context: Optional[str] = None
+    default_text_verbosity: Optional[str] = None
+    version: int = 1
+
+    def public_descriptor(self) -> dict[str, Any]:
+        return {
+            "id": self.profile_id,
+            "version": self.version,
+            "provider": self.provider,
+            "models": list(self.model_ids),
+            "capabilities": {
+                "reasoning_efforts": list(self.capabilities.reasoning_efforts),
+                "reasoning_modes": list(self.capabilities.reasoning_modes),
+                "reasoning_contexts": list(self.capabilities.reasoning_contexts),
+                "text_verbosity_levels": list(
+                    self.capabilities.text_verbosity_levels
+                ),
+                "temperature_policy": self.capabilities.temperature_policy.value,
+            },
+            "defaults": {
+                "reasoning_effort": self.default_reasoning_effort,
+                "reasoning_mode": self.default_reasoning_mode,
+                "reasoning_context": self.default_reasoning_context,
+                "text_verbosity": self.default_text_verbosity,
+            },
+        }
+
+
+@dataclass(frozen=True)
+class ResolvedGenerationSettings:
+    profile_id: str
+    profile_version: int
+    temperature: Optional[float]
+    reasoning_effort: Optional[str]
+    reasoning_mode: Optional[str]
+    reasoning_context: Optional[str]
+    text_verbosity: Optional[str]
+    omitted_controls: tuple[str, ...] = ()
+
+    def metadata(
+        self,
+        config: GenerationConfig,
+        *,
+        requested_model: str,
+        response_model: Optional[str] = None,
+    ) -> dict[str, Any]:
+        return {
+            "profile_id": self.profile_id,
+            "profile_version": self.profile_version,
+            "requested_model": requested_model,
+            "response_model": response_model,
+            "requested": {
+                "temperature": config.temperature,
+                "max_tokens": config.max_tokens,
+                "reasoning_effort": config.reasoning_effort,
+                "reasoning_mode": config.reasoning_mode,
+                "reasoning_context": config.reasoning_context,
+                "text_verbosity": config.text_verbosity,
+            },
+            "sent": {
+                "temperature": self.temperature,
+                "max_tokens": config.max_tokens,
+                "reasoning_effort": self.reasoning_effort,
+                "reasoning_mode": self.reasoning_mode,
+                "reasoning_context": self.reasoning_context,
+                "text_verbosity": self.text_verbosity,
+            },
+            "omitted_controls": list(self.omitted_controls),
+        }
+
+
+_MODEL_PROFILES: list[ModelProfile] = []
+
+
+def register_model_profile(profile: ModelProfile) -> None:
+    provider = profile.provider.strip().lower()
+    if not provider or provider != profile.provider:
+        raise ValueError("Model profile providers must be lowercase canonical names.")
+    if not profile.profile_id.strip():
+        raise ValueError("Model profile id must not be blank.")
+    if profile.profile_id != profile.profile_id.strip():
+        raise ValueError("Model profile id must not contain surrounding whitespace.")
+    if (
+        not isinstance(profile.version, int)
+        or isinstance(profile.version, bool)
+        or profile.version < 1
+    ):
+        raise ValueError("Model profile version must be at least 1.")
+    if not profile.model_ids:
+        raise ValueError("Model profiles must declare at least one exact model id.")
+    if any(not model_id.strip() for model_id in profile.model_ids):
+        raise ValueError("Model profile ids must not be blank.")
+    if len(set(profile.model_ids)) != len(profile.model_ids):
+        raise ValueError("Model profiles must not repeat a model id.")
+    capability_values = (
+        ("reasoning_efforts", profile.capabilities.reasoning_efforts),
+        ("reasoning_modes", profile.capabilities.reasoning_modes),
+        ("reasoning_contexts", profile.capabilities.reasoning_contexts),
+        ("text_verbosity_levels", profile.capabilities.text_verbosity_levels),
+    )
+    for label, values in capability_values:
+        if len(set(values)) != len(values):
+            raise ValueError(f"Model profile {label} must not contain duplicates.")
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Model profile {label} values must be nonblank strings.")
+            if value != value.strip().lower():
+                raise ValueError(
+                    f"Model profile {label} values must be lowercase canonical strings."
+                )
+            if value == "auto":
+                raise ValueError(
+                    f"Model profile {label} reserves 'auto' for profile defaults."
+                )
+    if any(
+        registered.profile_id == profile.profile_id
+        for registered in _MODEL_PROFILES
+    ):
+        raise ValueError(f"Model profile id already registered: {profile.profile_id!r}")
+    defaults = (
+        (
+            "default_reasoning_effort",
+            profile.default_reasoning_effort,
+            profile.capabilities.reasoning_efforts,
+        ),
+        (
+            "default_reasoning_mode",
+            profile.default_reasoning_mode,
+            profile.capabilities.reasoning_modes,
+        ),
+        (
+            "default_reasoning_context",
+            profile.default_reasoning_context,
+            profile.capabilities.reasoning_contexts,
+        ),
+        (
+            "default_text_verbosity",
+            profile.default_text_verbosity,
+            profile.capabilities.text_verbosity_levels,
+        ),
+    )
+    for label, value, supported in defaults:
+        if value is not None and value not in supported:
+            raise ValueError(
+                f"{label}={value!r} is not declared by profile {profile.profile_id!r}."
+            )
+    occupied = {
+        (registered.provider, model_id)
+        for registered in _MODEL_PROFILES
+        for model_id in registered.model_ids
+    }
+    collisions = sorted(
+        model_id
+        for model_id in profile.model_ids
+        if (profile.provider, model_id) in occupied
+    )
+    if collisions:
+        raise ValueError(
+            f"Model ids already registered for {profile.provider}: {', '.join(collisions)}"
+        )
+    _MODEL_PROFILES.append(profile)
+
+
+def resolve_model_profile(provider: str, model: str) -> ModelProfile:
+    canonical_provider = provider.strip().lower()
+    for profile in _MODEL_PROFILES:
+        if profile.provider == canonical_provider and model in profile.model_ids:
+            return profile
+    return ModelProfile(
+        profile_id=f"{canonical_provider}.default",
+        provider=canonical_provider,
+        model_ids=(),
+        capabilities=ModelCapabilities(),
+    )
+
+
+def model_profile_catalog() -> list[dict[str, Any]]:
+    return [profile.public_descriptor() for profile in _MODEL_PROFILES]
+
+
+register_model_profile(
+    ModelProfile(
+        profile_id="openai.gpt-5.6.v1",
+        provider="openai",
+        model_ids=("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
+        capabilities=ModelCapabilities(
+            reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
+            reasoning_modes=("standard", "pro"),
+            reasoning_contexts=("current_turn", "all_turns"),
+            text_verbosity_levels=("low", "medium", "high"),
+            temperature_policy=TemperaturePolicy.REASONING_NONE_ONLY,
+        ),
+        # The lab favors visible-token headroom and arm-local reasoning unless a
+        # run explicitly chooses a different condition.
+        default_reasoning_effort="none",
+        default_reasoning_mode="standard",
+        default_reasoning_context="current_turn",
+    )
+)
 
 
 @dataclass
@@ -67,6 +300,16 @@ class ProviderResponse:
     usage: Optional[dict[str, Any]] = None
     finish_reason: Optional[str] = None
     request_id: Optional[str] = None
+    adapter_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def generation_config_with_min_tokens(
+    config: GenerationConfig, minimum: int
+) -> GenerationConfig:
+    return dataclasses.replace(
+        config,
+        max_tokens=max(int(config.max_tokens or 0), int(minimum)),
+    )
 
 
 @dataclass
@@ -229,6 +472,7 @@ class ExperimentConfig:
             temperature=0.0, max_tokens=220, timeout_seconds=120
         )
     )
+    observer_config: Optional[GenerationConfig] = None
 
 
 @dataclass
@@ -1518,6 +1762,104 @@ class BaseAdapter(abc.ABC):
 
     def __init__(self, model: str) -> None:
         self.model = model
+        self.model_profile = resolve_model_profile(self.provider_name, model)
+
+    @staticmethod
+    def _resolve_capability_value(
+        *,
+        label: str,
+        requested: Optional[str],
+        default: Optional[str],
+        supported: tuple[str, ...],
+        profile_id: str,
+    ) -> Optional[str]:
+        value = requested if requested is not None else default
+        if value is None:
+            return None
+        if value not in supported:
+            choices = ", ".join(supported) if supported else "none"
+            raise ValueError(
+                f"{label}={value!r} is not supported by model profile "
+                f"{profile_id!r}. Supported values: {choices}."
+            )
+        return value
+
+    def resolve_generation_settings(
+        self, config: GenerationConfig
+    ) -> ResolvedGenerationSettings:
+        profile = self.model_profile
+        has_pinned_id = config.model_profile_id is not None
+        has_pinned_version = config.model_profile_version is not None
+        if has_pinned_id != has_pinned_version:
+            raise ModelProfilePinError(
+                "Pinned model profile requires both model_profile_id and "
+                "model_profile_version."
+            )
+        if has_pinned_id and (
+            config.model_profile_id != profile.profile_id
+            or config.model_profile_version != profile.version
+        ):
+            raise ModelProfilePinError(
+                "Pinned model profile "
+                f"{config.model_profile_id!r} version {config.model_profile_version} "
+                "does not match resolved profile "
+                f"{profile.profile_id!r} version {profile.version} for "
+                f"{self.provider_name}={self.model!r}; refusing to resume with "
+                "different generation semantics."
+            )
+        capabilities = profile.capabilities
+        reasoning_effort = self._resolve_capability_value(
+            label="reasoning_effort",
+            requested=config.reasoning_effort,
+            default=profile.default_reasoning_effort,
+            supported=capabilities.reasoning_efforts,
+            profile_id=profile.profile_id,
+        )
+        reasoning_mode = self._resolve_capability_value(
+            label="reasoning_mode",
+            requested=config.reasoning_mode,
+            default=profile.default_reasoning_mode,
+            supported=capabilities.reasoning_modes,
+            profile_id=profile.profile_id,
+        )
+        reasoning_context = self._resolve_capability_value(
+            label="reasoning_context",
+            requested=config.reasoning_context,
+            default=profile.default_reasoning_context,
+            supported=capabilities.reasoning_contexts,
+            profile_id=profile.profile_id,
+        )
+        text_verbosity = self._resolve_capability_value(
+            label="text_verbosity",
+            requested=config.text_verbosity,
+            default=profile.default_text_verbosity,
+            supported=capabilities.text_verbosity_levels,
+            profile_id=profile.profile_id,
+        )
+
+        temperature: Optional[float] = config.temperature
+        omitted_controls: list[str] = []
+        if capabilities.temperature_policy == TemperaturePolicy.NEVER:
+            temperature = None
+        elif (
+            capabilities.temperature_policy
+            == TemperaturePolicy.REASONING_NONE_ONLY
+            and reasoning_effort != "none"
+        ):
+            temperature = None
+        if temperature is None and config.temperature is not None:
+            omitted_controls.append("temperature")
+
+        return ResolvedGenerationSettings(
+            profile_id=profile.profile_id,
+            profile_version=profile.version,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            reasoning_mode=reasoning_mode,
+            reasoning_context=reasoning_context,
+            text_verbosity=text_verbosity,
+            omitted_controls=tuple(omitted_controls),
+        )
 
     @abc.abstractmethod
     def generate(
@@ -1528,6 +1870,35 @@ class BaseAdapter(abc.ABC):
         config: GenerationConfig,
     ) -> ProviderResponse:
         raise NotImplementedError
+
+
+def pin_generation_config(
+    adapter: BaseAdapter, config: GenerationConfig
+) -> GenerationConfig:
+    resolved = adapter.resolve_generation_settings(config)
+    return dataclasses.replace(
+        config,
+        reasoning_effort=resolved.reasoning_effort,
+        reasoning_mode=resolved.reasoning_mode,
+        reasoning_context=resolved.reasoning_context,
+        text_verbosity=resolved.text_verbosity,
+        model_profile_id=resolved.profile_id,
+        model_profile_version=resolved.profile_version,
+    )
+
+
+def generation_config_with_auto_model_controls(
+    config: GenerationConfig,
+) -> GenerationConfig:
+    return dataclasses.replace(
+        config,
+        reasoning_effort=None,
+        reasoning_mode=None,
+        reasoning_context=None,
+        text_verbosity=None,
+        model_profile_id=None,
+        model_profile_version=None,
+    )
 
 
 class BaseEmbeddingAdapter(abc.ABC):
@@ -1556,6 +1927,7 @@ class DummyAdapter(BaseAdapter):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
+        resolved = self.resolve_generation_settings(config)
         prompt = messages[-1].content if messages else ""
         lower = prompt.lower()
         system_lower = (system or "").lower()
@@ -2019,6 +2391,11 @@ class DummyAdapter(BaseAdapter):
             usage={"input_tokens": 0, "output_tokens": 0},
             finish_reason="stop",
             request_id=f"dummy-{random.randint(1000, 9999)}",
+            adapter_metadata=resolved.metadata(
+                config,
+                requested_model=self.model,
+                response_model=self.model,
+            ),
         )
 
 
@@ -2046,9 +2423,118 @@ class OpenAIResponsesAdapter(BaseAdapter):
     provider_name = "openai"
     url = "https://api.openai.com/v1/responses"
 
-    def __init__(self, model: str, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        model: str,
+        api_key: Optional[str] = None,
+        transport: Optional[Callable[..., dict[str, Any]]] = None,
+    ) -> None:
         super().__init__(model=model)
-        self.api_key = api_key or require_env("OPENAI_API_KEY")
+        self.api_key = api_key.strip() if api_key else None
+        self.transport = transport or post_json
+
+    def build_request_payload(
+        self,
+        *,
+        system: Optional[str],
+        messages: list[ChatMessage],
+        config: GenerationConfig,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_generation_settings(config)
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": m.role, "content": m.content} for m in messages],
+            "max_output_tokens": config.max_tokens,
+            "store": False,
+        }
+        if resolved.temperature is not None:
+            payload["temperature"] = resolved.temperature
+        reasoning = {
+            key: value
+            for key, value in {
+                "effort": resolved.reasoning_effort,
+                "mode": resolved.reasoning_mode,
+                "context": resolved.reasoning_context,
+            }.items()
+            if value is not None
+        }
+        if reasoning:
+            payload["reasoning"] = reasoning
+        if resolved.text_verbosity is not None:
+            payload["text"] = {"verbosity": resolved.text_verbosity}
+        if system:
+            payload["instructions"] = system
+        return payload
+
+    def parse_response(
+        self,
+        data: dict[str, Any],
+        *,
+        adapter_metadata: Optional[dict[str, Any]] = None,
+    ) -> ProviderResponse:
+        text_parts: list[str] = []
+        refusals: list[str] = []
+        for item in data.get("output", []) or []:
+            if not isinstance(item, dict) or item.get("type") != "message":
+                continue
+            for block in item.get("content", []) or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "output_text" and isinstance(
+                    block.get("text"), str
+                ):
+                    text_parts.append(block["text"])
+                elif block.get("type") == "refusal":
+                    refusal = block.get("refusal") or block.get("text")
+                    if isinstance(refusal, str):
+                        refusals.append(refusal)
+        text = "\n".join(text_parts or refusals).strip()
+
+        status = data.get("status")
+        finish_reason = str(status) if status is not None else None
+        if status == "incomplete":
+            reason = (data.get("incomplete_details") or {}).get("reason")
+            if reason:
+                finish_reason = f"incomplete:{reason}"
+        elif status == "failed":
+            error = data.get("error") or {}
+            code = error.get("code") if isinstance(error, dict) else None
+            if code:
+                finish_reason = f"failed:{code}"
+
+        metadata = dict(adapter_metadata or {})
+        response_model = data.get("model")
+        if isinstance(response_model, str):
+            metadata["response_model"] = response_model
+        metadata["raw_response_sha256"] = hashlib.sha256(
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        metadata["refusal_count"] = len(refusals)
+        response_reasoning = data.get("reasoning")
+        if isinstance(response_reasoning, dict):
+            echoed_reasoning = {
+                key: response_reasoning[key]
+                for key in ("effort", "mode", "context")
+                if isinstance(response_reasoning.get(key), str)
+            }
+            if echoed_reasoning:
+                metadata["response_reasoning"] = echoed_reasoning
+
+        return ProviderResponse(
+            provider=self.provider_name,
+            model=self.model,
+            text=text,
+            raw=data,
+            usage=data.get("usage"),
+            finish_reason=finish_reason,
+            request_id=data.get("id"),
+            adapter_metadata=metadata,
+        )
 
     def generate(
         self,
@@ -2057,50 +2543,30 @@ class OpenAIResponsesAdapter(BaseAdapter):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "input": [{"role": m.role, "content": m.content} for m in messages],
-            "max_output_tokens": config.max_tokens,
-            "temperature": config.temperature,
-            "store": False,
-        }
-        if system:
-            payload["instructions"] = system
-
-        data = post_json(
+        resolved = self.resolve_generation_settings(config)
+        payload = self.build_request_payload(
+            system=system,
+            messages=messages,
+            config=config,
+        )
+        data = self.transport(
             url=self.url,
             headers={
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {self.api_key or require_env('OPENAI_API_KEY')}",
                 "Content-Type": "application/json",
             },
             payload=payload,
             timeout_seconds=config.timeout_seconds,
         )
-        text_parts: list[str] = []
-        for item in data.get("output", []) or []:
-            if item.get("type") != "message":
-                continue
-            for block in item.get("content", []) or []:
-                if block.get("type") == "output_text" and isinstance(block.get("text"), str):
-                    text_parts.append(block["text"])
-        text = "\n".join(text_parts).strip()
-
-        finish_reason = None
-        try:
-            finish_reason = data.get("status")
-        except Exception:
-            pass
-
-        request_id = data.get("id")
-        usage = data.get("usage")
-        return ProviderResponse(
-            provider=self.provider_name,
-            model=self.model,
-            text=text,
-            raw=data,
-            usage=usage,
-            finish_reason=finish_reason,
-            request_id=request_id,
+        return self.parse_response(
+            data,
+            adapter_metadata=resolved.metadata(
+                config,
+                requested_model=self.model,
+                response_model=(
+                    str(data.get("model")) if data.get("model") is not None else None
+                ),
+            ),
         )
 
 
@@ -2110,7 +2576,7 @@ class OpenAIEmbeddingsAdapter(BaseEmbeddingAdapter):
 
     def __init__(self, model: str, api_key: Optional[str] = None) -> None:
         super().__init__(model=model)
-        self.api_key = api_key or require_env("OPENAI_API_KEY")
+        self.api_key = api_key.strip() if api_key else None
 
     def embed(
         self,
@@ -2126,7 +2592,7 @@ class OpenAIEmbeddingsAdapter(BaseEmbeddingAdapter):
         data = post_json(
             url=self.url,
             headers={
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {self.api_key or require_env('OPENAI_API_KEY')}",
                 "Content-Type": "application/json",
             },
             payload=payload,
@@ -2171,7 +2637,7 @@ class AnthropicMessagesAdapter(BaseAdapter):
         api_version: str = "2023-06-01",
     ) -> None:
         super().__init__(model=model)
-        self.api_key = api_key or require_env("ANTHROPIC_API_KEY")
+        self.api_key = api_key.strip() if api_key else None
         self.api_version = api_version
 
     def generate(
@@ -2181,6 +2647,7 @@ class AnthropicMessagesAdapter(BaseAdapter):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
+        resolved = self.resolve_generation_settings(config)
         payload: dict[str, Any] = {
             "model": self.model,
             "max_tokens": config.max_tokens,
@@ -2188,12 +2655,13 @@ class AnthropicMessagesAdapter(BaseAdapter):
         }
         if system:
             payload["system"] = system
-        payload["temperature"] = config.temperature
+        if resolved.temperature is not None:
+            payload["temperature"] = resolved.temperature
 
         data = post_json(
             url=self.url,
             headers={
-                "x-api-key": self.api_key,
+                "x-api-key": self.api_key or require_env("ANTHROPIC_API_KEY"),
                 "anthropic-version": self.api_version,
                 "content-type": "application/json",
             },
@@ -2213,6 +2681,11 @@ class AnthropicMessagesAdapter(BaseAdapter):
             usage=data.get("usage"),
             finish_reason=data.get("stop_reason"),
             request_id=data.get("id"),
+            adapter_metadata=resolved.metadata(
+                config,
+                requested_model=self.model,
+                response_model=str(data.get("model") or self.model),
+            ),
         )
 
 
@@ -2222,7 +2695,7 @@ class MistralChatAdapter(BaseAdapter):
 
     def __init__(self, model: str, api_key: Optional[str] = None) -> None:
         super().__init__(model=model)
-        self.api_key = api_key or require_env("MISTRAL_API_KEY")
+        self.api_key = api_key.strip() if api_key else None
 
     def generate(
         self,
@@ -2231,6 +2704,7 @@ class MistralChatAdapter(BaseAdapter):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
+        resolved = self.resolve_generation_settings(config)
         payload_messages: list[dict[str, str]] = []
         if system:
             payload_messages.append({"role": "system", "content": system})
@@ -2240,13 +2714,14 @@ class MistralChatAdapter(BaseAdapter):
             "model": self.model,
             "messages": payload_messages,
             "max_tokens": config.max_tokens,
-            "temperature": config.temperature,
             "stream": False,
         }
+        if resolved.temperature is not None:
+            payload["temperature"] = resolved.temperature
         data = post_json(
             url=self.url,
             headers={
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {self.api_key or require_env('MISTRAL_API_KEY')}",
                 "Content-Type": "application/json",
             },
             payload=payload,
@@ -2263,6 +2738,11 @@ class MistralChatAdapter(BaseAdapter):
             usage=data.get("usage"),
             finish_reason=choice0.get("finish_reason"),
             request_id=data.get("id"),
+            adapter_metadata=resolved.metadata(
+                config,
+                requested_model=self.model,
+                response_model=str(data.get("model") or self.model),
+            ),
         )
 
 
@@ -2272,7 +2752,7 @@ class GeminiAdapter(BaseAdapter):
 
     def __init__(self, model: str, api_key: Optional[str] = None) -> None:
         super().__init__(model=model)
-        self.api_key = api_key or require_env("GEMINI_API_KEY")
+        self.api_key = api_key.strip() if api_key else None
 
     @staticmethod
     def _gemini_role(role: str) -> str:
@@ -2289,6 +2769,7 @@ class GeminiAdapter(BaseAdapter):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
+        resolved = self.resolve_generation_settings(config)
         contents = []
         for m in messages:
             contents.append(
@@ -2301,17 +2782,18 @@ class GeminiAdapter(BaseAdapter):
         payload: dict[str, Any] = {
             "contents": contents,
             "generationConfig": {
-                "temperature": config.temperature,
                 "maxOutputTokens": config.max_tokens,
             },
         }
+        if resolved.temperature is not None:
+            payload["generationConfig"]["temperature"] = resolved.temperature
         if system:
             payload["system_instruction"] = {"parts": [{"text": system}]}
 
         data = post_json(
             url=f"{self.base}/{self.model}:generateContent",
             headers={
-                "x-goog-api-key": self.api_key,
+                "x-goog-api-key": self.api_key or require_env("GEMINI_API_KEY"),
                 "Content-Type": "application/json",
             },
             payload=payload,
@@ -2340,6 +2822,11 @@ class GeminiAdapter(BaseAdapter):
             usage=usage,
             finish_reason=finish_reason,
             request_id=None,
+            adapter_metadata=resolved.metadata(
+                config,
+                requested_model=self.model,
+                response_model=self.model,
+            ),
         )
 
 
@@ -2349,7 +2836,7 @@ class HuggingFaceRouterAdapter(BaseAdapter):
 
     def __init__(self, model: str, api_key: Optional[str] = None) -> None:
         super().__init__(model=model)
-        self.api_key = api_key or require_env("HF_TOKEN")
+        self.api_key = api_key.strip() if api_key else None
 
     def generate(
         self,
@@ -2358,6 +2845,7 @@ class HuggingFaceRouterAdapter(BaseAdapter):
         messages: list[ChatMessage],
         config: GenerationConfig,
     ) -> ProviderResponse:
+        resolved = self.resolve_generation_settings(config)
         payload_messages: list[dict[str, str]] = []
         if system:
             payload_messages.append({"role": "system", "content": system})
@@ -2367,13 +2855,14 @@ class HuggingFaceRouterAdapter(BaseAdapter):
             "model": self.model,
             "messages": payload_messages,
             "max_tokens": config.max_tokens,
-            "temperature": config.temperature,
             "stream": False,
         }
+        if resolved.temperature is not None:
+            payload["temperature"] = resolved.temperature
         data = post_json(
             url=self.url,
             headers={
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {self.api_key or require_env('HF_TOKEN')}",
                 "Content-Type": "application/json",
             },
             payload=payload,
@@ -2390,36 +2879,105 @@ class HuggingFaceRouterAdapter(BaseAdapter):
             usage=data.get("usage"),
             finish_reason=choice0.get("finish_reason"),
             request_id=data.get("id"),
+            adapter_metadata=resolved.metadata(
+                config,
+                requested_model=self.model,
+                response_model=str(data.get("model") or self.model),
+            ),
         )
 
 
+class AdapterRegistry:
+    def __init__(self, *, adapter_kind: str) -> None:
+        self.adapter_kind = adapter_kind
+        self._factories: dict[str, Callable[[str], Any]] = {}
+        self._aliases: dict[str, str] = {}
+
+    def register(
+        self,
+        provider: str,
+        factory: Callable[[str], Any],
+        *,
+        aliases: tuple[str, ...] = (),
+    ) -> None:
+        canonical = provider.strip().lower()
+        if not canonical:
+            raise ValueError("Provider name must not be blank.")
+        names = (canonical, *(alias.strip().lower() for alias in aliases))
+        if any(not name for name in names):
+            raise ValueError("Provider aliases must not be blank.")
+        if len(set(names)) != len(names):
+            raise ValueError("Provider names and aliases must be unique.")
+        collisions = sorted(name for name in names if name in self._aliases)
+        if collisions:
+            raise ValueError(
+                f"{self.adapter_kind.title()} provider names already registered: "
+                f"{', '.join(collisions)}"
+            )
+        self._factories[canonical] = factory
+        for name in names:
+            self._aliases[name] = canonical
+
+    def canonical_name(self, provider: str) -> str:
+        requested = provider.strip().lower()
+        if not requested:
+            raise ValueError(f"{self.adapter_kind.title()} provider must not be blank.")
+        canonical = self._aliases.get(requested)
+        if canonical is None:
+            supported = ", ".join(self.provider_names())
+            raise ValueError(
+                f"Unsupported {self.adapter_kind} provider: {provider!r}. "
+                f"Supported providers are: {supported}."
+            )
+        return canonical
+
+    def build(self, provider: str, model: str) -> Any:
+        canonical = self.canonical_name(provider)
+        return self._factories[canonical](model)
+
+    def provider_names(self) -> tuple[str, ...]:
+        return tuple(self._factories)
+
+
+ADAPTER_REGISTRY = AdapterRegistry(adapter_kind="generation")
+ADAPTER_REGISTRY.register("openai", OpenAIResponsesAdapter)
+ADAPTER_REGISTRY.register("anthropic", AnthropicMessagesAdapter)
+ADAPTER_REGISTRY.register("mistral", MistralChatAdapter)
+ADAPTER_REGISTRY.register("gemini", GeminiAdapter)
+ADAPTER_REGISTRY.register(
+    "hf",
+    HuggingFaceRouterAdapter,
+    aliases=("huggingface", "hugging_face"),
+)
+ADAPTER_REGISTRY.register("dummy", DummyAdapter)
+
+EMBEDDING_ADAPTER_REGISTRY = AdapterRegistry(adapter_kind="embedding")
+EMBEDDING_ADAPTER_REGISTRY.register("openai", OpenAIEmbeddingsAdapter)
+EMBEDDING_ADAPTER_REGISTRY.register("dummy", DummyEmbeddingAdapter)
+
+
+def available_provider_names() -> tuple[str, ...]:
+    return ADAPTER_REGISTRY.provider_names()
+
+
+def available_embedding_provider_names() -> tuple[str, ...]:
+    return EMBEDDING_ADAPTER_REGISTRY.provider_names()
+
+
+def canonical_provider_name(provider: str) -> str:
+    return ADAPTER_REGISTRY.canonical_name(provider)
+
+
+def canonical_embedding_provider_name(provider: str) -> str:
+    return EMBEDDING_ADAPTER_REGISTRY.canonical_name(provider)
+
+
 def build_adapter(provider: str, model: str) -> BaseAdapter:
-    provider = provider.strip().lower()
-    if provider == "openai":
-        return OpenAIResponsesAdapter(model=model)
-    if provider == "anthropic":
-        return AnthropicMessagesAdapter(model=model)
-    if provider == "mistral":
-        return MistralChatAdapter(model=model)
-    if provider == "gemini":
-        return GeminiAdapter(model=model)
-    if provider in {"hf", "huggingface", "hugging_face"}:
-        return HuggingFaceRouterAdapter(model=model)
-    if provider == "dummy":
-        return DummyAdapter(model=model)
-    raise ValueError(f"Unsupported provider: {provider!r}")
+    return ADAPTER_REGISTRY.build(provider, model)
 
 
 def build_embedding_adapter(provider: str, model: str) -> BaseEmbeddingAdapter:
-    provider = provider.strip().lower()
-    if provider == "openai":
-        return OpenAIEmbeddingsAdapter(model=model)
-    if provider == "dummy":
-        return DummyEmbeddingAdapter(model=model)
-    raise ValueError(
-        f"Unsupported embedding provider: {provider!r}. "
-        "Supported embedding providers are: openai, dummy."
-    )
+    return EMBEDDING_ADAPTER_REGISTRY.build(provider, model)
 
 
 def build_optional_observer_adapter(args: argparse.Namespace) -> Optional[BaseAdapter]:
@@ -2484,6 +3042,32 @@ class RecursiveConclusionSession:
         )
         self.config = config
         self.log_path = log_path
+        requested_probe_config = self.config.probe_config
+        self.config.reply_config = pin_generation_config(
+            self.adapter, self.config.reply_config
+        )
+        self.config.probe_config = pin_generation_config(
+            self.adapter, requested_probe_config
+        )
+        observer_requested_config = self.config.observer_config
+        if observer_requested_config is None:
+            generator_profile = self.adapter.model_profile
+            observer_profile = self.observer_adapter.model_profile
+            profiles_match = (
+                generator_profile.profile_id == observer_profile.profile_id
+                and generator_profile.version == observer_profile.version
+            )
+            observer_requested_config = (
+                requested_probe_config
+                if profiles_match
+                else generation_config_with_auto_model_controls(
+                    requested_probe_config
+                )
+            )
+        self.config.observer_config = pin_generation_config(
+            self.observer_adapter,
+            observer_requested_config,
+        )
         if self.config.semantic_judge_backend in {
             SemanticJudgeBackend.EMBEDDING,
             SemanticJudgeBackend.BOTH,
@@ -3204,6 +3788,7 @@ class RecursiveConclusionSession:
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
+                    "adapter_metadata": response.adapter_metadata,
                 },
             )
         return capsule or None
@@ -3396,6 +3981,7 @@ class RecursiveConclusionSession:
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
+                    "adapter_metadata": response.adapter_metadata,
                 },
             )
         return hypothesis or None
@@ -3427,10 +4013,9 @@ class RecursiveConclusionSession:
         )
 
         def probe_config_with_budget(min_max_tokens: int) -> GenerationConfig:
-            return GenerationConfig(
-                temperature=self.config.probe_config.temperature,
-                max_tokens=max(int(self.config.probe_config.max_tokens or 0), min_max_tokens),
-                timeout_seconds=self.config.probe_config.timeout_seconds,
+            return generation_config_with_min_tokens(
+                self.config.probe_config,
+                min_max_tokens,
             )
 
         def summarize_plan(items: list[DelayedMentionItem]) -> dict[str, Any]:
@@ -3653,6 +4238,7 @@ class RecursiveConclusionSession:
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
+                    "adapter_metadata": response.adapter_metadata,
                     "probe_max_tokens": planner_probe_max_tokens,
                 },
             )
@@ -3668,6 +4254,7 @@ class RecursiveConclusionSession:
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
+                    "adapter_metadata": response.adapter_metadata,
                     "probe_max_tokens": planner_probe_max_tokens,
                 },
             )
@@ -3781,6 +4368,7 @@ class RecursiveConclusionSession:
                 "usage": repair_response.usage,
                 "finish_reason": repair_response.finish_reason,
                 "request_id": repair_response.request_id,
+                "adapter_metadata": repair_response.adapter_metadata,
                 "probe_max_tokens": repair_probe_max_tokens,
                 "final_plan_validation": plan_validation,
             }
@@ -3803,6 +4391,7 @@ class RecursiveConclusionSession:
                 "usage": response.usage,
                 "finish_reason": response.finish_reason,
                 "request_id": response.request_id,
+                "adapter_metadata": response.adapter_metadata,
                 "probe_max_tokens": planner_probe_max_tokens,
             },
         )
@@ -3875,7 +4464,7 @@ class RecursiveConclusionSession:
                 "toward the latest conclusion without answering the user."
             ),
             messages=[ChatMessage(role="user", content=source)],
-            config=self.config.probe_config,
+            config=self.config.observer_config or self.config.probe_config,
         )
         raw = response.text.strip()
         alignment = parse_probe_float(extract_probe_line_value(raw, "LATENT_ALIGNMENT"))
@@ -3919,6 +4508,7 @@ class RecursiveConclusionSession:
             "usage": response.usage,
             "finish_reason": response.finish_reason,
             "request_id": response.request_id,
+            "adapter_metadata": response.adapter_metadata,
         }
         self.latest_latent_convergence_trace = payload
         self._log("latent_convergence_trace", payload)
@@ -4182,6 +4772,7 @@ class RecursiveConclusionSession:
                     "usage": response.usage,
                     "finish_reason": response.finish_reason,
                     "request_id": response.request_id,
+                    "adapter_metadata": response.adapter_metadata,
                 },
             )
             return []
@@ -4236,6 +4827,7 @@ class RecursiveConclusionSession:
                 "usage": response.usage,
                 "finish_reason": response.finish_reason,
                 "request_id": response.request_id,
+                "adapter_metadata": response.adapter_metadata,
                 "planning_capacity": plan_capacity,
             },
         )
@@ -4275,6 +4867,7 @@ class RecursiveConclusionSession:
             scheduler_usage = None
             scheduler_finish_reason = None
             scheduler_request_id = None
+            scheduler_adapter_metadata: dict[str, Any] = {}
             scheduler_raw_text = ""
         else:
             inject_schema = not self._deferred_intent_scheduler_compact_ok
@@ -4392,6 +4985,7 @@ class RecursiveConclusionSession:
             scheduler_usage = response.usage
             scheduler_finish_reason = response.finish_reason
             scheduler_request_id = response.request_id
+            scheduler_adapter_metadata = response.adapter_metadata
             scheduler_raw_text = response.text
 
         raw_decisions = decisions_payload.get("decisions") if isinstance(decisions_payload, dict) else []
@@ -4514,6 +5108,7 @@ class RecursiveConclusionSession:
                 "usage": scheduler_usage,
                 "finish_reason": scheduler_finish_reason,
                 "request_id": scheduler_request_id,
+                "adapter_metadata": scheduler_adapter_metadata,
             },
         )
         return due_intents, applied
@@ -5892,6 +6487,7 @@ class RecursiveConclusionSession:
             "usage": reply.usage,
             "finish_reason": reply.finish_reason,
             "request_id": reply.request_id,
+            "adapter_metadata": reply.adapter_metadata,
             "probe_reply_overlap": overlap,
         }
         self._log("assistant_reply", payload)
@@ -5939,12 +6535,37 @@ def parse_provider_specs(specs: list[str]) -> list[tuple[str, str]]:
         model = model.strip()
         if not provider or not model:
             raise ValueError(f"Invalid provider spec: {spec!r}")
-        parsed.append((provider, model))
+        parsed.append((canonical_provider_name(provider), model))
     return parsed
+
+
+def optional_generation_setting(args: argparse.Namespace, name: str) -> Optional[str]:
+    value = str(getattr(args, name, "auto") or "auto").strip().lower()
+    return None if value == "auto" else value
 
 
 def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: str = "") -> ExperimentConfig:
     base = base_system or args.system or ""
+    observer_controls = {
+        "reasoning_effort": optional_generation_setting(
+            args, "observer_reasoning_effort"
+        ),
+        "reasoning_mode": optional_generation_setting(args, "observer_reasoning_mode"),
+        "reasoning_context": optional_generation_setting(
+            args, "observer_reasoning_context"
+        ),
+        "text_verbosity": optional_generation_setting(args, "observer_text_verbosity"),
+    }
+    observer_config = (
+        GenerationConfig(
+            temperature=0.0,
+            max_tokens=args.probe_max_tokens,
+            timeout_seconds=args.timeout,
+            **observer_controls,
+        )
+        if any(value is not None for value in observer_controls.values())
+        else None
+    )
     cfg = ExperimentConfig(
         base_system=base,
         recent_window_messages=args.window,
@@ -6050,12 +6671,25 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             timeout_seconds=args.timeout,
+            reasoning_effort=optional_generation_setting(args, "reasoning_effort"),
+            reasoning_mode=optional_generation_setting(args, "reasoning_mode"),
+            reasoning_context=optional_generation_setting(args, "reasoning_context"),
+            text_verbosity=optional_generation_setting(args, "text_verbosity"),
         ),
         probe_config=GenerationConfig(
             temperature=0.0,
             max_tokens=args.probe_max_tokens,
             timeout_seconds=args.timeout,
+            reasoning_effort=optional_generation_setting(
+                args, "probe_reasoning_effort"
+            ),
+            reasoning_mode=optional_generation_setting(args, "probe_reasoning_mode"),
+            reasoning_context=optional_generation_setting(
+                args, "probe_reasoning_context"
+            ),
+            text_verbosity=optional_generation_setting(args, "probe_text_verbosity"),
         ),
+        observer_config=observer_config,
     )
 
     if (
@@ -6385,6 +7019,7 @@ def execute_compare(args: argparse.Namespace) -> CompareExecutionResult:
                     ],
                     "probe_reply_overlap": result["probe_reply_overlap"],
                     "usage": result["usage"],
+                    "adapter_metadata": result["adapter_metadata"],
                 }
             )
             print(
@@ -6643,6 +7278,15 @@ def sanitize_filename(text: str) -> str:
 # CLI
 # ----------------------------
 
+def model_capability_choices(capability_name: str) -> list[str]:
+    values = ["auto"]
+    for profile in _MODEL_PROFILES:
+        for value in getattr(profile.capabilities, capability_name):
+            if value not in values:
+                values.append(value)
+    return values
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -6654,7 +7298,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(p: argparse.ArgumentParser, *, single_provider: bool) -> None:
         if single_provider:
-            p.add_argument("--provider", required=True, help="openai | anthropic | mistral | gemini | hf | dummy")
+            p.add_argument(
+                "--provider",
+                required=True,
+                help=" | ".join(available_provider_names()),
+            )
             p.add_argument("--model", required=True, help="Model id for the selected provider.")
         p.add_argument("--system", default="", help="Base system prompt.")
         p.add_argument(
@@ -6936,6 +7584,78 @@ def build_parser() -> argparse.ArgumentParser:
             help="Ablation mode for deferred intents (e.g., delete planned intents immediately).",
         )
         p.add_argument("--temperature", type=float, default=0.2, help="Temperature for main assistant replies.")
+        p.add_argument(
+            "--reasoning-effort",
+            choices=model_capability_choices("reasoning_efforts"),
+            default="auto",
+            help="Reasoning effort for main replies; auto uses the model profile default.",
+        )
+        p.add_argument(
+            "--probe-reasoning-effort",
+            choices=model_capability_choices("reasoning_efforts"),
+            default="auto",
+            help="Reasoning effort for memory, conclusion, and intent probes.",
+        )
+        p.add_argument(
+            "--observer-reasoning-effort",
+            choices=model_capability_choices("reasoning_efforts"),
+            default="auto",
+            help="Reasoning effort for an independent latent-convergence observer.",
+        )
+        p.add_argument(
+            "--reasoning-mode",
+            choices=model_capability_choices("reasoning_modes"),
+            default="auto",
+            help="Reasoning mode for main replies; supported model profiles validate it.",
+        )
+        p.add_argument(
+            "--probe-reasoning-mode",
+            choices=model_capability_choices("reasoning_modes"),
+            default="auto",
+            help="Reasoning mode for probes.",
+        )
+        p.add_argument(
+            "--observer-reasoning-mode",
+            choices=model_capability_choices("reasoning_modes"),
+            default="auto",
+            help="Reasoning mode for an independent latent-convergence observer.",
+        )
+        p.add_argument(
+            "--reasoning-context",
+            choices=model_capability_choices("reasoning_contexts"),
+            default="auto",
+            help="Reasoning context for main replies; GPT-5.6 defaults to current_turn in this lab.",
+        )
+        p.add_argument(
+            "--probe-reasoning-context",
+            choices=model_capability_choices("reasoning_contexts"),
+            default="auto",
+            help="Reasoning context for probes.",
+        )
+        p.add_argument(
+            "--observer-reasoning-context",
+            choices=model_capability_choices("reasoning_contexts"),
+            default="auto",
+            help="Reasoning context for an independent latent-convergence observer.",
+        )
+        p.add_argument(
+            "--text-verbosity",
+            choices=model_capability_choices("text_verbosity_levels"),
+            default="auto",
+            help="Text verbosity for main replies when the model profile supports it.",
+        )
+        p.add_argument(
+            "--probe-text-verbosity",
+            choices=model_capability_choices("text_verbosity_levels"),
+            default="auto",
+            help="Text verbosity for probes.",
+        )
+        p.add_argument(
+            "--observer-text-verbosity",
+            choices=model_capability_choices("text_verbosity_levels"),
+            default="auto",
+            help="Text verbosity for an independent latent-convergence observer.",
+        )
         p.add_argument("--max-tokens", type=int, default=900, help="Max output tokens for main assistant replies.")
         p.add_argument("--probe-max-tokens", type=int, default=220, help="Max output tokens for memory/conclusion/intent probes.")
         p.add_argument("--timeout", type=int, default=120, help="HTTP timeout in seconds.")
