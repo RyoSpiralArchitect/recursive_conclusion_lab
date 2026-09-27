@@ -11,6 +11,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import threading
 import time
@@ -108,6 +109,14 @@ def json_ready(value: Any) -> Any:
 def value_or_default(data: dict[str, Any], key: str, default: Any) -> Any:
     value = data.get(key)
     return default if value is None else value
+
+
+def safe_turn_error(error: Exception) -> str:
+    kind = type(error).__name__
+    status = re.match(r"HTTP ([1-5][0-9]{2})\b", str(error))
+    if status:
+        return f"{kind}: provider HTTP {status.group(1)}"
+    return f"{kind}: turn failed"
 
 
 def generation_config_from_dict(data: dict[str, Any]) -> GenerationConfig:
@@ -357,6 +366,7 @@ def restore_session_state(
 
 
 def failed_event_receipts(discarded_bytes: bytes) -> list[dict[str, Any]]:
+    """Keep event identity and provider receipts without copying prompt or reply text."""
     receipts: list[dict[str, Any]] = []
     for raw_line in discarded_bytes.splitlines(keepends=True):
         if not raw_line.strip():
@@ -415,6 +425,7 @@ def save_failed_attempt(
     error: Exception,
     discarded_bytes: bytes,
 ) -> None:
+    """Persist discarded event receipts before removing them from the live session log."""
     receipts = failed_event_receipts(discarded_bytes)
     audit = {
         "recorded_at": time.time(),
@@ -936,7 +947,7 @@ class SessionManager:
                 else:
                     with record.log_path.open("r+b") as event_log:
                         event_log.truncate(log_size_before)
-                record.last_error = str(exc)
+                record.last_error = safe_turn_error(exc)
                 self._save_record(record)
                 raise
             record.pending_user_text = ""
@@ -998,12 +1009,14 @@ def build_app(*, sessions_dir: Path, allowed_origins: list[str]) -> FastAPI:
     def append_turn(session_id: str, request: TurnRequest) -> dict[str, Any]:
         try:
             return manager.append_turn(session_id, request.user_text)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Session not found.") from None
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if str(exc) == "user_text must not be empty":
+                raise HTTPException(status_code=400, detail="user_text must not be empty") from None
+            raise HTTPException(status_code=500, detail=safe_turn_error(exc)) from None
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail=safe_turn_error(exc)) from None
 
     @app.put("/api/sessions/{session_id}/notes")
     def update_notes(session_id: str, request: NotesRequest) -> dict[str, Any]:

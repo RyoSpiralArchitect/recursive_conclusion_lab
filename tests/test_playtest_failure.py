@@ -2,10 +2,15 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+
+from fastapi import HTTPException
 
 from playtest_server import (
     CreateSessionRequest,
     SessionManager,
+    TurnRequest,
+    build_app,
     failed_event_receipts,
     generation_config_from_dict,
     json_ready,
@@ -43,7 +48,7 @@ class PlaytestFailureTests(unittest.TestCase):
             nonlocal calls
             calls += 1
             if calls == 2:
-                raise RuntimeError("simulated reply failure")
+                raise RuntimeError("simulated reply failure sk-test-secret")
             return original_generate(**kwargs)
 
         adapter.generate = generate_then_fail
@@ -56,15 +61,19 @@ class PlaytestFailureTests(unittest.TestCase):
             session_id = record.session_id
             original_generate = self.fail_after_memory_probe(record)
             before = serialize_session_state(record.session)
-            first_attempt = "first attempt sk-test-secret"
+            first_attempt = "first attempt"
 
             with self.assertRaisesRegex(RuntimeError, "simulated reply failure"):
                 manager.append_turn(session_id, first_attempt)
 
             self.assertEqual(serialize_session_state(record.session), before)
             self.assertEqual(record.pending_user_text, first_attempt)
-            self.assertEqual(record.last_error, "simulated reply failure")
+            self.assertEqual(record.last_error, "RuntimeError: turn failed")
             self.assertFalse(record.log_path.exists())
+            self.assertNotIn(
+                "sk-test-secret",
+                manager._session_json_path(session_id).read_text(encoding="utf-8"),
+            )
             audit_path = record.storage_dir / "failed_attempts.jsonl"
             audit_raw = audit_path.read_text(encoding="utf-8")
             self.assertNotIn("sk-test-secret", audit_raw)
@@ -184,6 +193,35 @@ class PlaytestFailureTests(unittest.TestCase):
         receipt = failed_event_receipts(raw_event)[0]
         self.assertEqual(receipt["payload"], {"usage": {"input_tokens": 5}})
         self.assertNotIn("sk-test-secret", json.dumps(receipt))
+
+    def test_turn_endpoint_hides_adapter_error_text(self):
+        with TemporaryDirectory() as temp_dir:
+            app = build_app(sessions_dir=Path(temp_dir), allowed_origins=[])
+            endpoint = next(
+                route.endpoint
+                for route in app.routes
+                if getattr(route, "path", None) == "/api/sessions/{session_id}/turn"
+                and "POST" in getattr(route, "methods", set())
+            )
+            cases = (
+                (
+                    RuntimeError(
+                        "HTTP 429 from https://provider.example; Request payload: sk-test-secret"
+                    ),
+                    "RuntimeError: provider HTTP 429",
+                ),
+                (ValueError("invalid provider response sk-test-secret"), "ValueError: turn failed"),
+            )
+            for error, expected_detail in cases:
+                with self.subTest(error_type=type(error).__name__):
+                    with patch.object(SessionManager, "append_turn", side_effect=error):
+                        with self.assertRaises(HTTPException) as caught:
+                            endpoint("example", TurnRequest(user_text="hello"))
+                    public_error = caught.exception
+                    self.assertEqual(public_error.status_code, 500)
+                    self.assertEqual(public_error.detail, expected_detail)
+                    self.assertTrue(public_error.__suppress_context__)
+                    self.assertNotIn("sk-test-secret", str(public_error.detail))
 
 
 if __name__ == "__main__":

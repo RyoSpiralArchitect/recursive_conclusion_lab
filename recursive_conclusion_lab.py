@@ -1217,18 +1217,13 @@ def post_json(
         timeout=timeout_seconds,
     )
     if response.status_code >= 400:
-        snippet = response.text[:2000]
         raise RuntimeError(
-            f"HTTP {response.status_code} from {url}\n"
-            f"Request payload:\n{json.dumps(payload, ensure_ascii=False)[:1500]}\n\n"
-            f"Response body:\n{snippet}"
+            f"HTTP {response.status_code} from provider endpoint; response details omitted"
         )
     try:
         return response.json()
-    except Exception as exc:  # pragma: no cover - defensive
-        raise RuntimeError(
-            f"Non-JSON response from {url}: {response.text[:2000]}"
-        ) from exc
+    except Exception:  # pragma: no cover - defensive
+        raise RuntimeError("Non-JSON response from provider endpoint; details omitted") from None
 
 
 def clamp01(value: Any, default: float = 0.0) -> float:
