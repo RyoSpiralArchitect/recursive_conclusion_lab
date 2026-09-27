@@ -6,10 +6,15 @@ Cross-provider experiment harness for observing (and optionally steering) the *t
 
 - Recursive **memory capsules** (compressed context you can reload every turn)
 - Periodic **conclusion probes** (predict the likely end-state)
-- Observe-only **latent convergence traces** (semantic drift before explicit mention)
+- Output-level **latent convergence traces** (visible-reply similarity to a probe-generated conclusion before explicit mention)
 - Optional **independent observer** for latent convergence judging
-- Optional **embedding judge** for semantic drift measurement
+- Optional **embedding judge** for visible-text similarity measurement
 - **Deferred utterance intents** (plan now, say later)
+
+The trace names describe output-level proxies, not access to a model's internal latent state. In
+`observe` mode, probe–reply overlap alone cannot establish that the probe affected the reply:
+both can reflect the same dialogue context. Test that effect against a matched no-probe run;
+confirm selected settings on held-out dialogue scripts.
 
 ## Providers
 
@@ -122,7 +127,7 @@ python recursive_conclusion_lab.py run-config \
 
 ### Latent convergence trace
 
-Track semantic convergence toward the latest conclusion even before explicit mention:
+Track visible-reply similarity to the latest probe-generated conclusion before explicit mention:
 
 ```bash
 python recursive_conclusion_lab.py compare \
@@ -144,6 +149,10 @@ fields like `avg_latent_alignment`, `avg_embedding_alignment`,
 `latent_semantic_leakage_rate`, `embedding_semantic_leakage_rate`,
 `avg_articulation_gap_turns`, `avg_embedding_articulation_gap_turns`, and
 `semantic_judge_disagreement_rate`.
+These scores describe observable text and depend on the probe's chosen target; they do not
+measure an internal intention or prove causal leakage. A shuffled or unrelated conclusion is
+a useful negative control for target similarity. Adaptive hazard policies can use these scores
+to change later replies, so the full run is not necessarily observe-only.
 If `--observer-provider/--observer-model` are set, the LLM latent judge is decoupled from the
 generator and `analyze_runs.py` reports `latent_judge_source`, `latent_judge_provider`,
 `latent_judge_model`, plus `embedding_judge_provider` / `embedding_judge_model`.
@@ -225,11 +234,17 @@ python recursive_conclusion_lab.py compare-matrix \
 
 You can add top-level `repeats` and `seed` to rerun the full arm matrix multiple times with stable
 harness-side randomness.
+The derived seed includes the arm name, so different arms do not currently share matched random
+draws. Record this when interpreting arm differences.
+Repeated runs of one script are not independent dialogue scenarios; reserve held-out scripts
+for checking whether an exploratory difference generalizes.
 
 This writes arm-tagged logs like `arm_soft_fire___openai__model.jsonl`, arm-specific summaries
 (`summary__soft_fire.json`), per-repeat summaries such as `summary__soft_fire__run_001.json`,
 a combined `summary.json`, plus repeat-level analyzer outputs in `analysis_runs.json` and
 `analysis_aggregate.json`.
+`compare` and `compare-matrix` reserve output files before provider calls. Existing files or
+filename collisions stop the run; use a new `--out-dir` or config `out_dir` for each run.
 
 If a script's `evaluation` block includes an optional `perturbation` spec, `analyze_runs.py`
 also reports recovery metrics such as `recovery_after_perturbation_rate`,
@@ -291,9 +306,10 @@ The leakage guard is configurable:
 - `--adaptive-hazard-stage-policy flat|kind_aware`
 - `--adaptive-hazard-embedding-guard off|on`
 
-When the guard is on, active delayed mentions whose current turn probability is still below the
-threshold are injected into the private system prompt as “keep latent” targets. This is meant to
-reduce early explicit surfacing without removing latent trajectory pressure.
+When the guard and `--delayed-mention-mode soft_fire` are on, active delayed mentions whose
+current turn probability is still below the threshold are injected into the private system
+prompt as “keep latent” targets. In `observe` mode, the guard does not inject targets. This is
+meant to reduce early explicit surfacing without removing latent trajectory pressure in active arms.
 
 The planner can also be nudged away from collapsing everything into `conclusion`. The delayed-mention
 probe now asks for at least some non-conclusion items and a minimum kind diversity when plausible,
@@ -356,6 +372,9 @@ The UI is meant for human-side inspection rather than benchmarking:
 
 Session snapshots are written under `playtest_sessions/` and recover the last pending user draft if
 the server dies mid-turn.
+If a provider call raises during a turn, the server restores the prior conversation state and
+keeps the draft. It records metadata and available request/usage receipts for discarded events in
+that session's `failed_attempts.jsonl`, without copying event text into the failure audit.
 
 When `--delayed-mention-diversity-repair on`, the harness will make one compact supplemental probe if
 the first delayed-mention plan fails the non-conclusion or kind-diversity minimums. This keeps the
@@ -413,6 +432,15 @@ python jsonl_to_sqlite.py \
 
 - `EXPERIMENT_PROTOCOL.md` (JP)
 - `DEFERRED_INTENT_PROTOCOL.md` (JP)
+
+## Local checks
+
+```bash
+python -m pip install requests -r playtest_requirements.txt
+python -m unittest discover -s tests -v
+```
+
+The tests use the local dummy adapter and make no live provider calls.
 
 ## License
 

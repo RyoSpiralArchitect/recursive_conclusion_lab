@@ -14,9 +14,9 @@
    - `--conclusion-mode soft_steer` にすると、その仮説を次ターンへ soft hint として注入できます。
 
 3. **Latent convergence trace**
-   - 結論をまだ明示していない段階でも、会話軌道がその結論へどの程度収束しているかを observe-only で計測します。
+   - 結論をまだ明示していない段階の返信と、probe が生成した結論との意味的類似度を測ります。
    - `latent_convergence_trace` として alignment / readiness / leakage risk / stage をログします。
-   - 必要なら embedding judge を並走させて、生成器とは別系統の semantic drift 指標も取れます。
+   - 必要なら embedding judge を並走させて、可視テキストの類似度指標も取れます。
 
 4. **Deferred utterance intents**
    - 「今はまだ言わないが、数ターン後に適切なら言う」という将来発話意図を side channel で作ります。
@@ -26,6 +26,10 @@
    - `--deferred-intent-plan-policy periodic|auto` / `--deferred-intent-plan-budget N` で「新規 intent をいつ/どれだけ計画できるか」を制御できます（`auto` のとき budget 必須）。
    - `--deferred-intent-plan-max-new N` は 1 回の計画ターンで作れる新規 intent 数の上限です（external + inband）。
    - `--deferred-intent-timing offset|model|hazard` は timing window の決め方です（`hazard` は delay ごとの確率 profile を planner に出させます）。
+
+これらの trace は出力から作る代理指標であり、モデル内部の latent state を直接測っていません。
+`observe` の probe と返信に overlap があっても、共通の会話文脈による類似度と区別できません。
+probe 呼び出しの有無だけを変えた対応対照で影響を調べ、選んだ設定は未使用の会話スクリプトで確認します。
 
 ## 対応プロバイダ
 
@@ -196,8 +200,11 @@ python recursive_conclusion_lab.py compare-matrix \
 
 `observe` / `latent_only` / `soft_fire` / `hard_fire` / `delete_planned` のような arm を並べる用途を想定しています。
 top-level に `repeats` と `seed` を置くと、arm matrix 全体を複数回まわせます。
+導出 seed には arm 名が入るため、arm 間で同じ乱数抽選を共有していません。条件差を解釈するときに区別してください。
+同一スクリプトの反復は独立した会話シナリオの数ではありません。探索で選んだ差は未使用スクリプトで確認します。
 出力は `summary__soft_fire__run_001.json` のような per-run summary、
 `summary.json`、`analysis_runs.json`、`analysis_aggregate.json` まで揃います。
+`compare` / `compare-matrix` は API 呼び出し前に出力ファイルを確保します。既存ファイルやファイル名の衝突があれば停止するため、再実行には新しい `--out-dir` または設定の `out_dir` を使ってください。
 
 ## ログ
 
@@ -228,7 +235,10 @@ top-level に `repeats` と `seed` を置くと、arm matrix 全体を複数回�
 
 ### latent convergence
 
-`--latent-convergence-every N` を有効にすると、明示言及前の semantic drift を observe-only で追えます。
+`--latent-convergence-every N` を有効にすると、明示言及前の返信と probe が生成した結論との類似度を observe-only で追えます。
+これは可視テキストの指標であり、内部意図や probe の因果的な漏出を示しません。
+無関係な結論やシャッフルした結論を、標的類似度の負の対照にできます。
+adaptive hazard ではこの値を後続の制御に使うため、実行全体が observe-only とは限りません。
 `--semantic-judge-backend` は `off|llm|embedding|both` です。
 `--observer-provider` / `--observer-model` を指定すると、この judge だけを独立 observer に切り替えられます。
 その場合 `analyze_runs.py` は `latent_judge_source` / `latent_judge_provider` / `latent_judge_model`
@@ -279,6 +289,7 @@ python recursive_conclusion_lab.py compare \
 `soft_fire` の注入確率もその per-delay mass で重み付けされます。
 
 leak guard も比較できるようにしました。
+`--delayed-mention-mode soft_fire` のときだけ抑制対象を返信の system prompt に注入します。`observe` では guard が標的を注入しません。
 
 - `--delayed-mention-leak-policy on|off`
 - `--delayed-mention-leak-threshold <0.00-1.00>`
@@ -356,6 +367,7 @@ dev 中は `http://127.0.0.1:5173`、`npm run build` 後は `http://127.0.0.1:87
 
 session snapshot は `playtest_sessions/` に保存されるので、server が turn の途中で落ちても
 直前の user draft を復元できます。
+turn 中の provider 例外では会話状態を戻して draft を残し、破棄したイベントの種別・ハッシュと取得済みの request/usage receipt を、その session の `failed_attempts.jsonl` に記録します。イベント本文は失敗監査へ複写しません。
 
 `--delayed-mention-diversity-repair on` のときは、最初の delayed mention plan が
 non-conclusion 数や kind diversity の minimum を満たさなかった場合に、compact な
@@ -424,6 +436,15 @@ python jsonl_to_sqlite.py \
 - `fixed` vs `trigger` vs `adaptive` で deferred intent の自然さがどう変わるか
 - `gather_then_recommend` で「早すぎる提案」が減るか
 - `interrupted_agenda` で保持した意図をちゃんと cancel できるか
+
+## ローカル検証
+
+```bash
+python -m pip install requests -r playtest_requirements.txt
+python -m unittest discover -s tests -v
+```
+
+テストはローカルの dummy adapter を使い、実際のプロバイダ API は呼び出しません。
 
 ## ライセンス
 

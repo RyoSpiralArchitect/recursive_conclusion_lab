@@ -2981,7 +2981,10 @@ class RecursiveConclusionSession:
         injected_delayed_mentions: Optional[list[DelayedMentionItem]] = None,
         adaptive_adjustments: Optional[dict[str, dict[str, Any]]] = None,
     ) -> list[DelayedMentionItem]:
-        if self.config.delayed_mention_leak_policy != DelayedMentionLeakPolicy.ON:
+        if (
+            self.config.delayed_mention_mode != DelayedMentionMode.SOFT_FIRE
+            or self.config.delayed_mention_leak_policy != DelayedMentionLeakPolicy.ON
+        ):
             return []
         injected_ids = {item.item_id for item in injected_delayed_mentions or []}
         suppressed: list[DelayedMentionItem] = []
@@ -3163,7 +3166,11 @@ class RecursiveConclusionSession:
         )
 
     def _probe_memory_capsule(self) -> Optional[str]:
-        if self.config.memory_every <= 0:
+        if (
+            self.config.memory_every <= 0
+            or self.config.memory_capsule_limit <= 0
+            or self.config.memory_word_budget <= 0
+        ):
             return None
         if self.turn_index == 0 or self.turn_index % self.config.memory_every != 0:
             return None
@@ -5927,6 +5934,10 @@ def load_script(path: Path) -> tuple[str, list[str]]:
 
 
 def parse_provider_specs(specs: list[str]) -> list[tuple[str, str]]:
+    supported = {
+        "openai", "anthropic", "mistral", "gemini",
+        "hf", "huggingface", "hugging_face", "dummy",
+    }
     parsed: list[tuple[str, str]] = []
     for spec in specs:
         if "=" not in spec:
@@ -5935,10 +5946,12 @@ def parse_provider_specs(specs: list[str]) -> list[tuple[str, str]]:
                 "e.g. openai=gpt-5-mini"
             )
         provider, model = spec.split("=", 1)
-        provider = provider.strip()
+        provider = provider.strip().lower()
         model = model.strip()
         if not provider or not model:
             raise ValueError(f"Invalid provider spec: {spec!r}")
+        if provider not in supported:
+            raise ValueError(f"Unsupported provider: {provider!r}")
         parsed.append((provider, model))
     return parsed
 
@@ -6216,6 +6229,42 @@ def write_summary_rows(path: Path, payload: Any) -> Path:
     return path
 
 
+class OutputCollisionError(ValueError):
+    """A compare run would reuse or overwrite an experiment artifact."""
+
+
+def reserve_new_artifacts(paths: Iterable[Path]) -> None:
+    """Reserve every output before making provider calls; never append to an old run."""
+    planned = list(paths)
+    if len(planned) != len(set(planned)):
+        raise OutputCollisionError(
+            "Multiple compare outputs resolve to the same filename. "
+            "Use distinct arm names and provider/model filenames."
+        )
+    for path in planned:
+        if path.exists() or path.is_symlink():
+            raise OutputCollisionError(
+                f"Compare output already exists: {path}. Choose a new --out-dir."
+            )
+
+    created: list[Path] = []
+    try:
+        for path in planned:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with path.open("x", encoding="utf-8"):
+                    pass
+            except FileExistsError as exc:
+                raise OutputCollisionError(
+                    f"Compare output already exists: {path}. Choose a new --out-dir."
+                ) from exc
+            created.append(path)
+    except Exception:
+        for path in created:
+            path.unlink()
+        raise
+
+
 def derive_repeat_seed(
     base_seed: Optional[int],
     *,
@@ -6241,12 +6290,13 @@ def build_compare_log_path(
 ) -> Path:
     prefix = f"arm_{sanitize_filename(arm_name)}___" if arm_name else ""
     suffix = f"__{sanitize_filename(run_name)}" if run_name else ""
-    return out_dir / f"{prefix}{provider}__{sanitize_filename(model)}{suffix}.jsonl"
+    return out_dir / (
+        f"{prefix}{sanitize_filename(provider)}__{sanitize_filename(model)}{suffix}.jsonl"
+    )
 
 
-def write_compare_summary(
+def build_compare_summary_path(
     out_dir: Path,
-    rows: list[dict[str, Any]],
     *,
     arm_name: str = "",
     run_name: str = "",
@@ -6257,17 +6307,31 @@ def write_compare_summary(
         parts.append(sanitize_filename(arm_name))
     if run_name:
         parts.append(sanitize_filename(run_name))
-    filename = "__".join(parts) + ".json"
-    return write_summary_rows(out_dir / filename, rows)
+    return out_dir / ("__".join(parts) + ".json")
 
 
-def execute_compare(args: argparse.Namespace) -> CompareExecutionResult:
+def write_compare_summary(
+    out_dir: Path,
+    rows: list[dict[str, Any]],
+    *,
+    arm_name: str = "",
+    run_name: str = "",
+    prefix: str = "summary",
+) -> Path:
+    path = build_compare_summary_path(
+        out_dir, arm_name=arm_name, run_name=run_name, prefix=prefix
+    )
+    return write_summary_rows(path, rows)
+
+
+def execute_compare(
+    args: argparse.Namespace, *, artifacts_reserved: bool = False
+) -> CompareExecutionResult:
     script_path = Path(args.script)
     script_system, turns = load_script(script_path)
     provider_specs = parse_provider_specs(args.providers)
 
     out_dir = Path(args.out_dir or "compare_outputs")
-    out_dir.mkdir(parents=True, exist_ok=True)
     arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
     arm_description = compact_text(str(getattr(args, "arm_description", "") or ""))
     run_name = compact_text(str(getattr(args, "run_name", "") or ""))
@@ -6275,12 +6339,23 @@ def execute_compare(args: argparse.Namespace) -> CompareExecutionResult:
     base_seed = coerce_int(getattr(args, "random_seed", None))
 
     rows: list[dict[str, Any]] = []
-    log_paths: list[Path] = []
+    log_paths = [
+        build_compare_log_path(
+            out_dir,
+            provider=provider,
+            model=model,
+            arm_name=arm_name,
+            run_name=run_name,
+        )
+        for provider, model in provider_specs
+    ]
+    if not artifacts_reserved:
+        reserve_new_artifacts(log_paths)
     if arm_name:
         print(f"=== arm: {arm_name} ===")
     if run_name:
         print(f"=== repeat: {run_name} ===")
-    for provider, model in provider_specs:
+    for (provider, model), log_path in zip(provider_specs, log_paths):
         effective_seed = derive_repeat_seed(
             base_seed,
             arm_name=arm_name,
@@ -6294,14 +6369,6 @@ def execute_compare(args: argparse.Namespace) -> CompareExecutionResult:
         observer_adapter = build_optional_observer_adapter(args)
         embedding_adapter = build_optional_embedding_adapter(args)
         cfg = make_experiment_config_from_args(args, base_system=script_system)
-        log_path = build_compare_log_path(
-            out_dir,
-            provider=provider,
-            model=model,
-            arm_name=arm_name,
-            run_name=run_name,
-        )
-        log_paths.append(log_path)
         session = RecursiveConclusionSession(
             adapter=adapter,
             observer_adapter=observer_adapter,
@@ -6397,12 +6464,27 @@ def execute_compare(args: argparse.Namespace) -> CompareExecutionResult:
 
 
 def run_compare(args: argparse.Namespace) -> int:
-    execution = execute_compare(args)
+    load_script(Path(args.script))
+    make_experiment_config_from_args(args)
+    out_dir = Path(args.out_dir or "compare_outputs")
+    arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
+    run_name = compact_text(str(getattr(args, "run_name", "") or ""))
+    artifacts = [
+        build_compare_log_path(
+            out_dir, provider=provider, model=model, arm_name=arm_name, run_name=run_name
+        )
+        for provider, model in parse_provider_specs(args.providers)
+    ]
+    artifacts.append(
+        build_compare_summary_path(out_dir, arm_name=arm_name, run_name=run_name)
+    )
+    reserve_new_artifacts(artifacts)
+    execution = execute_compare(args, artifacts_reserved=True)
     summary_path = write_compare_summary(
-        Path(args.out_dir or "compare_outputs"),
+        out_dir,
         execution.rows,
-        arm_name=compact_text(str(getattr(args, "arm_name", "") or "")),
-        run_name=compact_text(str(getattr(args, "run_name", "") or "")),
+        arm_name=arm_name,
+        run_name=run_name,
     )
     print(f"Wrote {summary_path}")
     return 0
@@ -6479,15 +6561,11 @@ def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
             base_seed = coerce_int(args_block.get("random_seed"))
 
     out_dir = Path(str(data.get("out_dir") or data.get("out-dir") or "compare_outputs"))
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    combined_rows: list[dict[str, Any]] = []
-    analysis_rows: list[dict[str, Any]] = []
-    from analyze_runs import aggregate_summary_rows, load_evaluation_spec, summarize_log
-
-    script_value = data.get("script")
-    script_path = Path(str(script_value)) if isinstance(script_value, str) and script_value else None
-    evaluation = load_evaluation_spec(script_path)
+    # Plan and reserve the complete matrix before any provider call. Otherwise a
+    # later arm can collide with an earlier arm after partial logs are written.
+    planned_arms: list[tuple[str, str, list[tuple[int, str, argparse.Namespace]]]] = []
+    planned_artifacts: list[Path] = []
     for idx, arm in enumerate(arms, start=1):
         if not isinstance(arm, dict):
             raise ValueError(f"Arm {idx} must be an object.")
@@ -6496,7 +6574,7 @@ def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
         arm_args = arm.get("args") or {}
         if not isinstance(arm_args, dict):
             raise ValueError(f"Arm {arm_name!r} field 'args' must be an object.")
-        arm_rows: list[dict[str, Any]] = []
+        planned_runs: list[tuple[int, str, argparse.Namespace]] = []
         for repeat_idx in range(1, repeats + 1):
             run_name = f"run_{repeat_idx:03d}" if repeats > 1 else ""
             compare_args = build_compare_args_from_config(
@@ -6510,7 +6588,45 @@ def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
             compare_args.run_index = repeat_idx
             if base_seed is not None:
                 compare_args.random_seed = base_seed + (repeat_idx - 1)
-            execution = execute_compare(compare_args)
+            make_experiment_config_from_args(compare_args)
+            planned_artifacts.extend(
+                build_compare_log_path(
+                    out_dir,
+                    provider=provider,
+                    model=model,
+                    arm_name=arm_name,
+                    run_name=run_name,
+                )
+                for provider, model in parse_provider_specs(compare_args.providers)
+            )
+            if run_name:
+                planned_artifacts.append(
+                    build_compare_summary_path(
+                        out_dir, arm_name=arm_name, run_name=run_name
+                    )
+                )
+            planned_runs.append((repeat_idx, run_name, compare_args))
+        planned_artifacts.append(build_compare_summary_path(out_dir, arm_name=arm_name))
+        planned_arms.append((arm_name, arm_description, planned_runs))
+    planned_artifacts.extend(
+        out_dir / name
+        for name in ("summary.json", "analysis_runs.json", "analysis_aggregate.json", "arms.json")
+    )
+    from analyze_runs import aggregate_summary_rows, load_evaluation_spec, summarize_log
+
+    script_value = data.get("script")
+    script_path = Path(str(script_value)) if isinstance(script_value, str) and script_value else None
+    if script_path is not None:
+        load_script(script_path)
+    evaluation = load_evaluation_spec(script_path)
+    reserve_new_artifacts(planned_artifacts)
+
+    combined_rows: list[dict[str, Any]] = []
+    analysis_rows: list[dict[str, Any]] = []
+    for arm_name, arm_description, planned_runs in planned_arms:
+        arm_rows: list[dict[str, Any]] = []
+        for repeat_idx, run_name, compare_args in planned_runs:
+            execution = execute_compare(compare_args, artifacts_reserved=True)
             arm_rows.extend(execution.rows)
             combined_rows.extend(execution.rows)
             if run_name:
@@ -6663,10 +6779,10 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Optional seed for harness-side stochastic components such as soft-fire sampling.",
         )
-        p.add_argument("--window", type=int, default=8, help="How many recent messages to reload each turn.")
+        p.add_argument("--window", type=int, default=8, help="How many recent messages to reload each turn; 0 uses full history.")
         p.add_argument("--memory-every", type=int, default=3, help="Create a new memory capsule every N user turns. 0 disables.")
-        p.add_argument("--memory-limit", type=int, default=4, help="Maximum number of memory capsules to retain.")
-        p.add_argument("--memory-words", type=int, default=140, help="Soft word budget for each memory capsule.")
+        p.add_argument("--memory-limit", type=int, default=4, help="Maximum number of memory capsules to retain; 0 disables memory probes.")
+        p.add_argument("--memory-words", type=int, default=140, help="Soft word budget for each memory capsule; 0 disables memory probes.")
         p.add_argument("--conclusion-every", type=int, default=3, help="Probe the likely end-state every N user turns. 0 disables.")
         p.add_argument(
             "--conclusion-mode",
@@ -6986,7 +7102,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except OutputCollisionError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":
