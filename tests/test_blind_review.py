@@ -15,6 +15,7 @@ from blind_review import (
     ReviewConflictError,
     ReviewSetCatalog,
     ReviewValidationError,
+    json_digest,
 )
 from build_human_eval_set import build_items, write_outputs
 
@@ -249,6 +250,61 @@ class BlindReviewManagerTests(unittest.TestCase):
         self.assertNotIn("presentation", serialized)
         self.assertNotIn("label_to_arm", serialized)
         self.assertNotIn("adaptive_kind_aware", serialized)
+
+    def test_rebuilt_packet_or_key_does_not_reuse_stale_session(self) -> None:
+        eval_sets_dir = Path(self.temporary.name) / "eval_sets"
+        packet_dir = eval_sets_dir / "earned_conclusion_demo"
+        shutil.copytree(FIXTURE_ROOT / "earned_conclusion_demo", packet_dir)
+        manager = BlindReviewManager(
+            eval_sets_dir=eval_sets_dir,
+            sessions_dir=self.sessions_dir,
+        )
+        first = manager.create_session(
+            eval_set_id="earned_conclusion_demo", rater_id="same-rater"
+        )
+        original_packet = manager.catalog.load("earned_conclusion_demo")
+
+        manifest_path = packet_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["title"] = "Rebuilt review packet"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        new_bundle_digest = json_digest(
+            {
+                "manifest": {
+                    **original_packet.manifest,
+                    "title": manifest["title"],
+                },
+                "items": original_packet.items,
+            }
+        )
+        ready_path = packet_dir / "READY.json"
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        ready["review_bundle_digest"] = new_bundle_digest
+        ready_path.write_text(json.dumps(ready), encoding="utf-8")
+        key_path = packet_dir / "blind_key.json"
+        key = json.loads(key_path.read_text(encoding="utf-8"))
+        key["_meta"]["review_bundle_digest"] = new_bundle_digest
+        key_path.write_text(json.dumps(key), encoding="utf-8")
+
+        second = manager.create_session(
+            eval_set_id="earned_conclusion_demo", rater_id="same-rater"
+        )
+        self.assertNotEqual(first["session_id"], second["session_id"])
+        self.assertEqual(second["review_bundle_digest"], new_bundle_digest)
+        with self.assertRaises(ReviewConflictError):
+            manager.session_detail(str(first["session_id"]))
+
+        key["_meta"]["seed"] += 1
+        key_path.write_text(json.dumps(key), encoding="utf-8")
+        third = manager.create_session(
+            eval_set_id="earned_conclusion_demo", rater_id="same-rater"
+        )
+        self.assertNotEqual(second["session_id"], third["session_id"])
+        repeated = manager.create_session(
+            eval_set_id="earned_conclusion_demo", rater_id="same-rater"
+        )
+        self.assertEqual(third["session_id"], repeated["session_id"])
+        self.assertEqual(len(list(self.sessions_dir.glob("*/session.json"))), 3)
 
     def test_submission_is_idempotent_and_corrections_supersede(self) -> None:
         session = self.create_session()

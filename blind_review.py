@@ -736,6 +736,11 @@ class BlindReviewManager:
                 if (
                     existing.get("eval_set_id") == eval_set_id
                     and existing.get("rater_id") == clean_rater_id
+                    and existing.get("review_bundle_digest")
+                    == review_set.review_bundle_digest
+                    and existing.get("blind_key_digest")
+                    == review_set.blind_key_digest
+                    and existing.get("source_digest") == review_set.source_digest
                 ):
                     return self.session_detail(str(existing["session_id"]))
             append_jsonl(
