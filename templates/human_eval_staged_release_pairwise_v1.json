@@ -1,11 +1,13 @@
 {
+  "title": "Staged Release Pairwise Review",
+  "rubric_version": "staged_release_pairwise_v1",
   "seed": 7,
   "out_dir": "human_eval_sets/staged_release_pairwise_v1",
   "scenarios": [
     {
       "name": "shortlist_then_commit",
       "display_name": "Shortlist Then Commit",
-      "compare_out_dir": "compare_outputs/triplet_shortlist_stage_policy_gpt4mini_v3",
+      "compare_out_dir": "compare_outputs/triplet_shortlist_stage_policy_gpt4mini",
       "arms": [
         "static",
         "adaptive_flat",

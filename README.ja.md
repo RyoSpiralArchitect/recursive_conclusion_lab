@@ -36,6 +36,82 @@
 - `hf`
 - `dummy`（API キー不要のローカル擬似プロバイダ）
 
+## Model profile と GPT-5.6
+
+provider adapter は wire protocol を担当し、exact-ID の model profile は model family ごとの
+capability と lab default を担当します。利用側の安定した契約は引き続き `BaseAdapter` と
+`build_adapter(provider, model)` で、その内側に adapter registry と profile resolver があります。
+
+OpenAI profile は現在、次の model ID だけを exact match で認識します。
+
+- `gpt-5.6`（GPT-5.6 Sol を指す OpenAI alias）
+- `gpt-5.6-sol`
+- `gpt-5.6-terra`
+- `gpt-5.6-luna`
+
+この family で扱える設定は次の通りです。
+
+- reasoning effort: `none | low | medium | high | xhigh | max`
+- reasoning mode: `standard | pro`
+- reasoning context: `current_turn | all_turns`
+- text verbosity: `low | medium | high`
+
+CLI では各設定に `auto` も指定できます。`auto` は profile 解決用の sentinel で、provider へは
+送信しません。GPT-5.6 に対するこの lab の既定値は effort=`none`、mode=`standard`、
+context=`current_turn` です。text verbosity は明示指定しない限り未設定のままです。これは
+visible token の余裕と turn-local な実験条件を保つための lab 固有の既定値であり、OpenAI service
+全体の既定値を説明するものではありません。
+
+adapter は既存の stateless な Responses 動作を維持します。`store=false`、chat message の手動 replay、
+`previous_response_id` なしのままです。`all_turns` を選ぶと request field は設定されますが、この PR で
+call 間や arm 間の persisted reasoning reuse が追加されるわけではありません。
+
+reply と probe は別々に設定できます。
+
+```bash
+python recursive_conclusion_lab.py repl \
+  --provider openai \
+  --model gpt-5.6-terra \
+  --reasoning-effort low \
+  --probe-reasoning-effort none \
+  --reasoning-mode standard \
+  --probe-reasoning-mode standard \
+  --reasoning-context current_turn \
+  --probe-reasoning-context current_turn \
+  --text-verbosity medium \
+  --probe-text-verbosity low \
+  --max-tokens 1200 \
+  --probe-max-tokens 360
+```
+
+GPT-5.6 profile は送信する reasoning effort が `none` のときだけ `temperature` を送ります。
+effort が `none` 以外なら `temperature` を payload から外し、その省略を adapter metadata に
+記録します。また OpenAI の `max_output_tokens` は visible output と reasoning token の両方を
+含む上限です。reasoning 条件に余裕が必要なら `--max-tokens` または `--probe-max-tokens` を
+増やしてください。
+
+Playtest session は reply、probe、独立 observer の解決済み control と、exact profile ID / version を
+保存します。後から profile が一致しなくなった場合は、異なる生成条件で黙って再開せず、session list に
+復元エラーを出して停止します。
+独立 observer が generator と異なる profile を使う場合、generator 専用の probe control は継承しません。
+明示する場合は `--observer-reasoning-*` と `--observer-text-verbosity` を使います。既存の version-1
+Playtest snapshot は、従来どおりの generic profile か、すでに完全な pin を持つ場合だけ初回 load 時に
+移行します。現在 exact profile に一致する未固定の旧 snapshot は、過去の wire semantics を安全に
+復元できないため fail closed します。
+
+同じ request shape を使う OpenAI Responses の model family を足すときは `ModelProfile` を
+`register_model_profile(...)` で登録します。別 provider や別 request shape には `BaseAdapter` の実装も
+必要で、`ADAPTER_REGISTRY.register(...)` へ登録します。既存の `build_adapter(...)` 呼び出し側は
+変更不要です。embedding adapter は引き続き別 registry で管理します。capability value は lowercase の
+canonical string とし、`auto` は profile default を選ぶ予約語です。
+
+profile 登録、request construction、offline parser test は、特定 API account の live access、quota、
+必要な service tier を保証せず、live provider validation を行ったことも意味しません。実行前に
+OpenAI 公式の [model catalog](https://developers.openai.com/api/docs/models)、
+[GPT-5.6 guidance](https://developers.openai.com/api/docs/guides/latest-model)、
+[reasoning guide](https://developers.openai.com/api/docs/guides/reasoning)、
+[Responses API reference](https://developers.openai.com/api/docs/api-reference/responses/create) を確認してください。
+
 ## 必要環境変数
 
 - `OPENAI_API_KEY`
@@ -325,8 +401,16 @@ scripts/build_staged_release_human_eval_set.sh
 ```
 
 出力先は `human_eval_sets/staged_release_pairwise_v1/` で、`manifest.json`、
-`eval_items.jsonl`、`booklet.md`、`answer_sheet.csv`、`blind_key.json` と、
-各 item ごとの Markdown packet を `packets/` に書き出します。
+`eval_items.jsonl`、`booklet.md`、`answer_sheet.csv`、`blind_key.json`、`READY.json` と、
+各 item ごとの Markdown packet を `packets/` に書き出します。`READY.json` がある場合だけ
+publish 完了です。再 build では最初に marker を外すため、途中で落ちた出力を review server は読みません。
+
+`manifest.json` と `eval_items.jsonl` は reviewer-safe な公開 packet です。arm 名、provider、
+model、入力 path は含みません。A/B と実 arm の対応、seed、source digest、private config は
+`blind_key.json` だけに保存されます。評価中はこのファイルを reviewer に渡さないでください。
+`human_eval_sets/` 以下の生成 key は gitignore 対象です。公開 packet、booklet/Markdown packet、
+answer sheet、readiness marker だけを reviewer 側へ渡し、key は research 側に保持します。
+builder は arm 間で user turn 列が同一であることも検査し、比較組を表さない opaque item ID を振ります。
 
 live な qualitative playtest 用には、minimal local web app も使えます。
 
@@ -347,14 +431,41 @@ npm run dev
 ```
 
 dev 中は `http://127.0.0.1:5173`、`npm run build` 後は `http://127.0.0.1:8787` を開いてください。
-これは benchmark 用ではなく、人間が transcript と live trace と観察メモを見ながら洗うための UI です。
+full mode の app には 2 つの workspace があります。ただし Playtest API は arm / model 設定を返すため、
+この full mode 全体を researcher console として扱ってください。
+
+`Playtest` は benchmark 用ではなく、人間が transcript と live trace と観察メモを見ながら
+洗うための非盲検 UI です。
 
 - `static` / `adaptive_flat` / `adaptive_kind_aware` の session を作成・再開できる
 - protocol script の turn を seed として流し込み、その後は自由対話に切り替えられる
 - transcript、conclusion state、delayed mention pressure、軽い live metrics を横で見られる
 - observer note を書きながら、backend が turn ごとに session を保存する
 
-session snapshot は `playtest_sessions/` に保存されるので、server が turn の途中で落ちても
+`Blind Review` は `eval_items.jsonl` を読み、arm / provider / model / machine metric を隠したまま
+pairwise 判断を収集します。
+
+- 同じ user turn の下で response A/B を比較する
+- 各 rubric に `A / B / Tie`、confidence、evidence、counterevidence を記録する
+- 判断不能は `Tie` と分けて、理由つきの `Abstain` として保存する
+- 判断の訂正は古い event を上書きせず、`supersedes` つきで追記する
+- 全 item 完了後にだけ seal し、research artifact に設問別 raw count と digest を書き出す
+
+review event、`unblinded_results.json`、`seal_receipt.json` は
+`blind_review_sessions/<session-id>/` に保存されます。seal 後も reviewer UI は blind のままで、
+receipt だけを表示します。unblinded result は後から research 側で確認します。モデル API は呼びません。
+
+reviewer に渡す instance は、Playtest UI/API を閉じた mode で起動します。
+
+```bash
+EVAL_SETS_DIR=examples/human_eval_sets scripts/run_blind_review_server.sh
+```
+
+現時点の review mode は loopback 上の「信頼された local rater 1 人」用で、認証つき multi-rater service
+ではありません。また pairwise 判断から分かるのは arm 間の相対的な好みです。「結論を言う準備が
+整った正確な turn」という強い timing claim には、次の評価層で absolute readiness-turn annotation が要ります。
+
+playtest session snapshot は `playtest_sessions/` に保存されるので、server が turn の途中で落ちても
 直前の user draft を復元できます。
 
 `--delayed-mention-diversity-repair on` のときは、最初の delayed mention plan が

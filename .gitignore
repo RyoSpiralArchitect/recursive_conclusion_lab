@@ -18,5 +18,7 @@ dist/
 playtest_ui/node_modules/
 playtest_ui/dist/
 playtest_sessions/
+blind_review_sessions/
+human_eval_sets/**/blind_key.json
 
 runs/

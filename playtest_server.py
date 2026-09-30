@@ -14,12 +14,19 @@ import threading
 import time
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
 
+from blind_review import (
+    BlindReviewManager,
+    ReviewConflictError,
+    ReviewNotFoundError,
+    ReviewValidationError,
+)
 from recursive_conclusion_lab import (
     AdaptiveHazardEmbeddingGuard,
     AdaptiveHazardPolicy,
@@ -42,13 +49,19 @@ from recursive_conclusion_lab import (
     DeferredIntentTiming,
     ExperimentConfig,
     GenerationConfig,
+    ModelProfilePinError,
     RecursiveConclusionSession,
     SemanticJudgeBackend,
     SteerStrength,
+    available_embedding_provider_names,
+    available_provider_names,
     build_adapter,
     build_embedding_adapter,
+    canonical_embedding_provider_name,
+    canonical_provider_name,
     compact_text,
     load_script,
+    model_profile_catalog,
     strip_rcl_state,
 )
 
@@ -57,11 +70,15 @@ ROOT_DIR = Path(__file__).resolve().parent
 PROTOCOL_SCRIPTS_DIR = ROOT_DIR / "protocol_scripts"
 PLAYTEST_UI_DIST_DIR = ROOT_DIR / "playtest_ui" / "dist"
 DEFAULT_SESSIONS_DIR = ROOT_DIR / "playtest_sessions"
+DEFAULT_EVAL_SETS_DIR = ROOT_DIR / "human_eval_sets"
+DEFAULT_REVIEW_SESSIONS_DIR = ROOT_DIR / "blind_review_sessions"
 
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-4.1-mini-2025-04-14"
 DEFAULT_EMBEDDING_PROVIDER = "openai"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
+SESSION_SCHEMA_VERSION = 2
+PUBLIC_LOAD_ERROR_LIMIT = 20
 
 DEFAULT_ALLOWED_ORIGINS = [
     "http://127.0.0.1:5173",
@@ -69,11 +86,18 @@ DEFAULT_ALLOWED_ORIGINS = [
 ]
 
 
+class AmbiguousLegacyProfileError(ModelProfilePinError):
+    pass
+
+
 def json_ready(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
     if dataclasses.is_dataclass(value):
-        return {field.name: json_ready(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        return {
+            field.name: json_ready(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
@@ -86,11 +110,31 @@ def json_ready(value: Any) -> Any:
 
 
 def generation_config_from_dict(data: dict[str, Any]) -> GenerationConfig:
+    temperature_raw = data.get("temperature", 0.2)
+    profile_id_raw = data.get("model_profile_id")
+    profile_version_raw = data.get("model_profile_version")
     return GenerationConfig(
-        temperature=float(data.get("temperature", 0.2) or 0.2),
+        temperature=(
+            float(temperature_raw) if temperature_raw is not None else 0.2
+        ),
         max_tokens=int(data.get("max_tokens", 900) or 900),
         timeout_seconds=int(data.get("timeout_seconds", 120) or 120),
+        reasoning_effort=optional_generation_setting(data.get("reasoning_effort")),
+        reasoning_mode=optional_generation_setting(data.get("reasoning_mode")),
+        reasoning_context=optional_generation_setting(data.get("reasoning_context")),
+        text_verbosity=optional_generation_setting(data.get("text_verbosity")),
+        model_profile_id=(
+            str(profile_id_raw).strip() if profile_id_raw is not None else None
+        ),
+        model_profile_version=(
+            int(profile_version_raw) if profile_version_raw is not None else None
+        ),
     )
+
+
+def optional_generation_setting(value: Any) -> Optional[str]:
+    cleaned = str(value or "").strip().lower()
+    return None if not cleaned or cleaned == "auto" else cleaned
 
 
 def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
@@ -101,12 +145,18 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         memory_capsule_limit=int(data.get("memory_capsule_limit", 4) or 4),
         memory_word_budget=int(data.get("memory_word_budget", 140) or 140),
         conclusion_every=int(data.get("conclusion_every", 3) or 3),
-        conclusion_mode=ConclusionMode(str(data.get("conclusion_mode", ConclusionMode.OBSERVE.value))),
+        conclusion_mode=ConclusionMode(
+            str(data.get("conclusion_mode", ConclusionMode.OBSERVE.value))
+        ),
         conclusion_steer_strength=SteerStrength(
             str(data.get("conclusion_steer_strength", SteerStrength.MEDIUM.value))
         ),
         conclusion_steer_injection=ConclusionSteerInjection(
-            str(data.get("conclusion_steer_injection", ConclusionSteerInjection.FULL.value))
+            str(
+                data.get(
+                    "conclusion_steer_injection", ConclusionSteerInjection.FULL.value
+                )
+            )
         ),
         delayed_mention_every=int(data.get("delayed_mention_every", 0) or 0),
         delayed_mention_item_limit=int(data.get("delayed_mention_item_limit", 3) or 3),
@@ -127,10 +177,18 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         delayed_mention_mode=DelayedMentionMode(
             str(data.get("delayed_mention_mode", DelayedMentionMode.OBSERVE.value))
         ),
-        delayed_mention_fire_prob=float(data.get("delayed_mention_fire_prob", 0.35) or 0.35),
-        delayed_mention_fire_max_items=int(data.get("delayed_mention_fire_max_items", 2) or 2),
+        delayed_mention_fire_prob=float(
+            data.get("delayed_mention_fire_prob", 0.35) or 0.35
+        ),
+        delayed_mention_fire_max_items=int(
+            data.get("delayed_mention_fire_max_items", 2) or 2
+        ),
         delayed_mention_leak_policy=DelayedMentionLeakPolicy(
-            str(data.get("delayed_mention_leak_policy", DelayedMentionLeakPolicy.ON.value))
+            str(
+                data.get(
+                    "delayed_mention_leak_policy", DelayedMentionLeakPolicy.ON.value
+                )
+            )
         ),
         delayed_mention_leak_threshold=float(
             data.get("delayed_mention_leak_threshold", 0.05) or 0.05
@@ -139,7 +197,11 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
             str(data.get("adaptive_hazard_policy", AdaptiveHazardPolicy.ADAPTIVE.value))
         ),
         adaptive_hazard_profile=AdaptiveHazardProfile(
-            str(data.get("adaptive_hazard_profile", AdaptiveHazardProfile.BALANCED.value))
+            str(
+                data.get(
+                    "adaptive_hazard_profile", AdaptiveHazardProfile.BALANCED.value
+                )
+            )
         ),
         adaptive_hazard_stage_policy=AdaptiveHazardStagePolicy(
             str(
@@ -166,7 +228,11 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
             str(data.get("deferred_intent_mode", DeferredIntentMode.OBSERVE.value))
         ),
         deferred_intent_strategy=DeferredIntentStrategy(
-            str(data.get("deferred_intent_strategy", DeferredIntentStrategy.TRIGGER.value))
+            str(
+                data.get(
+                    "deferred_intent_strategy", DeferredIntentStrategy.TRIGGER.value
+                )
+            )
         ),
         deferred_intent_timing=DeferredIntentTiming(
             str(data.get("deferred_intent_timing", DeferredIntentTiming.OFFSET.value))
@@ -182,10 +248,18 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
                 )
             )
         ),
-        deferred_intent_plan_budget=int(data.get("deferred_intent_plan_budget", 0) or 0),
-        deferred_intent_plan_max_new=int(data.get("deferred_intent_plan_max_new", 1) or 1),
+        deferred_intent_plan_budget=int(
+            data.get("deferred_intent_plan_budget", 0) or 0
+        ),
+        deferred_intent_plan_max_new=int(
+            data.get("deferred_intent_plan_max_new", 1) or 1
+        ),
         deferred_intent_backend=DeferredIntentBackend(
-            str(data.get("deferred_intent_backend", DeferredIntentBackend.EXTERNAL.value))
+            str(
+                data.get(
+                    "deferred_intent_backend", DeferredIntentBackend.EXTERNAL.value
+                )
+            )
         ),
         deferred_intent_latent_injection=DeferredIntentLatentInjection(
             str(
@@ -201,6 +275,11 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         show_probe_outputs=bool(data.get("show_probe_outputs", False)),
         reply_config=generation_config_from_dict(dict(data.get("reply_config") or {})),
         probe_config=generation_config_from_dict(dict(data.get("probe_config") or {})),
+        observer_config=(
+            generation_config_from_dict(dict(data["observer_config"]))
+            if isinstance(data.get("observer_config"), dict)
+            else None
+        ),
     )
 
 
@@ -223,11 +302,19 @@ def serialize_session_state(session: RecursiveConclusionSession) -> dict[str, An
         ),
         "latest_conclusion_mention_likelihood": session.latest_conclusion_mention_likelihood,
         "latest_conclusion_delay_strategy": session.latest_conclusion_delay_strategy,
-        "latest_conclusion_delay_signals": list(session.latest_conclusion_delay_signals),
+        "latest_conclusion_delay_signals": list(
+            session.latest_conclusion_delay_signals
+        ),
         "latest_conclusion_delay_rationale": session.latest_conclusion_delay_rationale,
-        "latest_latent_convergence_trace": json_ready(session.latest_latent_convergence_trace),
-        "latest_embedding_convergence_trace": json_ready(session.latest_embedding_convergence_trace),
-        "latest_adaptive_hazard_trace": json_ready(session.latest_adaptive_hazard_trace),
+        "latest_latent_convergence_trace": json_ready(
+            session.latest_latent_convergence_trace
+        ),
+        "latest_embedding_convergence_trace": json_ready(
+            session.latest_embedding_convergence_trace
+        ),
+        "latest_adaptive_hazard_trace": json_ready(
+            session.latest_adaptive_hazard_trace
+        ),
         "delayed_mentions": [item.to_dict() for item in session.delayed_mentions],
         "deferred_intents": [item.to_dict() for item in session.deferred_intents],
         "turn_index": session.turn_index,
@@ -251,7 +338,9 @@ def restore_session_state(
         for item in list(state.get("history") or [])
         if isinstance(item, dict)
     ]
-    session.memory_capsules = [str(item) for item in list(state.get("memory_capsules") or [])]
+    session.memory_capsules = [
+        str(item) for item in list(state.get("memory_capsules") or [])
+    ]
     session.conclusion_hypotheses = [
         str(item) for item in list(state.get("conclusion_hypotheses") or [])
     ]
@@ -441,12 +530,18 @@ def default_experiment_config(
         deferred_intent_latent_injection=DeferredIntentLatentInjection.OFF,
         deferred_intent_ablation=DeferredIntentAblation.NONE,
         show_probe_outputs=False,
-        reply_config=GenerationConfig(temperature=0.2, max_tokens=900, timeout_seconds=120),
-        probe_config=GenerationConfig(temperature=0.0, max_tokens=220, timeout_seconds=120),
+        reply_config=GenerationConfig(
+            temperature=0.2, max_tokens=900, timeout_seconds=120
+        ),
+        probe_config=GenerationConfig(
+            temperature=0.0, max_tokens=220, timeout_seconds=120
+        ),
     )
 
 
-def sanitize_turn_payload(payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def sanitize_turn_payload(
+    payload: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
     if not isinstance(payload, dict):
         return None
     data = dict(json_ready(payload))
@@ -529,6 +624,18 @@ class CreateSessionRequest(BaseModel):
     script_id: str = "free_chat"
     arm_preset: str = "adaptive_kind_aware"
     semantic_judge_backend: str = SemanticJudgeBackend.BOTH.value
+    reasoning_effort: Optional[str] = None
+    probe_reasoning_effort: Optional[str] = None
+    reasoning_mode: Optional[str] = None
+    probe_reasoning_mode: Optional[str] = None
+    reasoning_context: Optional[str] = None
+    probe_reasoning_context: Optional[str] = None
+    text_verbosity: Optional[str] = None
+    probe_text_verbosity: Optional[str] = None
+    observer_reasoning_effort: Optional[str] = None
+    observer_reasoning_mode: Optional[str] = None
+    observer_reasoning_context: Optional[str] = None
+    observer_text_verbosity: Optional[str] = None
 
 
 class TurnRequest(BaseModel):
@@ -539,11 +646,26 @@ class NotesRequest(BaseModel):
     notes: str = ""
 
 
+class CreateReviewSessionRequest(BaseModel):
+    eval_set_id: str = Field(min_length=1)
+    rater_id: str = Field(min_length=1, max_length=120)
+
+
+class SubmitJudgmentRequest(BaseModel):
+    submission_id: str = Field(min_length=1)
+    answers: dict[str, str] = Field(default_factory=dict)
+    confidence: str
+    evidence: str
+    counterevidence: str = ""
+    abstain: bool = False
+
+
 class SessionManager:
     def __init__(self, sessions_dir: Path) -> None:
         self.sessions_dir = sessions_dir
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._records: dict[str, PlaytestRecord] = {}
+        self._load_errors: list[dict[str, str]] = []
         self._lock = threading.RLock()
         self._load_existing()
 
@@ -557,28 +679,136 @@ class SessionManager:
         for session_json in sorted(self.sessions_dir.glob("*/session.json")):
             try:
                 payload = json.loads(session_json.read_text(encoding="utf-8"))
-                record = self._restore_record(payload, session_json.parent)
-            except Exception:
+                schema_version = int(payload.get("version", 1) or 1)
+                if schema_version < 1 or schema_version > SESSION_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"Unsupported saved session schema version: {schema_version}."
+                    )
+                record = self._restore_record(
+                    payload,
+                    session_json.parent,
+                    schema_version=schema_version,
+                )
+                if schema_version < SESSION_SCHEMA_VERSION:
+                    self._save_record(record, touch_updated_at=False)
+            except Exception as exc:
+                self._load_errors.append(
+                    self._public_load_error(session_json.parent.name, exc)
+                )
                 continue
             self._records[record.session_id] = record
 
-    def _restore_record(self, payload: dict[str, Any], storage_dir: Path) -> PlaytestRecord:
-        provider = str(payload.get("provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER)
+    @staticmethod
+    def _public_load_error(session_id: str, exc: Exception) -> dict[str, str]:
+        if isinstance(exc, AmbiguousLegacyProfileError):
+            return {
+                "session_id": session_id,
+                "code": "legacy_profile_ambiguous",
+                "message": (
+                    "This legacy session predates exact model-profile provenance; "
+                    "it was not resumed with inferred generation semantics."
+                ),
+            }
+        if isinstance(exc, ModelProfilePinError):
+            return {
+                "session_id": session_id,
+                "code": "model_profile_mismatch",
+                "message": (
+                    "The pinned model profile is missing or no longer matches; "
+                    "the session was not resumed."
+                ),
+            }
+        if isinstance(exc, OSError):
+            return {
+                "session_id": session_id,
+                "code": "storage_error",
+                "message": "The saved session could not be read or migrated.",
+            }
+        return {
+            "session_id": session_id,
+            "code": "invalid_snapshot",
+            "message": "The saved session is invalid or incompatible and was not resumed.",
+        }
+
+    def _restore_record(
+        self,
+        payload: dict[str, Any],
+        storage_dir: Path,
+        *,
+        schema_version: int,
+    ) -> PlaytestRecord:
+        session_id = compact_text(str(payload.get("session_id") or ""))
+        if not session_id or session_id != storage_dir.name:
+            raise ValueError("Saved session id does not match its storage directory.")
+        provider = canonical_provider_name(
+            str(payload.get("provider", DEFAULT_PROVIDER) or DEFAULT_PROVIDER)
+        )
         model = str(payload.get("model", DEFAULT_MODEL) or DEFAULT_MODEL)
-        observer_provider = str(payload.get("observer_provider", provider) or provider)
+        observer_provider = canonical_provider_name(
+            str(payload.get("observer_provider", provider) or provider)
+        )
         observer_model = str(payload.get("observer_model", model) or model)
-        embedding_provider = str(
-            payload.get("embedding_provider", DEFAULT_EMBEDDING_PROVIDER)
-            or DEFAULT_EMBEDDING_PROVIDER
+        embedding_provider = canonical_embedding_provider_name(
+            str(
+                payload.get("embedding_provider", DEFAULT_EMBEDDING_PROVIDER)
+                or DEFAULT_EMBEDDING_PROVIDER
+            )
         )
         embedding_model = str(
-            payload.get("embedding_model", DEFAULT_EMBEDDING_MODEL) or DEFAULT_EMBEDDING_MODEL
+            payload.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+            or DEFAULT_EMBEDDING_MODEL
         )
         config = experiment_config_from_dict(dict(payload.get("config") or {}))
+        generation_adapter = build_adapter(provider, model)
+        observer_generation_adapter = build_adapter(
+            observer_provider, observer_model
+        )
+        if schema_version >= SESSION_SCHEMA_VERSION:
+            pinned_configs = {
+                "reply_config": config.reply_config,
+                "probe_config": config.probe_config,
+                "observer_config": config.observer_config,
+            }
+            for label, generation_config in pinned_configs.items():
+                if generation_config is None or (
+                    generation_config.model_profile_id is None
+                    or generation_config.model_profile_version is None
+                ):
+                    raise ModelProfilePinError(
+                        f"Saved {label} is missing its model profile pin."
+                    )
+        else:
+            legacy_configs = (
+                ("reply_config", config.reply_config, generation_adapter),
+                ("probe_config", config.probe_config, generation_adapter),
+                (
+                    "observer_config",
+                    config.observer_config,
+                    observer_generation_adapter,
+                ),
+            )
+            for label, generation_config, adapter in legacy_configs:
+                has_profile_id = (
+                    generation_config is not None
+                    and generation_config.model_profile_id is not None
+                )
+                has_profile_version = (
+                    generation_config is not None
+                    and generation_config.model_profile_version is not None
+                )
+                if has_profile_id != has_profile_version:
+                    raise ModelProfilePinError(
+                        f"Saved {label} has an incomplete model profile pin."
+                    )
+                if not has_profile_id and adapter.model_profile.model_ids:
+                    raise AmbiguousLegacyProfileError(
+                        f"Saved {label} predates exact profile provenance for "
+                        f"{adapter.provider_name}={adapter.model!r}."
+                    )
         log_path = storage_dir / "events.jsonl"
         session = RecursiveConclusionSession(
-            adapter=build_adapter(provider, model),
-            observer_adapter=build_adapter(observer_provider, observer_model),
+            adapter=generation_adapter,
+            observer_adapter=observer_generation_adapter,
             embedding_adapter=(
                 build_embedding_adapter(embedding_provider, embedding_model)
                 if config.semantic_judge_backend
@@ -590,7 +820,7 @@ class SessionManager:
         )
         restore_session_state(session, dict(payload.get("session_state") or {}))
         return PlaytestRecord(
-            session_id=str(payload.get("session_id")),
+            session_id=session_id,
             title=str(payload.get("title", "") or ""),
             created_at=float(payload.get("created_at", time.time()) or time.time()),
             updated_at=float(payload.get("updated_at", time.time()) or time.time()),
@@ -601,7 +831,10 @@ class SessionManager:
             embedding_provider=embedding_provider,
             embedding_model=embedding_model,
             script_id=str(payload.get("script_id", "free_chat") or "free_chat"),
-            arm_preset=str(payload.get("arm_preset", "adaptive_kind_aware") or "adaptive_kind_aware"),
+            arm_preset=str(
+                payload.get("arm_preset", "adaptive_kind_aware")
+                or "adaptive_kind_aware"
+            ),
             notes=str(payload.get("notes", "") or ""),
             pending_user_text=str(payload.get("pending_user_text", "") or ""),
             last_error=str(payload.get("last_error", "") or ""),
@@ -615,11 +848,14 @@ class SessionManager:
             session=session,
         )
 
-    def _save_record(self, record: PlaytestRecord) -> None:
-        record.updated_at = time.time()
+    def _save_record(
+        self, record: PlaytestRecord, *, touch_updated_at: bool = True
+    ) -> None:
+        if touch_updated_at:
+            record.updated_at = time.time()
         record.storage_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": SESSION_SCHEMA_VERSION,
             "session_id": record.session_id,
             "title": record.title,
             "created_at": record.created_at,
@@ -639,14 +875,26 @@ class SessionManager:
             "config": json_ready(record.session.config),
             "session_state": serialize_session_state(record.session),
         }
-        self._session_json_path(record.session_id).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        session_json = self._session_json_path(record.session_id)
+        temporary = session_json.with_name(
+            f".{session_json.name}.{secrets.token_hex(4)}.tmp"
         )
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, session_json)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _default_title(self, script_id: str, arm_preset: str) -> str:
-        script_label = SCRIPT_INDEX.get(script_id, {}).get("label") or humanize_name(script_id)
-        arm_label = ARM_PRESETS.get(arm_preset, {}).get("label") or humanize_name(arm_preset)
+        script_label = SCRIPT_INDEX.get(script_id, {}).get("label") or humanize_name(
+            script_id
+        )
+        arm_label = ARM_PRESETS.get(arm_preset, {}).get("label") or humanize_name(
+            arm_preset
+        )
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         return f"{script_label} · {arm_label} · {timestamp}"
 
@@ -663,9 +911,13 @@ class SessionManager:
                         "session_id": record.session_id,
                         "title": record.title,
                         "script_id": record.script_id,
-                        "script_label": SCRIPT_INDEX.get(record.script_id, {}).get("label"),
+                        "script_label": SCRIPT_INDEX.get(record.script_id, {}).get(
+                            "label"
+                        ),
                         "arm_preset": record.arm_preset,
-                        "arm_label": ARM_PRESETS.get(record.arm_preset, {}).get("label"),
+                        "arm_label": ARM_PRESETS.get(record.arm_preset, {}).get(
+                            "label"
+                        ),
                         "provider": record.provider,
                         "model": record.model,
                         "created_at": record.created_at,
@@ -677,6 +929,16 @@ class SessionManager:
                     }
                 )
             return items
+
+    def load_errors(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [
+                dict(item) for item in self._load_errors[:PUBLIC_LOAD_ERROR_LIMIT]
+            ]
+
+    def load_error_count(self) -> int:
+        with self._lock:
+            return len(self._load_errors)
 
     def get_record(self, session_id: str) -> PlaytestRecord:
         with self._lock:
@@ -718,23 +980,39 @@ class SessionManager:
             raise ValueError(f"Unknown script_id: {request.script_id}")
         if request.arm_preset not in ARM_PRESETS:
             raise ValueError(f"Unknown arm preset: {request.arm_preset}")
-        semantic_judge_backend = request.semantic_judge_backend or SemanticJudgeBackend.BOTH.value
+        semantic_judge_backend = (
+            request.semantic_judge_backend or SemanticJudgeBackend.BOTH.value
+        )
 
-        provider = compact_text(request.provider).lower() or DEFAULT_PROVIDER
-        model = compact_text(request.model) or DEFAULT_MODEL
-        observer_provider = (
+        provider = canonical_provider_name(
+            compact_text(request.provider).lower() or DEFAULT_PROVIDER
+        )
+        model = compact_text(request.model)
+        if not model:
+            raise ValueError("model must not be blank")
+        observer_provider = canonical_provider_name(
             compact_text(request.observer_provider or "").lower() or provider
         )
         observer_model = compact_text(request.observer_model or "") or model
         embedding_provider = compact_text(request.embedding_provider or "").lower()
         embedding_model = compact_text(request.embedding_model or "")
-        if semantic_judge_backend in {SemanticJudgeBackend.EMBEDDING.value, SemanticJudgeBackend.BOTH.value}:
+        if semantic_judge_backend in {
+            SemanticJudgeBackend.EMBEDDING.value,
+            SemanticJudgeBackend.BOTH.value,
+        }:
             if not embedding_provider:
                 embedding_provider = (
                     "dummy" if provider == "dummy" else DEFAULT_EMBEDDING_PROVIDER
                 )
             if not embedding_model:
-                embedding_model = "hash-128" if embedding_provider == "dummy" else DEFAULT_EMBEDDING_MODEL
+                embedding_model = (
+                    "hash-128"
+                    if embedding_provider == "dummy"
+                    else DEFAULT_EMBEDDING_MODEL
+                )
+            embedding_provider = canonical_embedding_provider_name(
+                embedding_provider
+            )
 
         session_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
         storage_dir = self._session_dir(session_id)
@@ -744,13 +1022,55 @@ class SessionManager:
             arm_preset=request.arm_preset,
             semantic_judge_backend=semantic_judge_backend,
         )
+        config.reply_config = dataclasses.replace(
+            config.reply_config,
+            reasoning_effort=optional_generation_setting(request.reasoning_effort),
+            reasoning_mode=optional_generation_setting(request.reasoning_mode),
+            reasoning_context=optional_generation_setting(request.reasoning_context),
+            text_verbosity=optional_generation_setting(request.text_verbosity),
+        )
+        config.probe_config = dataclasses.replace(
+            config.probe_config,
+            reasoning_effort=optional_generation_setting(
+                request.probe_reasoning_effort
+            ),
+            reasoning_mode=optional_generation_setting(request.probe_reasoning_mode),
+            reasoning_context=optional_generation_setting(
+                request.probe_reasoning_context
+            ),
+            text_verbosity=optional_generation_setting(request.probe_text_verbosity),
+        )
+        observer_controls = {
+            "reasoning_effort": optional_generation_setting(
+                request.observer_reasoning_effort
+            ),
+            "reasoning_mode": optional_generation_setting(
+                request.observer_reasoning_mode
+            ),
+            "reasoning_context": optional_generation_setting(
+                request.observer_reasoning_context
+            ),
+            "text_verbosity": optional_generation_setting(
+                request.observer_text_verbosity
+            ),
+        }
+        if any(value is not None for value in observer_controls.values()):
+            config.observer_config = GenerationConfig(
+                temperature=config.probe_config.temperature,
+                max_tokens=config.probe_config.max_tokens,
+                timeout_seconds=config.probe_config.timeout_seconds,
+                **observer_controls,
+            )
         session = RecursiveConclusionSession(
             adapter=build_adapter(provider, model),
             observer_adapter=build_adapter(observer_provider, observer_model),
             embedding_adapter=(
                 build_embedding_adapter(embedding_provider, embedding_model)
                 if semantic_judge_backend
-                in {SemanticJudgeBackend.EMBEDDING.value, SemanticJudgeBackend.BOTH.value}
+                in {
+                    SemanticJudgeBackend.EMBEDDING.value,
+                    SemanticJudgeBackend.BOTH.value,
+                }
                 else None
             ),
             config=config,
@@ -758,7 +1078,8 @@ class SessionManager:
         )
         record = PlaytestRecord(
             session_id=session_id,
-            title=compact_text(request.title) or self._default_title(request.script_id, request.arm_preset),
+            title=compact_text(request.title)
+            or self._default_title(request.script_id, request.arm_preset),
             created_at=time.time(),
             updated_at=time.time(),
             provider=provider,
@@ -811,10 +1132,29 @@ class SessionManager:
         return self.session_detail(session_id)
 
 
-def build_app(*, sessions_dir: Path, allowed_origins: list[str]) -> FastAPI:
+def build_app(
+    *,
+    sessions_dir: Path,
+    allowed_origins: list[str],
+    eval_sets_dir: Optional[Path] = None,
+    review_sessions_dir: Optional[Path] = None,
+    workspace_mode: str = "full",
+) -> FastAPI:
+    if workspace_mode not in {"full", "review"}:
+        raise ValueError("workspace_mode must be 'full' or 'review'.")
     manager = SessionManager(sessions_dir=sessions_dir)
+    review_manager = BlindReviewManager(
+        eval_sets_dir=(eval_sets_dir or DEFAULT_EVAL_SETS_DIR),
+        sessions_dir=(review_sessions_dir or DEFAULT_REVIEW_SESSIONS_DIR),
+    )
 
-    app = FastAPI(title="Recursive Conclusion Lab Playtest")
+    reviewer_only = workspace_mode == "review"
+    app = FastAPI(
+        title="Recursive Conclusion Lab Playtest",
+        openapi_url=None if reviewer_only else "/openapi.json",
+        docs_url=None if reviewer_only else "/docs",
+        redoc_url=None if reviewer_only else "/redoc",
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
@@ -823,6 +1163,22 @@ def build_app(*, sessions_dir: Path, allowed_origins: list[str]) -> FastAPI:
         allow_headers=["*"],
     )
 
+    if reviewer_only:
+
+        @app.middleware("http")
+        async def enforce_reviewer_boundary(request: Request, call_next: Any) -> Any:
+            path = request.url.path.rstrip("/")
+            if (
+                path == "/api/options"
+                or path == "/api/sessions"
+                or path.startswith("/api/sessions/")
+            ):
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": "Playtest APIs are unavailable in review mode."},
+                )
+            return await call_next(request)
+
     @app.get("/api/options")
     def get_options() -> dict[str, Any]:
         return {
@@ -830,20 +1186,28 @@ def build_app(*, sessions_dir: Path, allowed_origins: list[str]) -> FastAPI:
             "default_model": DEFAULT_MODEL,
             "default_embedding_provider": DEFAULT_EMBEDDING_PROVIDER,
             "default_embedding_model": DEFAULT_EMBEDDING_MODEL,
+            "default_script_id": "shortlist_then_commit",
+            "default_arm_preset": "adaptive_kind_aware",
+            "default_semantic_judge_backend": "both",
             "scripts": SCRIPT_CATALOG,
             "arm_presets": [
-                {"id": arm_id, **payload}
-                for arm_id, payload in ARM_PRESETS.items()
+                {"id": arm_id, **payload} for arm_id, payload in ARM_PRESETS.items()
             ],
             "semantic_judge_backends": [
                 backend.value for backend in SemanticJudgeBackend
             ],
-            "providers": ["openai", "anthropic", "mistral", "gemini", "hf", "dummy"],
+            "providers": list(available_provider_names()),
+            "embedding_providers": list(available_embedding_provider_names()),
+            "model_profiles": model_profile_catalog(),
         }
 
     @app.get("/api/sessions")
     def list_sessions() -> dict[str, Any]:
-        return {"sessions": manager.list_summaries()}
+        return {
+            "sessions": manager.list_summaries(),
+            "load_errors": manager.load_errors(),
+            "load_error_count": manager.load_error_count(),
+        }
 
     @app.post("/api/sessions")
     def create_session(request: CreateSessionRequest) -> dict[str, Any]:
@@ -888,12 +1252,85 @@ def build_app(*, sessions_dir: Path, allowed_origins: list[str]) -> FastAPI:
             raise HTTPException(status_code=404, detail="Session not found.") from exc
         return {"events": read_event_log_tail(record.log_path, limit=limit)}
 
+    @app.get("/api/review/sets")
+    def list_review_sets() -> dict[str, Any]:
+        try:
+            return {"sets": review_manager.list_sets()}
+        except ReviewValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/review/sessions")
+    def list_review_sessions() -> dict[str, Any]:
+        return {"sessions": review_manager.list_sessions()}
+
+    @app.post("/api/review/sessions")
+    def create_review_session(request: CreateReviewSessionRequest) -> dict[str, Any]:
+        try:
+            return review_manager.create_session(
+                eval_set_id=request.eval_set_id,
+                rater_id=request.rater_id,
+            )
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ReviewValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/review/sessions/{session_id}")
+    def get_review_session(session_id: str) -> dict[str, Any]:
+        try:
+            return review_manager.session_detail(session_id)
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ReviewValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/review/sessions/{session_id}/items/{item_id}")
+    def submit_review_judgment(
+        session_id: str,
+        item_id: str,
+        request: SubmitJudgmentRequest,
+    ) -> dict[str, Any]:
+        try:
+            return review_manager.submit_judgment(
+                session_id=session_id,
+                item_id=item_id,
+                submission_id=request.submission_id,
+                answers=request.answers,
+                confidence=request.confidence,
+                evidence=request.evidence,
+                counterevidence=request.counterevidence,
+                abstain=request.abstain,
+            )
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ReviewValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/review/sessions/{session_id}/seal")
+    def seal_review_session(session_id: str) -> dict[str, Any]:
+        try:
+            return review_manager.seal_session(session_id)
+        except ReviewNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ReviewValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ReviewConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/health")
     def health() -> dict[str, Any]:
-        return {"ok": True}
+        return {"ok": True, "workspace_mode": workspace_mode}
 
     if PLAYTEST_UI_DIST_DIR.exists():
-        app.mount("/", StaticFiles(directory=PLAYTEST_UI_DIST_DIR, html=True), name="playtest-ui")
+        app.mount(
+            "/",
+            StaticFiles(directory=PLAYTEST_UI_DIST_DIR, html=True),
+            name="playtest-ui",
+        )
 
     return app
 
@@ -904,21 +1341,48 @@ def app_from_env() -> FastAPI:
     ).resolve()
     origins_raw = os.environ.get("RCL_PLAYTEST_ALLOW_ORIGINS", "")
     extra_origins = [item.strip() for item in origins_raw.split(",") if item.strip()]
+    eval_sets_dir = Path(
+        os.environ.get("RCL_EVAL_SETS_DIR", str(DEFAULT_EVAL_SETS_DIR))
+    ).resolve()
+    review_sessions_dir = Path(
+        os.environ.get("RCL_REVIEW_SESSIONS_DIR", str(DEFAULT_REVIEW_SESSIONS_DIR))
+    ).resolve()
+    workspace_mode = os.environ.get("RCL_WORKSPACE_MODE", "full").strip().lower()
     return build_app(
         sessions_dir=sessions_dir,
         allowed_origins=DEFAULT_ALLOWED_ORIGINS + extra_origins,
+        eval_sets_dir=eval_sets_dir,
+        review_sessions_dir=review_sessions_dir,
+        workspace_mode=workspace_mode,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local playtest server for Recursive Conclusion Lab.")
+    parser = argparse.ArgumentParser(
+        description="Local playtest server for Recursive Conclusion Lab."
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--reload", action="store_true")
     parser.add_argument(
+        "--review-only",
+        action="store_true",
+        help="Expose only blind-review APIs and hide the unblinded Playtest workspace.",
+    )
+    parser.add_argument(
         "--sessions-dir",
         default=str(DEFAULT_SESSIONS_DIR),
         help="Directory where playtest session snapshots and logs are stored.",
+    )
+    parser.add_argument(
+        "--eval-sets-dir",
+        default=str(DEFAULT_EVAL_SETS_DIR),
+        help="Directory containing blinded human-evaluation packet sets.",
+    )
+    parser.add_argument(
+        "--review-sessions-dir",
+        default=str(DEFAULT_REVIEW_SESSIONS_DIR),
+        help="Directory where append-only blind-review sessions are stored.",
     )
     parser.add_argument(
         "--allow-origin",
@@ -933,6 +1397,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     sessions_dir = Path(args.sessions_dir).resolve()
     os.environ["RCL_PLAYTEST_SESSIONS_DIR"] = str(sessions_dir)
+    os.environ["RCL_EVAL_SETS_DIR"] = str(Path(args.eval_sets_dir).resolve())
+    os.environ["RCL_REVIEW_SESSIONS_DIR"] = str(
+        Path(args.review_sessions_dir).resolve()
+    )
+    os.environ["RCL_WORKSPACE_MODE"] = "review" if args.review_only else "full"
     os.environ["RCL_PLAYTEST_ALLOW_ORIGINS"] = ",".join(list(args.allow_origin or []))
     if args.reload:
         uvicorn.run("playtest_server:app", host=args.host, port=args.port, reload=True)
