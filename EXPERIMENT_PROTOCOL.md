@@ -4,15 +4,15 @@
 
 この実験では、会話中に数ターンごとに「この対話が最終的にどんな結論へ向かっているか」を推定する `conclusion probe` を挿入したとき、応答軌道がどう変わるかを比較する。特に次の2点を切り分けて観測する。
 
-1. **観測効果** - probe を挿すだけで、返信内容にどれだけ影響が漏れ出るか
+1. **観測効果** - probe 呼び出しの有無だけで返信が変わるか
 2. **誘導効果** - `soft_steer` で probe を次ターンへ注入したとき、収束・記憶保持・過剰ロックインがどう変化するか
 
 加えて、`recent_window_messages` を絞った条件で `memory capsule` が文脈保持にどれだけ効くかを測る。
 
 ## 2. 主仮説
 
-- **H1: observe でも leakage は起きる**  
-  `observe` では probe をユーザーへ見せず reply system にも注入しないが、side-channel の生成が返信に影響するなら `probe_reply_overlap` は 0 より明確に大きくなる。
+- **H1: observe probe 呼び出しの影響は検証対象**
+  `observe` では probe を返信へ注入しない。`probe_reply_overlap` が 0 より大きくても、共通の会話文脈から生じる類似度と区別できず、因果的な leakage は示せない。同一の入力・設定で probe 呼び出しの有無だけを変えた対応対照を比較する。
 
 - **H2: soft_steer は収束を強める**  
   `soft_steer` では `probe_reply_overlap` と `conclusion_stability` が上がりやすい。
@@ -33,6 +33,8 @@
 | B. Memory only | 2 or 3 | 0 | observe | memory capsule 単体の効果 |
 | C. Observe | 2 or 3 | 2 or 3 | observe | probe を挿すだけの観測効果 |
 | D. Soft steer | 2 or 3 | 2 or 3 | soft_steer | probe 注入の誘導効果 |
+
+B と C は H1 の探索的比較。因果評価では、比較する各ターンの返信入力・モデル・生成条件を固定し、probe 呼び出しの有無だけを変える。返信が受け取った入力と probe 出力の非注入を trace で確認する。
 
 推奨パラメータ:
 
@@ -82,7 +84,7 @@
 ### 5.1 既存ログから直接取れる指標
 
 1. **probe_reply_overlap**  
-   既に実装済み。reply が直前 probe 仮説をどれだけ取り込んだかの近似。
+   既に実装済み。reply と直前 probe 仮説の語彙的類似度。これ単独では probe の影響を示さない。
 
 2. **avg_probe_confidence**  
    `CONCLUSION / CONFIDENCE / EVIDENCE` 形式から confidence を抽出し平均する。
@@ -94,7 +96,7 @@
    最後の user turn と最後の assistant reply の lexical overlap。現在の要求への追従性の粗い近似。
 
 5. **final_probe_reply_overlap**  
-   最後の probe 仮説と最後の reply の overlap。最終ターンで仮説がどれだけ reply を支配したかを見る。
+   最後の probe 仮説と最後の reply の語彙的類似度。
 
 6. **usage-based efficiency**  
    `usage` が取れる provider では、turn あたり input/output token を比較する。
@@ -142,6 +144,7 @@ lexical 指標だけだと意味的な良し悪しを取りこぼす。最低で
   を使うと、`avg_embedding_alignment`、`embedding_alignment_slope`、
   `embedding_semantic_leakage_rate`、`avg_embedding_articulation_gap_turns` を計算できる。
   `both` にすると `semantic_judge_disagreement_rate` も出る。
+  これらは可視の返信と probe が選んだ標的との類似度であり、モデル内部の latent state は測らない。無関係な結論やシャッフルした結論を負の対照として比較する。
 
 - **人手評価 3 項目**  
   1. 現在のユーザー目標に答えているか  
@@ -229,14 +232,15 @@ Phase 1 で差が出た設定だけ、OpenAI / Anthropic / Mistral / Gemini / HF
 - `--conclusion-steer-injection full` vs `--conclusion-steer-injection conclusion_line`
 
 を切り替えて再確認する。
+この選択と調整は探索として扱う。確認には未使用の会話スクリプトを先に固定し、対応対照と同じ評価基準で比較する。同一スクリプトの反復数を独立シナリオ数として扱わない。
 
 ## 7. 解釈ガイド
 
 - **probe_reply_overlap 高 / final_goal_coverage 高**  
-  probe 仮説がうまく reply の構造化を助けている可能性
+  共通文脈による一致もあり得る。probe の寄与は対応対照で確認する
 
 - **probe_reply_overlap 高 / late_redirection 失敗**  
-  仮説が強すぎて lock-in している可能性
+  lock-in の候補。probe の寄与は対応対照で確認する
 
 - **conclusion_stability 極端に高い / final quality 低い**  
   早すぎる premature convergence の疑い
@@ -267,12 +271,12 @@ Phase 1 で差が出た設定だけ、OpenAI / Anthropic / Mistral / Gemini / HF
 
 ### 成功パターン
 - `memory_only` が context retention を改善
-- `observe` が軽い leakage に留まる
+- 対応する no-probe 条件と比べ、`observe` の返信に再現する悪化がない
 - `soft_steer` が convergent planning では有利
 - ただし late redirection では `observe` が勝つ
 
 ### 失敗パターン
-- `observe` の時点で overlap が高すぎる
+- 対応する no-probe 条件と比べ、`observe` の返信に再現する悪化がある
 - `soft_steer` で final answer が毎回似すぎる
 - redirection 後も obsolete goal を繰り返す
 - memory capsule が stylistic summary になり facts を落とす
@@ -281,7 +285,7 @@ Phase 1 で差が出た設定だけ、OpenAI / Anthropic / Mistral / Gemini / HF
 
 最終的に知りたいのは「probe を観測装置として使うべきか、制御装置として使うべきか」である。
 
-- **観測器として十分** なら `observe` を採用
+- **観測器として十分** かは対応対照と未使用スクリプトで確認する
 - **収束促進に価値** があるなら `soft_steer` を planning タスクに限定採用
 - **goal shift が多い運用** なら `soft_steer` は危険なので抑制する
 

@@ -6,9 +6,12 @@ import argparse
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import re
 import secrets
 import threading
 import time
@@ -85,6 +88,24 @@ DEFAULT_ALLOWED_ORIGINS = [
     "http://localhost:5173",
 ]
 
+TOKEN_USAGE_FIELDS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "prompttokencount",
+        "candidatestokencount",
+        "totaltokencount",
+        "thoughtstokencount",
+        "tooluseprompttokencount",
+    }
+)
+
 
 class AmbiguousLegacyProfileError(ModelProfilePinError):
     pass
@@ -109,16 +130,32 @@ def json_ready(value: Any) -> Any:
     return value
 
 
+def value_or_default(data: dict[str, Any], key: str, default: Any) -> Any:
+    value = data.get(key)
+    return default if value is None else value
+
+
+def safe_turn_error(error: Exception) -> str:
+    kind = type(error).__name__
+    status = re.match(r"HTTP ([1-5][0-9]{2})\b", str(error))
+    if status:
+        return f"{kind}: provider HTTP {status.group(1)}"
+    return f"{kind}: turn failed"
+
+
 def generation_config_from_dict(data: dict[str, Any]) -> GenerationConfig:
-    temperature_raw = data.get("temperature", 0.2)
+    max_tokens = int(value_or_default(data, "max_tokens", 900))
+    timeout_seconds = int(value_or_default(data, "timeout_seconds", 120))
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
     profile_id_raw = data.get("model_profile_id")
     profile_version_raw = data.get("model_profile_version")
     return GenerationConfig(
-        temperature=(
-            float(temperature_raw) if temperature_raw is not None else 0.2
-        ),
-        max_tokens=int(data.get("max_tokens", 900) or 900),
-        timeout_seconds=int(data.get("timeout_seconds", 120) or 120),
+        temperature=float(value_or_default(data, "temperature", 0.2)),
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
         reasoning_effort=optional_generation_setting(data.get("reasoning_effort")),
         reasoning_mode=optional_generation_setting(data.get("reasoning_mode")),
         reasoning_context=optional_generation_setting(data.get("reasoning_context")),
@@ -140,14 +177,12 @@ def optional_generation_setting(value: Any) -> Optional[str]:
 def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
     return ExperimentConfig(
         base_system=str(data.get("base_system", "") or ""),
-        recent_window_messages=int(data.get("recent_window_messages", 8) or 8),
-        memory_every=int(data.get("memory_every", 3) or 3),
-        memory_capsule_limit=int(data.get("memory_capsule_limit", 4) or 4),
-        memory_word_budget=int(data.get("memory_word_budget", 140) or 140),
-        conclusion_every=int(data.get("conclusion_every", 3) or 3),
-        conclusion_mode=ConclusionMode(
-            str(data.get("conclusion_mode", ConclusionMode.OBSERVE.value))
-        ),
+        recent_window_messages=int(value_or_default(data, "recent_window_messages", 8)),
+        memory_every=int(value_or_default(data, "memory_every", 3)),
+        memory_capsule_limit=int(value_or_default(data, "memory_capsule_limit", 4)),
+        memory_word_budget=int(value_or_default(data, "memory_word_budget", 140)),
+        conclusion_every=int(value_or_default(data, "conclusion_every", 3)),
+        conclusion_mode=ConclusionMode(str(data.get("conclusion_mode", ConclusionMode.OBSERVE.value))),
         conclusion_steer_strength=SteerStrength(
             str(data.get("conclusion_steer_strength", SteerStrength.MEDIUM.value))
         ),
@@ -158,13 +193,13 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
                 )
             )
         ),
-        delayed_mention_every=int(data.get("delayed_mention_every", 0) or 0),
-        delayed_mention_item_limit=int(data.get("delayed_mention_item_limit", 3) or 3),
+        delayed_mention_every=int(value_or_default(data, "delayed_mention_every", 0)),
+        delayed_mention_item_limit=int(value_or_default(data, "delayed_mention_item_limit", 3)),
         delayed_mention_min_nonconclusion_items=int(
-            data.get("delayed_mention_min_nonconclusion_items", 1) or 1
+            value_or_default(data, "delayed_mention_min_nonconclusion_items", 1)
         ),
         delayed_mention_min_kind_diversity=int(
-            data.get("delayed_mention_min_kind_diversity", 2) or 2
+            value_or_default(data, "delayed_mention_min_kind_diversity", 2)
         ),
         delayed_mention_diversity_repair=DelayedMentionDiversityRepairPolicy(
             str(
@@ -177,12 +212,8 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         delayed_mention_mode=DelayedMentionMode(
             str(data.get("delayed_mention_mode", DelayedMentionMode.OBSERVE.value))
         ),
-        delayed_mention_fire_prob=float(
-            data.get("delayed_mention_fire_prob", 0.35) or 0.35
-        ),
-        delayed_mention_fire_max_items=int(
-            data.get("delayed_mention_fire_max_items", 2) or 2
-        ),
+        delayed_mention_fire_prob=float(value_or_default(data, "delayed_mention_fire_prob", 0.35)),
+        delayed_mention_fire_max_items=int(value_or_default(data, "delayed_mention_fire_max_items", 2)),
         delayed_mention_leak_policy=DelayedMentionLeakPolicy(
             str(
                 data.get(
@@ -191,7 +222,7 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
             )
         ),
         delayed_mention_leak_threshold=float(
-            data.get("delayed_mention_leak_threshold", 0.05) or 0.05
+            value_or_default(data, "delayed_mention_leak_threshold", 0.05)
         ),
         adaptive_hazard_policy=AdaptiveHazardPolicy(
             str(data.get("adaptive_hazard_policy", AdaptiveHazardPolicy.ADAPTIVE.value))
@@ -219,11 +250,11 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
                 )
             )
         ),
-        latent_convergence_every=int(data.get("latent_convergence_every", 0) or 0),
+        latent_convergence_every=int(value_or_default(data, "latent_convergence_every", 0)),
         semantic_judge_backend=SemanticJudgeBackend(
             str(data.get("semantic_judge_backend", SemanticJudgeBackend.LLM.value))
         ),
-        deferred_intent_every=int(data.get("deferred_intent_every", 0) or 0),
+        deferred_intent_every=int(value_or_default(data, "deferred_intent_every", 0)),
         deferred_intent_mode=DeferredIntentMode(
             str(data.get("deferred_intent_mode", DeferredIntentMode.OBSERVE.value))
         ),
@@ -237,9 +268,9 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         deferred_intent_timing=DeferredIntentTiming(
             str(data.get("deferred_intent_timing", DeferredIntentTiming.OFFSET.value))
         ),
-        deferred_intent_offset=int(data.get("deferred_intent_offset", 3) or 3),
-        deferred_intent_grace=int(data.get("deferred_intent_grace", 2) or 2),
-        deferred_intent_limit=int(data.get("deferred_intent_limit", 6) or 6),
+        deferred_intent_offset=int(value_or_default(data, "deferred_intent_offset", 3)),
+        deferred_intent_grace=int(value_or_default(data, "deferred_intent_grace", 2)),
+        deferred_intent_limit=int(value_or_default(data, "deferred_intent_limit", 6)),
         deferred_intent_plan_policy=DeferredIntentPlanPolicy(
             str(
                 data.get(
@@ -248,12 +279,8 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
                 )
             )
         ),
-        deferred_intent_plan_budget=int(
-            data.get("deferred_intent_plan_budget", 0) or 0
-        ),
-        deferred_intent_plan_max_new=int(
-            data.get("deferred_intent_plan_max_new", 1) or 1
-        ),
+        deferred_intent_plan_budget=int(value_or_default(data, "deferred_intent_plan_budget", 0)),
+        deferred_intent_plan_max_new=int(value_or_default(data, "deferred_intent_plan_max_new", 1)),
         deferred_intent_backend=DeferredIntentBackend(
             str(
                 data.get(
@@ -414,6 +441,84 @@ def restore_session_state(
     return session
 
 
+def failed_event_receipts(discarded_bytes: bytes) -> list[dict[str, Any]]:
+    """Keep event identity and provider receipts without copying prompt or reply text."""
+    receipts: list[dict[str, Any]] = []
+    for raw_line in discarded_bytes.splitlines(keepends=True):
+        if not raw_line.strip():
+            continue
+        receipt: dict[str, Any] = {"raw_line_sha256": hashlib.sha256(raw_line).hexdigest()}
+        try:
+            event = json.loads(raw_line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            receipts.append(receipt)
+            continue
+        if not isinstance(event, dict):
+            receipts.append(receipt)
+            continue
+        for key in ("timestamp", "turn_index"):
+            value = event.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                receipt[key] = value
+        event_type = event.get("event_type")
+        if isinstance(event_type, str) and len(event_type) <= 64 and event_type.replace("_", "").isalnum():
+            receipt["event_type"] = event_type
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            safe_payload: dict[str, Any] = {}
+            request_id = payload.get("request_id")
+            if isinstance(request_id, str) and 0 < len(request_id) <= 128:
+                allowed = all(char.isascii() and (char.isalnum() or char in "._:-") for char in request_id)
+                secret_prefix = request_id.lower().startswith(
+                    ("sk-", "sk_", "hf_", "aiza", "xox", "ghp_", "github_pat_")
+                )
+                if allowed and not secret_prefix:
+                    safe_payload["request_id"] = request_id
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                token_usage = {
+                    key: value
+                    for key, value in usage.items()
+                    if isinstance(key, str)
+                    and key.lower() in TOKEN_USAGE_FIELDS
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                }
+                if token_usage:
+                    safe_payload["usage"] = token_usage
+            if safe_payload:
+                receipt["payload"] = safe_payload
+        receipts.append(receipt)
+    return receipts
+
+
+def save_failed_attempt(
+    record: PlaytestRecord,
+    *,
+    user_text: str,
+    turn_index: int,
+    error: Exception,
+    discarded_bytes: bytes,
+) -> None:
+    """Persist discarded event receipts before removing them from the live session log."""
+    receipts = failed_event_receipts(discarded_bytes)
+    audit = {
+        "recorded_at": time.time(),
+        "attempt_turn_index": turn_index,
+        "error_type": type(error).__name__,
+        "user_text_sha256": hashlib.sha256(user_text.encode("utf-8")).hexdigest(),
+        "discarded_bytes_sha256": hashlib.sha256(discarded_bytes).hexdigest(),
+        "discarded_event_count": len(receipts),
+        "discarded_events": receipts,
+    }
+    audit_path = record.storage_dir / "failed_attempts.jsonl"
+    with audit_path.open("a", encoding="utf-8") as audit_log:
+        audit_log.write(json.dumps(audit, ensure_ascii=False, allow_nan=False) + "\n")
+        audit_log.flush()
+        os.fsync(audit_log.fileno())
+
+
 def humanize_name(name: str) -> str:
     parts = [part for part in name.replace("-", "_").split("_") if part]
     return " ".join(part.capitalize() for part in parts) if parts else name
@@ -497,10 +602,10 @@ def default_experiment_config(
         delayed_mention_every=2,
         delayed_mention_item_limit=4,
         delayed_mention_min_nonconclusion_items=int(
-            evaluation.get("delayed_mention_min_nonconclusion_items", 2) or 2
+            value_or_default(evaluation, "delayed_mention_min_nonconclusion_items", 2)
         ),
         delayed_mention_min_kind_diversity=int(
-            evaluation.get("delayed_mention_min_kind_diversity", 3) or 3
+            value_or_default(evaluation, "delayed_mention_min_kind_diversity", 3)
         ),
         delayed_mention_diversity_repair=DelayedMentionDiversityRepairPolicy.ON,
         delayed_mention_mode=DelayedMentionMode.SOFT_FIRE,
@@ -1116,13 +1221,41 @@ class SessionManager:
             raise ValueError("user_text must not be empty")
         with self._lock:
             record = self.get_record(session_id)
+            state_before = serialize_session_state(record.session)
+            log_size_before = record.log_path.stat().st_size if record.log_path.exists() else None
             record.pending_user_text = cleaned
             record.last_error = ""
             self._save_record(record)
             try:
                 result = record.session.user_turn(cleaned)
             except Exception as exc:
-                record.last_error = str(exc)
+                discarded_bytes = b""
+                if record.log_path.exists():
+                    with record.log_path.open("rb") as event_log:
+                        event_log.seek(log_size_before or 0)
+                        discarded_bytes = event_log.read()
+                restore_session_state(record.session, state_before)
+                try:
+                    save_failed_attempt(
+                        record,
+                        user_text=cleaned,
+                        turn_index=int(state_before["turn_index"]) + 1,
+                        error=exc,
+                        discarded_bytes=discarded_bytes,
+                    )
+                except Exception as audit_error:
+                    record.last_error = (
+                        f"{type(exc).__name__}: failed attempt audit write failed "
+                        f"({type(audit_error).__name__}); event log retained"
+                    )
+                    self._save_record(record)
+                    raise RuntimeError("Failed attempt audit write failed; event log retained") from audit_error
+                if log_size_before is None:
+                    record.log_path.unlink(missing_ok=True)
+                else:
+                    with record.log_path.open("r+b") as event_log:
+                        event_log.truncate(log_size_before)
+                record.last_error = safe_turn_error(exc)
                 self._save_record(record)
                 raise
             record.pending_user_text = ""
@@ -1227,12 +1360,14 @@ def build_app(
     def append_turn(session_id: str, request: TurnRequest) -> dict[str, Any]:
         try:
             return manager.append_turn(session_id, request.user_text)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Session not found.") from exc
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Session not found.") from None
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if str(exc) == "user_text must not be empty":
+                raise HTTPException(status_code=400, detail="user_text must not be empty") from None
+            raise HTTPException(status_code=500, detail=safe_turn_error(exc)) from None
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            raise HTTPException(status_code=500, detail=safe_turn_error(exc)) from None
 
     @app.put("/api/sessions/{session_id}/notes")
     def update_notes(session_id: str, request: NotesRequest) -> dict[str, Any]:
