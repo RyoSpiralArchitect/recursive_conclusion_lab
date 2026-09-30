@@ -1,0 +1,36 @@
+{
+  "title": "Open Dialogue Review",
+  "rubric_version": "hold_dialogue_v1",
+  "seed": 7,
+  "out_dir": "runs/human_eval_sets/hold_dialogue",
+  "scenarios": [
+    {
+      "name": "hold_open_then_revise",
+      "display_name": "Exploring a Shared Room",
+      "compare_out_dir": "runs/hold_dialogue",
+      "arms": ["baseline", "hold_prompt", "hold_workpad"]
+    }
+  ],
+  "questions": [
+    {
+      "id": "useful_progress",
+      "prompt": "Which transcript makes more useful progress while the final choice remains open?",
+      "choices": ["A", "B", "Tie"]
+    },
+    {
+      "id": "provisional_hypotheses",
+      "prompt": "Which transcript better keeps possibilities provisional and revises them when new constraints arrive?",
+      "choices": ["A", "B", "Tie"]
+    },
+    {
+      "id": "requested_synthesis",
+      "prompt": "Which transcript better grounds the requested recommendation in the dialogue and explains remaining uncertainty?",
+      "choices": ["A", "B", "Tie"]
+    },
+    {
+      "id": "reopening",
+      "prompt": "Which transcript better reopens the inquiry after the last change in circumstances?",
+      "choices": ["A", "B", "Tie"]
+    }
+  ]
+}

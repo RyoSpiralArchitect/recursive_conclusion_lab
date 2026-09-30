@@ -304,6 +304,8 @@ function App() {
   const metrics = collectMetrics(activeSession);
   const scriptTurns = activeSession?.script?.turns || [];
   const lastResult = activeSession?.last_result || {};
+  const holdingConclusion = activeSession?.config?.conclusion_mode === "hold";
+  const inquiry = lastResult.inquiry_state;
   const providerModelProfiles = (options?.model_profiles || []).filter(
     (profile) => profile.provider === createForm.provider,
   );
@@ -800,30 +802,67 @@ function App() {
             </div>
           </section>
 
-          <section className="panel-section">
-            <div className="section-heading tight">
-              <p className="eyebrow">Conclusion</p>
-              <h3>Current plan</h3>
-            </div>
-            <div className="inspector-card">
-              <p className="highlight-line">
-                {lastResult.latest_conclusion_line || "No conclusion probe yet."}
-              </p>
-              <dl className="kv-list">
-                <div>
-                  <dt>Window</dt>
-                  <dd>
-                    {lastResult.latest_conclusion_plan_earliest_turn ?? "—"} →{" "}
-                    {lastResult.latest_conclusion_plan_latest_turn ?? "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Hazard</dt>
-                  <dd>
-                    {formatNumber(lastResult.latest_conclusion_plan_hazard_turn_prob)} /{" "}
-                    {formatNumber(
-                      lastResult.latest_conclusion_plan_adaptive_hazard_turn_prob,
-                    )}
+          {holdingConclusion ? (
+            <section className="panel-section">
+              <div className="section-heading tight">
+                <p className="eyebrow">Open inquiry</p>
+                <h3>Keep exploring</h3>
+              </div>
+              <div className="inspector-card">
+                <p className="highlight-line">
+                  {inquiry?.focus || "Explore the question without choosing a conclusion yet."}
+                </p>
+                {inquiry ? (
+                  <>
+                    <p className="muted">
+                      These notes are provisional and can change with the conversation.
+                    </p>
+                    <h4>Possibilities</h4>
+                    <ul>
+                      {inquiry.hypotheses.map((text, index) => <li key={index}>{text}</li>)}
+                    </ul>
+                    {inquiry.hypotheses.length === 0 && <p>No specific hypothesis yet.</p>}
+                    <h4>Open questions</h4>
+                    <ul>
+                      {inquiry.open_questions.map((text, index) => <li key={index}>{text}</li>)}
+                    </ul>
+                    <h4>Next useful step</h4>
+                    <p>{inquiry.next_step}</p>
+                    {inquiry.revision_note && <p>{inquiry.revision_note}</p>}
+                    <p className="muted">
+                      Updated on turn {lastResult.inquiry_state_turn}. Ask for a synthesis whenever you want one.
+                    </p>
+                  </>
+                ) : (
+                  <p>No current inquiry notes. Continue the conversation to update them.</p>
+                )}
+              </div>
+            </section>
+          ) : (
+            <section className="panel-section">
+              <div className="section-heading tight">
+                <p className="eyebrow">Conclusion</p>
+                <h3>Current plan</h3>
+              </div>
+              <div className="inspector-card">
+                <p className="highlight-line">
+                  {lastResult.latest_conclusion_line || "No conclusion probe yet."}
+                </p>
+                <dl className="kv-list">
+                  <div>
+                    <dt>Window</dt>
+                    <dd>
+                      {lastResult.latest_conclusion_plan_earliest_turn ?? "—"} →{" "}
+                      {lastResult.latest_conclusion_plan_latest_turn ?? "—"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Hazard</dt>
+                    <dd>
+                      {formatNumber(lastResult.latest_conclusion_plan_hazard_turn_prob)} /{" "}
+                      {formatNumber(
+                        lastResult.latest_conclusion_plan_adaptive_hazard_turn_prob,
+                      )}
                   </dd>
                 </div>
                 <div>
@@ -833,6 +872,7 @@ function App() {
               </dl>
             </div>
           </section>
+          )}
 
           <section className="panel-section">
             <div className="section-heading tight">

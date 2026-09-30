@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "We have one spare room in our neighborhood building. Help me explore possible uses, but let's keep the final choice open.",
+    "The budget is small. Some neighbors want practical activities and others need somewhere quiet. What can we learn before deciding?",
+    "New constraint: the rooms next door are used for therapy, so noisy activities are out. Revise the possibilities with that in mind.",
+    "We can try one activity for a month, but only two volunteers are available. Develop a small experiment and tell me what is still uncertain.",
+    "Now give me a provisional recommendation, with the assumptions that could change it.",
+    "Let's reopen that: the two volunteers can only come in the evening. What changes, and what should we find out next?"
+  ]
+}

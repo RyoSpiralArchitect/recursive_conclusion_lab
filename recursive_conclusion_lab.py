@@ -34,6 +34,8 @@ import textwrap
 import time
 from typing import Any, Callable, Iterable, Optional
 
+from inquiry_state import INQUIRY_PROBE_SYSTEM, InquiryState, inquiry_reply_context
+
 
 # ----------------------------
 # Core data models
@@ -325,6 +327,7 @@ class EmbeddingResponse:
 class ConclusionMode(str, Enum):
     OBSERVE = "observe"
     SOFT_STEER = "soft_steer"
+    HOLD = "hold"
 
 
 class SteerStrength(str, Enum):
@@ -473,6 +476,25 @@ class ExperimentConfig:
         )
     )
     observer_config: Optional[GenerationConfig] = None
+
+
+def validate_hold_configuration(config: ExperimentConfig) -> None:
+    if config.conclusion_mode != ConclusionMode.HOLD:
+        return
+    if (
+        config.delayed_mention_every > 0
+        or config.delayed_mention_mode != DelayedMentionMode.OBSERVE
+        or config.deferred_intent_every > 0
+        or config.deferred_intent_mode != DeferredIntentMode.OBSERVE
+        or config.deferred_intent_backend != DeferredIntentBackend.EXTERNAL
+        or config.deferred_intent_plan_policy != DeferredIntentPlanPolicy.PERIODIC
+        or config.deferred_intent_latent_injection != DeferredIntentLatentInjection.OFF
+        or config.latent_convergence_every > 0
+    ):
+        raise ValueError(
+            "conclusion_mode='hold' requires delayed-mention and deferred-intent "
+            "planning/injection and latent-convergence judging to be disabled."
+        )
 
 
 @dataclass
@@ -1927,7 +1949,24 @@ class DummyAdapter(BaseAdapter):
         lower = prompt.lower()
         system_lower = (system or "").lower()
 
-        if "deferred-intent in-band state" in system_lower and "rcl_state" in system_lower:
+        if system == INQUIRY_PROBE_SYSTEM:
+            dialogue = json.loads(prompt).get("recent_dialogue") or []
+            focus = next(
+                (row["content"] for row in reversed(dialogue) if row["role"] == "user"),
+                "Continue the inquiry",
+            )
+            output = json.dumps(
+                {
+                    "focus": focus[:400],
+                    "hypotheses": [],
+                    "open_questions": [
+                        "What information would help clarify the current question?"
+                    ],
+                    "next_step": "Clarify one uncertainty or develop one concrete possibility.",
+                    "revision_note": "Dummy workpad updated from the latest user message.",
+                }
+            )
+        elif "deferred-intent in-band state" in system_lower and "rcl_state" in system_lower:
             def parse_int(key: str, default: int) -> int:
                 match = re.search(
                     rf"{re.escape(key)}\s*:\s*(\d+)", system or "", flags=re.IGNORECASE
@@ -3054,6 +3093,7 @@ class RecursiveConclusionSession:
         config: ExperimentConfig,
         log_path: Optional[Path] = None,
     ) -> None:
+        validate_hold_configuration(config)
         self.adapter = adapter
         self.observer_adapter = observer_adapter or adapter
         self.embedding_adapter = embedding_adapter
@@ -3098,6 +3138,8 @@ class RecursiveConclusionSession:
         self.history: list[ChatMessage] = []
         self.memory_capsules: list[str] = []
         self.conclusion_hypotheses: list[str] = []
+        self.inquiry_state: Optional[InquiryState] = None
+        self.inquiry_state_turn: Optional[int] = None
         self.latest_conclusion_probe_turn: Optional[int] = None
         self.latest_conclusion_line: str = ""
         self.latest_conclusion_keywords: list[str] = []
@@ -3639,6 +3681,9 @@ class RecursiveConclusionSession:
                 f"{render_capsules(self.memory_capsules)}"
             )
 
+        if self.config.conclusion_mode == ConclusionMode.HOLD:
+            parts.append(inquiry_reply_context(self.inquiry_state, self.inquiry_state_turn))
+
         if (
             self.config.conclusion_mode == ConclusionMode.SOFT_STEER
             and self.conclusion_hypotheses
@@ -3820,7 +3865,53 @@ class RecursiveConclusionSession:
             )
         return capsule or None
 
+    def _probe_inquiry(self) -> None:
+        if (
+            self.config.conclusion_mode != ConclusionMode.HOLD
+            or self.config.conclusion_every <= 0
+            or self.turn_index == 0
+            or self.turn_index % self.config.conclusion_every != 0
+        ):
+            return
+        source = json.dumps(
+            {
+                "previous_workpad": (
+                    self.inquiry_state.to_dict() if self.inquiry_state else None
+                ),
+                "memory_capsules": self.memory_capsules,
+                "recent_dialogue": [dataclasses.asdict(msg) for msg in self._recent_window()],
+            },
+            ensure_ascii=False,
+        )
+        response = self.adapter.generate(
+            system=INQUIRY_PROBE_SYSTEM,
+            messages=[ChatMessage(role="user", content=source)],
+            config=generation_config_with_min_tokens(self.config.probe_config, 600),
+        )
+        error = None
+        try:
+            state = InquiryState.from_dict(extract_json_value(response.text))
+        except ValueError:
+            # A stale hypothesis must not silently survive a failed revision.
+            state = None
+            error = "invalid_inquiry_state"
+        self.inquiry_state = state
+        self.inquiry_state_turn = self.turn_index if state is not None else None
+        self._log(
+            "inquiry_update",
+            {
+                "state": state.to_dict() if state else None,
+                "error": error,
+                "usage": response.usage,
+                "finish_reason": response.finish_reason,
+                "request_id": response.request_id,
+                "adapter_metadata": response.adapter_metadata,
+            },
+        )
+
     def _probe_conclusion(self) -> Optional[str]:
+        if self.config.conclusion_mode == ConclusionMode.HOLD:
+            return None
         if self.config.conclusion_every <= 0:
             return None
         if self.turn_index == 0 or self.turn_index % self.config.conclusion_every != 0:
@@ -5149,6 +5240,7 @@ class RecursiveConclusionSession:
         self.turn_index += 1
 
         memory_capsule = self._probe_memory_capsule()
+        self._probe_inquiry()
         conclusion = self._probe_conclusion()
         planned_delayed_mentions = self._probe_delayed_mentions()
         adaptive_delayed_mention_adjustments, adaptive_conclusion_hazard = (
@@ -6511,6 +6603,9 @@ class RecursiveConclusionSession:
             "inband_state_error": inband_state_error,
             "inband_state_chars": inband_state_chars,
             "system_prompt": system_prompt,
+            "conclusion_mode": self.config.conclusion_mode.value,
+            "inquiry_state": self.inquiry_state.to_dict() if self.inquiry_state else None,
+            "inquiry_state_turn": self.inquiry_state_turn,
             "usage": reply.usage,
             "finish_reason": reply.finish_reason,
             "request_id": reply.request_id,
@@ -6727,6 +6822,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
             "deferred_intent_plan_policy='auto' requires --deferred-intent-plan-budget >= 1."
         )
 
+    validate_hold_configuration(cfg)
     return cfg
 
 
@@ -6770,6 +6866,9 @@ def print_probe_outputs(result: dict[str, Any]) -> None:
         print(f"\n[memory capsule]\n{result['memory_capsule']}\n")
     if result.get("conclusion_probe"):
         print(f"[conclusion probe]\n{result['conclusion_probe']}\n")
+    if result.get("inquiry_state"):
+        print("[open inquiry workpad]")
+        print(json.dumps(result["inquiry_state"], ensure_ascii=False, indent=2))
     latent_trace = result.get("latent_convergence_trace")
     if isinstance(latent_trace, dict):
         print(
@@ -6979,6 +7078,7 @@ def execute_compare(
     script_system, turns = load_script(script_path)
     provider_specs = parse_provider_specs(args.providers)
     validate_optional_adapter_options(args)
+    make_experiment_config_from_args(args, base_system=script_system)
 
     out_dir = Path(args.out_dir or "compare_outputs")
     arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
@@ -7038,6 +7138,9 @@ def execute_compare(
                     "arm_description": arm_description or None,
                     "run_name": run_name or None,
                     "run_index": run_index,
+                    "conclusion_mode": result["conclusion_mode"],
+                    "inquiry_state": result["inquiry_state"],
+                    "inquiry_state_turn": result["inquiry_state_turn"],
                     "random_seed": effective_seed,
                     "semantic_judge_backend": result["semantic_judge_backend"],
                     "adaptive_hazard_policy": result["adaptive_hazard_policy"],
@@ -7448,12 +7551,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--memory-every", type=int, default=3, help="Create a new memory capsule every N user turns. 0 disables.")
         p.add_argument("--memory-limit", type=int, default=4, help="Maximum number of memory capsules to retain; 0 disables memory probes.")
         p.add_argument("--memory-words", type=int, default=140, help="Soft word budget for each memory capsule; 0 disables memory probes.")
-        p.add_argument("--conclusion-every", type=int, default=3, help="Probe the likely end-state every N user turns. 0 disables.")
+        p.add_argument("--conclusion-every", type=int, default=3, help="Update the conclusion probe, or open inquiry workpad in hold mode, every N user turns. 0 disables probes.")
         p.add_argument(
             "--conclusion-mode",
             choices=[m.value for m in ConclusionMode],
             default=ConclusionMode.OBSERVE.value,
-            help="Whether the latest conclusion hypothesis is only logged or softly injected into the next reply.",
+            help="Observe a conclusion, softly steer toward it, or hold it open with a revisable inquiry workpad.",
         )
         p.add_argument(
             "--conclusion-steer-strength",

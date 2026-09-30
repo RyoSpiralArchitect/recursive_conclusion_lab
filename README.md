@@ -2,6 +2,15 @@
 
 [Japanese README](README.ja.md)
 
+The development goal is a chat harness that can keep a conclusion open while
+continuing useful dialogue. Experiments help us choose mechanisms for that goal.
+See [the goal and first hold-mode design](HARNESS_GOAL.md).
+
+Try the first implementation with the **Open Inquiry (hold)** Playtest preset,
+or `repl --provider dummy --model dummy-v1 --conclusion-mode hold --conclusion-every 1`.
+Its revisable workpad tracks possibilities, open questions, and a next step.
+It is an experimental mechanism; local tests establish its wiring, not dialogue quality.
+
 Cross-provider experiment harness for observing (and optionally steering) the *time-structure* of LLM dialogue:
 
 - Recursive **memory capsules** (compressed context you can reload every turn)
