@@ -1,0 +1,33 @@
+{
+  "_meta": {
+    "schema": "rcl.blind_pairwise_key.v2",
+    "seed": 7,
+    "rubric_version": "staged_release_pairwise_v1",
+    "review_bundle_digest": "8e57c05276ad42b8edd8d1bf4e59b7741784eab4fa7e6e85c40ce53ad90cf863",
+    "source_digest": "e3d8921d1d9768b58424bcef7a748be503d4ce6b6c441da6079884d81079f4cd"
+  },
+  "item_001": {
+    "scenario_name": "shortlist_then_commit",
+    "run_index": 0,
+    "label_to_arm": {
+      "A": "static",
+      "B": "adaptive_kind_aware"
+    }
+  },
+  "item_002": {
+    "scenario_name": "shortlist_then_commit",
+    "run_index": 1,
+    "label_to_arm": {
+      "A": "adaptive_kind_aware",
+      "B": "static"
+    }
+  },
+  "item_003": {
+    "scenario_name": "shortlist_then_commit",
+    "run_index": 2,
+    "label_to_arm": {
+      "A": "static",
+      "B": "adaptive_kind_aware"
+    }
+  }
+}

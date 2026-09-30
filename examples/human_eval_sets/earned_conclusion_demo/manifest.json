@@ -1,0 +1,31 @@
+{
+  "schema": "rcl.blind_pairwise_eval_set.v2",
+  "title": "Earned Conclusion Demo",
+  "rubric_version": "staged_release_pairwise_v1",
+  "item_count": 3,
+  "questions": [
+    {
+      "id": "overall_better",
+      "prompt": "Which transcript better balances delayed release and final articulation overall?",
+      "choices": ["A", "B", "Tie"]
+    },
+    {
+      "id": "leakage_control_better",
+      "prompt": "Which transcript better avoids premature leakage without becoming inert?",
+      "choices": ["A", "B", "Tie"]
+    },
+    {
+      "id": "staged_release_better",
+      "prompt": "Which transcript handles shortlist/support/final-packet staging more naturally?",
+      "choices": ["A", "B", "Tie"]
+    },
+    {
+      "id": "earned_final_better",
+      "prompt": "Which final answer feels more earned by the earlier turns?",
+      "choices": ["A", "B", "Tie"]
+    }
+  ],
+  "scenario_item_counts": {
+    "shortlist_then_commit": 3
+  }
+}

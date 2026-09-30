@@ -85,7 +85,7 @@ class CompareOutputIntegrityTests(unittest.TestCase):
         out_dir = self.root / "provider_collision"
         args = self.compare_args(out_dir, "../outside=dummy-v1")
 
-        with self.assertRaisesRegex(ValueError, "Unsupported provider"):
+        with self.assertRaisesRegex(ValueError, "Unsupported generation provider"):
             rcl.run_compare(args)
 
         self.assertFalse(out_dir.exists())
@@ -97,11 +97,11 @@ class CompareOutputIntegrityTests(unittest.TestCase):
             ({"observer_model": "dummy-v1"}, "--observer-provider and --observer-model"),
             (
                 {"observer_provider": "unsupported", "observer_model": "model"},
-                "Unsupported provider",
+                "Unsupported generation provider",
             ),
             (
                 {"observer_provider": "dummy=bad", "observer_model": "model"},
-                "Unsupported provider",
+                "Unsupported generation provider",
             ),
             ({"embedding_provider": "dummy"}, "--embedding-provider and --embedding-model"),
             ({"embedding_model": "dummy-v1"}, "--embedding-provider and --embedding-model"),
@@ -171,11 +171,11 @@ class CompareOutputIntegrityTests(unittest.TestCase):
             ({"observer_provider": "dummy"}, "--observer-provider and --observer-model"),
             (
                 {"observer_provider": "unsupported", "observer_model": "model"},
-                "Unsupported provider",
+                "Unsupported generation provider",
             ),
             (
                 {"observer_provider": "dummy=bad", "observer_model": "model"},
-                "Unsupported provider",
+                "Unsupported generation provider",
             ),
             ({"embedding_provider": "dummy"}, "--embedding-provider and --embedding-model"),
             (
