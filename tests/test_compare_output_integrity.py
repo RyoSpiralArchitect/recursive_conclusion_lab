@@ -91,6 +91,50 @@ class CompareOutputIntegrityTests(unittest.TestCase):
         self.assertFalse(out_dir.exists())
         self.assertEqual(list(self.root.glob("outside*")), [])
 
+    def test_invalid_optional_adapters_leave_single_compare_unreserved(self) -> None:
+        cases = (
+            ({"observer_provider": "dummy"}, "--observer-provider and --observer-model"),
+            ({"observer_model": "dummy-v1"}, "--observer-provider and --observer-model"),
+            (
+                {"observer_provider": "unsupported", "observer_model": "model"},
+                "Unsupported provider",
+            ),
+            (
+                {"observer_provider": "dummy=bad", "observer_model": "model"},
+                "Unsupported provider",
+            ),
+            ({"embedding_provider": "dummy"}, "--embedding-provider and --embedding-model"),
+            ({"embedding_model": "dummy-v1"}, "--embedding-provider and --embedding-model"),
+            (
+                {"embedding_provider": "unsupported", "embedding_model": "model"},
+                "Unsupported embedding provider",
+            ),
+            ({"semantic_judge_backend": "embedding"}, "semantic_judge_backend requires"),
+        )
+        for index, (overrides, error) in enumerate(cases):
+            with self.subTest(overrides=overrides):
+                out_dir = self.root / f"invalid_single_{index}"
+                args = self.compare_args(out_dir, "dummy=dummy-v1")
+                for name, value in overrides.items():
+                    setattr(args, name, value)
+                with mock.patch.object(rcl.DummyAdapter, "generate") as generate:
+                    with self.assertRaisesRegex(ValueError, error):
+                        rcl.run_compare(args)
+                generate.assert_not_called()
+                self.assertFalse(out_dir.exists())
+
+    def test_direct_compare_preflights_before_reserving_logs(self) -> None:
+        out_dir = self.root / "invalid_direct"
+        args = self.compare_args(out_dir, "dummy=dummy-v1")
+        args.embedding_provider = "dummy"
+
+        with mock.patch.object(rcl.DummyAdapter, "generate") as generate:
+            with self.assertRaisesRegex(ValueError, "--embedding-provider and --embedding-model"):
+                rcl.execute_compare(args)
+
+        generate.assert_not_called()
+        self.assertFalse(out_dir.exists())
+
     def matrix_config(self, out_dir: Path, arm_names: tuple[str, str]) -> dict:
         return {
             "script": str(self.script),
@@ -121,6 +165,58 @@ class CompareOutputIntegrityTests(unittest.TestCase):
                 rcl.run_compare_matrix_from_config_data(config)
 
         self.assertEqual(list(out_dir.rglob("*.json*")), [])
+
+    def test_invalid_later_matrix_arm_leaves_all_outputs_unreserved(self) -> None:
+        cases = (
+            ({"observer_provider": "dummy"}, "--observer-provider and --observer-model"),
+            (
+                {"observer_provider": "unsupported", "observer_model": "model"},
+                "Unsupported provider",
+            ),
+            (
+                {"observer_provider": "dummy=bad", "observer_model": "model"},
+                "Unsupported provider",
+            ),
+            ({"embedding_provider": "dummy"}, "--embedding-provider and --embedding-model"),
+            (
+                {"embedding_provider": "unsupported", "embedding_model": "model"},
+                "Unsupported embedding provider",
+            ),
+            ({"semantic_judge_backend": "both"}, "semantic_judge_backend requires"),
+        )
+        for index, (overrides, error) in enumerate(cases):
+            with self.subTest(overrides=overrides):
+                out_dir = self.root / f"invalid_matrix_{index}"
+                config = self.matrix_config(out_dir, ("valid", "invalid"))
+                config["arms"][1]["args"].update(overrides)
+                with mock.patch.object(rcl.DummyAdapter, "generate") as generate:
+                    with self.assertRaisesRegex(ValueError, error):
+                        rcl.run_compare_matrix_from_config_data(config)
+                generate.assert_not_called()
+                self.assertFalse(out_dir.exists())
+
+    def test_valid_optional_adapters_are_constructed_during_execution(self) -> None:
+        out_dir = self.root / "optional_adapters"
+        args = self.compare_args(out_dir, "dummy=dummy-v1")
+        args.observer_provider = "dummy"
+        args.observer_model = "observer-v1"
+        args.embedding_provider = "dummy"
+        args.embedding_model = "embedding-v1"
+        args.semantic_judge_backend = "both"
+        args.latent_convergence_every = 1
+
+        self.assertEqual(rcl.run_compare(args), 0)
+
+        rows = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(rows), 3)
+        self.assertIn(
+            "independent_observer",
+            [row["latent_convergence_judge_source"] for row in rows],
+        )
+        self.assertIn(
+            "dummy",
+            [row["embedding_convergence_judge_provider"] for row in rows],
+        )
 
     def test_fresh_matrix_writes_one_run_per_arm_and_repeat(self) -> None:
         out_dir = self.root / "matrix"

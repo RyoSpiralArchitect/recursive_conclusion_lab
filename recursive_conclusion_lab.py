@@ -30,7 +30,6 @@ import os
 from pathlib import Path
 import random
 import re
-import sys
 import textwrap
 import time
 from typing import Any, Iterable, Optional
@@ -2388,6 +2387,12 @@ class HuggingFaceRouterAdapter(BaseAdapter):
         )
 
 
+SUPPORTED_CHAT_PROVIDERS = frozenset({
+    "openai", "anthropic", "mistral", "gemini",
+    "hf", "huggingface", "hugging_face", "dummy",
+})
+
+
 def build_adapter(provider: str, model: str) -> BaseAdapter:
     provider = provider.strip().lower()
     if provider == "openai":
@@ -2417,7 +2422,7 @@ def build_embedding_adapter(provider: str, model: str) -> BaseEmbeddingAdapter:
     )
 
 
-def build_optional_observer_adapter(args: argparse.Namespace) -> Optional[BaseAdapter]:
+def optional_observer_spec(args: argparse.Namespace) -> Optional[tuple[str, str]]:
     observer_provider = compact_text(str(getattr(args, "observer_provider", "") or "")).lower()
     observer_model = compact_text(str(getattr(args, "observer_model", "") or ""))
     if bool(observer_provider) != bool(observer_model):
@@ -2426,12 +2431,12 @@ def build_optional_observer_adapter(args: argparse.Namespace) -> Optional[BaseAd
         )
     if not observer_provider:
         return None
-    return build_adapter(observer_provider, observer_model)
+    if observer_provider not in SUPPORTED_CHAT_PROVIDERS:
+        raise ValueError(f"Unsupported provider: {observer_provider!r}")
+    return observer_provider, observer_model
 
 
-def build_optional_embedding_adapter(
-    args: argparse.Namespace,
-) -> Optional[BaseEmbeddingAdapter]:
+def optional_embedding_spec(args: argparse.Namespace) -> Optional[tuple[str, str]]:
     embedding_provider = compact_text(
         str(getattr(args, "embedding_provider", "") or "")
     ).lower()
@@ -2442,7 +2447,39 @@ def build_optional_embedding_adapter(
         )
     if not embedding_provider:
         return None
-    return build_embedding_adapter(embedding_provider, embedding_model)
+    if embedding_provider not in {"openai", "dummy"}:
+        raise ValueError(
+            f"Unsupported embedding provider: {embedding_provider!r}. "
+            "Supported embedding providers are: openai, dummy."
+        )
+    return embedding_provider, embedding_model
+
+
+def validate_optional_adapter_options(args: argparse.Namespace) -> None:
+    optional_observer_spec(args)
+    embedding_spec = optional_embedding_spec(args)
+    backend = SemanticJudgeBackend(
+        getattr(args, "semantic_judge_backend", SemanticJudgeBackend.LLM.value)
+    )
+    if (
+        backend in {SemanticJudgeBackend.EMBEDDING, SemanticJudgeBackend.BOTH}
+        and embedding_spec is None
+    ):
+        raise ValueError(
+            "semantic_judge_backend requires --embedding-provider and --embedding-model."
+        )
+
+
+def build_optional_observer_adapter(args: argparse.Namespace) -> Optional[BaseAdapter]:
+    spec = optional_observer_spec(args)
+    return build_adapter(*spec) if spec is not None else None
+
+
+def build_optional_embedding_adapter(
+    args: argparse.Namespace,
+) -> Optional[BaseEmbeddingAdapter]:
+    spec = optional_embedding_spec(args)
+    return build_embedding_adapter(*spec) if spec is not None else None
 
 
 # ----------------------------
@@ -5929,10 +5966,6 @@ def load_script(path: Path) -> tuple[str, list[str]]:
 
 
 def parse_provider_specs(specs: list[str]) -> list[tuple[str, str]]:
-    supported = {
-        "openai", "anthropic", "mistral", "gemini",
-        "hf", "huggingface", "hugging_face", "dummy",
-    }
     parsed: list[tuple[str, str]] = []
     for spec in specs:
         if "=" not in spec:
@@ -5945,7 +5978,7 @@ def parse_provider_specs(specs: list[str]) -> list[tuple[str, str]]:
         model = model.strip()
         if not provider or not model:
             raise ValueError(f"Invalid provider spec: {spec!r}")
-        if provider not in supported:
+        if provider not in SUPPORTED_CHAT_PROVIDERS:
             raise ValueError(f"Unsupported provider: {provider!r}")
         parsed.append((provider, model))
     return parsed
@@ -6325,6 +6358,7 @@ def execute_compare(
     script_path = Path(args.script)
     script_system, turns = load_script(script_path)
     provider_specs = parse_provider_specs(args.providers)
+    validate_optional_adapter_options(args)
 
     out_dir = Path(args.out_dir or "compare_outputs")
     arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
@@ -6461,6 +6495,7 @@ def execute_compare(
 def run_compare(args: argparse.Namespace) -> int:
     load_script(Path(args.script))
     make_experiment_config_from_args(args)
+    validate_optional_adapter_options(args)
     out_dir = Path(args.out_dir or "compare_outputs")
     arm_name = compact_text(str(getattr(args, "arm_name", "") or ""))
     run_name = compact_text(str(getattr(args, "run_name", "") or ""))
@@ -6584,6 +6619,7 @@ def run_compare_matrix_from_config_data(data: dict[str, Any]) -> int:
             if base_seed is not None:
                 compare_args.random_seed = base_seed + (repeat_idx - 1)
             make_experiment_config_from_args(compare_args)
+            validate_optional_adapter_options(compare_args)
             planned_artifacts.extend(
                 build_compare_log_path(
                     out_dir,
