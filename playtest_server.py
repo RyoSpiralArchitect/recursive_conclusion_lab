@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
@@ -361,13 +362,37 @@ def restore_session_state(
     session: RecursiveConclusionSession,
     state: dict[str, Any],
 ) -> RecursiveConclusionSession:
+    # Parse on an isolated candidate so any early or late validation failure
+    # leaves the live session (including its adapters and log path) untouched.
+    candidate = copy.copy(session)
+    _restore_session_state(candidate, copy.deepcopy(state))
+    session.__dict__.update(candidate.__dict__)
+    return session
+
+
+def _restore_session_state(
+    session: RecursiveConclusionSession,
+    state: dict[str, Any],
+) -> None:
+    turn_index = state.get("turn_index", 0)
+    if type(turn_index) is not int or turn_index < 0:
+        raise ValueError("Invalid turn index in session snapshot.")
+    history = state.get("history", [])
+    if not isinstance(history, list) or len(history) != turn_index * 2:
+        raise ValueError("Session snapshot turn index does not match completed dialogue.")
+    for index, item in enumerate(history):
+        if (
+            not isinstance(item, dict)
+            or item.get("role") != ("user" if index % 2 == 0 else "assistant")
+            or not isinstance(item.get("content"), str)
+        ):
+            raise ValueError("Invalid dialogue history in session snapshot.")
     session.history = [
         ChatMessage(
             role=str(item.get("role", "user")),
             content=str(item.get("content", "")),
         )
-        for item in list(state.get("history") or [])
-        if isinstance(item, dict)
+        for item in history
     ]
     session.memory_capsules = [
         str(item) for item in list(state.get("memory_capsules") or [])
@@ -377,13 +402,13 @@ def restore_session_state(
     ]
     inquiry = state.get("inquiry_state")
     session.inquiry_state = InquiryState.from_dict(inquiry) if inquiry is not None else None
-    session.inquiry_state_turn = (
-        state.get("inquiry_state_turn") if inquiry is not None else None
-    )
+    session.inquiry_state_turn = state.get("inquiry_state_turn")
+    if session.inquiry_state is None and session.inquiry_state_turn is not None:
+        raise ValueError("Inquiry workpad turn has no workpad in session snapshot.")
     if session.inquiry_state is not None and (
         type(session.inquiry_state_turn) is not int
         or session.inquiry_state_turn < 1
-        or session.inquiry_state_turn > int(state.get("turn_index", 0))
+        or session.inquiry_state_turn > turn_index
     ):
         raise ValueError("Invalid inquiry workpad turn in session snapshot.")
     session.latest_conclusion_probe_turn = state.get("latest_conclusion_probe_turn")
@@ -437,7 +462,7 @@ def restore_session_state(
         for item in list(state.get("deferred_intents") or [])
         if isinstance(item, dict)
     ]
-    session.turn_index = int(state.get("turn_index", 0) or 0)
+    session.turn_index = turn_index
     session.next_deferred_intent_index = int(
         state.get("next_deferred_intent_index", 1) or 1
     )
@@ -453,7 +478,6 @@ def restore_session_state(
     session._deferred_intent_scheduler_compact_ok = bool(
         state.get("deferred_intent_scheduler_compact_ok", False)
     )
-    return session
 
 
 def failed_event_receipts(discarded_bytes: bytes) -> list[dict[str, Any]]:
@@ -1080,6 +1104,15 @@ class SessionManager:
     def session_detail(self, session_id: str) -> dict[str, Any]:
         record = self.get_record(session_id)
         script = SCRIPT_INDEX.get(record.script_id, SCRIPT_INDEX["free_chat"])
+        last_result = sanitize_turn_payload(record.last_result)
+        if last_result is not None:
+            # The inspector must show the validated live state after restore,
+            # not a second, independently persisted copy of the workpad.
+            last_result["inquiry_state"] = (
+                record.session.inquiry_state.to_dict()
+                if record.session.inquiry_state else None
+            )
+            last_result["inquiry_state_turn"] = record.session.inquiry_state_turn
         return {
             "session_id": record.session_id,
             "title": record.title,
@@ -1099,7 +1132,7 @@ class SessionManager:
             "last_error": record.last_error,
             "turn_index": record.session.turn_index,
             "history": build_public_history(record.session),
-            "last_result": sanitize_turn_payload(record.last_result),
+            "last_result": last_result,
             "config": json_ready(record.session.config),
             "log_path": display_path(record.log_path),
         }
