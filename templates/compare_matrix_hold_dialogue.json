@@ -1,0 +1,20 @@
+{
+  "script": "protocol_scripts/hold_open_then_revise.json",
+  "providers": ["dummy=dummy-v1"],
+  "out_dir": "runs/hold_dialogue",
+  "repeats": 2,
+  "seed": 7,
+  "args": {
+    "memory_every": 0,
+    "conclusion_every": 0,
+    "delayed_mention_every": 0,
+    "deferred_intent_every": 0,
+    "latent_convergence_every": 0,
+    "semantic_judge_backend": "off"
+  },
+  "arms": [
+    {"name": "baseline", "args": {"conclusion_mode": "observe"}},
+    {"name": "hold_prompt", "args": {"conclusion_mode": "hold"}},
+    {"name": "hold_workpad", "args": {"conclusion_mode": "hold", "conclusion_every": 1}}
+  ]
+}

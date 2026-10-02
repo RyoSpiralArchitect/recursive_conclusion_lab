@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
@@ -23,6 +24,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
+
+from inquiry_state import InquiryState
 
 from blind_review import (
     BlindReviewManager,
@@ -315,6 +318,8 @@ def serialize_session_state(session: RecursiveConclusionSession) -> dict[str, An
         "history": [json_ready(message) for message in session.history],
         "memory_capsules": list(session.memory_capsules),
         "conclusion_hypotheses": list(session.conclusion_hypotheses),
+        "inquiry_state": session.inquiry_state.to_dict() if session.inquiry_state else None,
+        "inquiry_state_turn": session.inquiry_state_turn,
         "latest_conclusion_probe_turn": session.latest_conclusion_probe_turn,
         "latest_conclusion_line": session.latest_conclusion_line,
         "latest_conclusion_keywords": list(session.latest_conclusion_keywords),
@@ -357,13 +362,37 @@ def restore_session_state(
     session: RecursiveConclusionSession,
     state: dict[str, Any],
 ) -> RecursiveConclusionSession:
+    # Parse on an isolated candidate so any early or late validation failure
+    # leaves the live session (including its adapters and log path) untouched.
+    candidate = copy.copy(session)
+    _restore_session_state(candidate, copy.deepcopy(state))
+    session.__dict__.update(candidate.__dict__)
+    return session
+
+
+def _restore_session_state(
+    session: RecursiveConclusionSession,
+    state: dict[str, Any],
+) -> None:
+    turn_index = state.get("turn_index", 0)
+    if type(turn_index) is not int or turn_index < 0:
+        raise ValueError("Invalid turn index in session snapshot.")
+    history = state.get("history", [])
+    if not isinstance(history, list) or len(history) != turn_index * 2:
+        raise ValueError("Session snapshot turn index does not match completed dialogue.")
+    for index, item in enumerate(history):
+        if (
+            not isinstance(item, dict)
+            or item.get("role") != ("user" if index % 2 == 0 else "assistant")
+            or not isinstance(item.get("content"), str)
+        ):
+            raise ValueError("Invalid dialogue history in session snapshot.")
     session.history = [
         ChatMessage(
             role=str(item.get("role", "user")),
             content=str(item.get("content", "")),
         )
-        for item in list(state.get("history") or [])
-        if isinstance(item, dict)
+        for item in history
     ]
     session.memory_capsules = [
         str(item) for item in list(state.get("memory_capsules") or [])
@@ -371,6 +400,17 @@ def restore_session_state(
     session.conclusion_hypotheses = [
         str(item) for item in list(state.get("conclusion_hypotheses") or [])
     ]
+    inquiry = state.get("inquiry_state")
+    session.inquiry_state = InquiryState.from_dict(inquiry) if inquiry is not None else None
+    session.inquiry_state_turn = state.get("inquiry_state_turn")
+    if session.inquiry_state is None and session.inquiry_state_turn is not None:
+        raise ValueError("Inquiry workpad turn has no workpad in session snapshot.")
+    if session.inquiry_state is not None and (
+        type(session.inquiry_state_turn) is not int
+        or session.inquiry_state_turn < 1
+        or session.inquiry_state_turn > turn_index
+    ):
+        raise ValueError("Invalid inquiry workpad turn in session snapshot.")
     session.latest_conclusion_probe_turn = state.get("latest_conclusion_probe_turn")
     session.latest_conclusion_line = str(state.get("latest_conclusion_line", "") or "")
     session.latest_conclusion_keywords = [
@@ -422,7 +462,7 @@ def restore_session_state(
         for item in list(state.get("deferred_intents") or [])
         if isinstance(item, dict)
     ]
-    session.turn_index = int(state.get("turn_index", 0) or 0)
+    session.turn_index = turn_index
     session.next_deferred_intent_index = int(
         state.get("next_deferred_intent_index", 1) or 1
     )
@@ -438,7 +478,6 @@ def restore_session_state(
     session._deferred_intent_scheduler_compact_ok = bool(
         state.get("deferred_intent_scheduler_compact_ok", False)
     )
-    return session
 
 
 def failed_event_receipts(discarded_bytes: bytes) -> list[dict[str, Any]]:
@@ -563,6 +602,11 @@ SCRIPT_CATALOG = load_script_catalog()
 SCRIPT_INDEX = {item["id"]: item for item in SCRIPT_CATALOG}
 
 ARM_PRESETS: dict[str, dict[str, str]] = {
+    "hold": {
+        "label": "Open Inquiry (hold)",
+        "adaptive_hazard_policy": AdaptiveHazardPolicy.STATIC.value,
+        "adaptive_hazard_stage_policy": AdaptiveHazardStagePolicy.FLAT.value,
+    },
     "static": {
         "label": "Static",
         "adaptive_hazard_policy": AdaptiveHazardPolicy.STATIC.value,
@@ -589,17 +633,18 @@ def default_experiment_config(
 ) -> ExperimentConfig:
     evaluation = dict(script.get("evaluation") or {})
     arm = ARM_PRESETS[arm_preset]
+    hold = arm_preset == "hold"
     return ExperimentConfig(
         base_system=str(script.get("system", "") or ""),
         recent_window_messages=8,
         memory_every=2,
         memory_capsule_limit=4,
         memory_word_budget=140,
-        conclusion_every=2,
-        conclusion_mode=ConclusionMode.OBSERVE,
+        conclusion_every=1 if hold else 2,
+        conclusion_mode=ConclusionMode.HOLD if hold else ConclusionMode.OBSERVE,
         conclusion_steer_strength=SteerStrength.MEDIUM,
         conclusion_steer_injection=ConclusionSteerInjection.FULL,
-        delayed_mention_every=2,
+        delayed_mention_every=0 if hold else 2,
         delayed_mention_item_limit=4,
         delayed_mention_min_nonconclusion_items=int(
             value_or_default(evaluation, "delayed_mention_min_nonconclusion_items", 2)
@@ -608,7 +653,9 @@ def default_experiment_config(
             value_or_default(evaluation, "delayed_mention_min_kind_diversity", 3)
         ),
         delayed_mention_diversity_repair=DelayedMentionDiversityRepairPolicy.ON,
-        delayed_mention_mode=DelayedMentionMode.SOFT_FIRE,
+        delayed_mention_mode=(
+            DelayedMentionMode.OBSERVE if hold else DelayedMentionMode.SOFT_FIRE
+        ),
         delayed_mention_fire_prob=0.35,
         delayed_mention_fire_max_items=2,
         delayed_mention_leak_policy=DelayedMentionLeakPolicy.ON,
@@ -619,8 +666,10 @@ def default_experiment_config(
             arm["adaptive_hazard_stage_policy"]
         ),
         adaptive_hazard_embedding_guard=AdaptiveHazardEmbeddingGuard.OFF,
-        latent_convergence_every=1,
-        semantic_judge_backend=SemanticJudgeBackend(semantic_judge_backend),
+        latent_convergence_every=0 if hold else 1,
+        semantic_judge_backend=(
+            SemanticJudgeBackend.OFF if hold else SemanticJudgeBackend(semantic_judge_backend)
+        ),
         deferred_intent_every=0,
         deferred_intent_mode=DeferredIntentMode.OBSERVE,
         deferred_intent_strategy=DeferredIntentStrategy.TRIGGER,
@@ -1055,6 +1104,15 @@ class SessionManager:
     def session_detail(self, session_id: str) -> dict[str, Any]:
         record = self.get_record(session_id)
         script = SCRIPT_INDEX.get(record.script_id, SCRIPT_INDEX["free_chat"])
+        last_result = sanitize_turn_payload(record.last_result)
+        if last_result is not None:
+            # The inspector must show the validated live state after restore,
+            # not a second, independently persisted copy of the workpad.
+            last_result["inquiry_state"] = (
+                record.session.inquiry_state.to_dict()
+                if record.session.inquiry_state else None
+            )
+            last_result["inquiry_state_turn"] = record.session.inquiry_state_turn
         return {
             "session_id": record.session_id,
             "title": record.title,
@@ -1074,7 +1132,7 @@ class SessionManager:
             "last_error": record.last_error,
             "turn_index": record.session.turn_index,
             "history": build_public_history(record.session),
-            "last_result": sanitize_turn_payload(record.last_result),
+            "last_result": last_result,
             "config": json_ready(record.session.config),
             "log_path": display_path(record.log_path),
         }
@@ -1088,6 +1146,8 @@ class SessionManager:
         semantic_judge_backend = (
             request.semantic_judge_backend or SemanticJudgeBackend.BOTH.value
         )
+        if request.arm_preset == "hold":
+            semantic_judge_backend = SemanticJudgeBackend.OFF.value
 
         provider = canonical_provider_name(
             compact_text(request.provider).lower() or DEFAULT_PROVIDER
