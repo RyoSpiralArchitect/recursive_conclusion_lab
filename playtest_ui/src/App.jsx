@@ -1,8 +1,9 @@
-import { startTransition, useDeferredValue, useEffect, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import { FileCheck2, MessagesSquare } from "lucide-react";
 
 import { fetchJson } from "./api";
 import BlindReview from "./BlindReview";
+import { emptySessionView, mergeSessionSummary, withCommittedTurn, withSessionDetail } from "./sessionView";
 const modelControlDefaults = {
   reasoning_effort: "auto",
   probe_reasoning_effort: "auto",
@@ -94,23 +95,73 @@ function App() {
   const [options, setOptions] = useState(null);
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState("");
-  const [activeSession, setActiveSession] = useState(null);
+  const activeSessionIdRef = useRef("");
+  const [sessionViews, setSessionViews] = useState({});
+  const sessionViewsRef = useRef({});
+  const inFlightTurnsRef = useRef(new Set());
+  const reconcilingTurnsRef = useRef(new Set());
+  const notesTimersRef = useRef(new Map());
+  const noteSavesRef = useRef(new Set());
   const [createForm, setCreateForm] = useState(emptyCreateForm);
-  const [composer, setComposer] = useState("");
-  const [notesDraft, setNotesDraft] = useState("");
-  const deferredNotes = useDeferredValue(notesDraft);
   const [error, setError] = useState("");
   const [restoreWarning, setRestoreWarning] = useState("");
   const [status, setStatus] = useState("Loading…");
   const [creating, setCreating] = useState(false);
-  const [sending, setSending] = useState(false);
-  const [loadingSession, setLoadingSession] = useState(false);
-  const [savingNotes, setSavingNotes] = useState(false);
+  const [loadingSessionId, setLoadingSessionId] = useState("");
+
+  const activeView = sessionViews[activeSessionId] || emptySessionView();
+  const activeSession = activeView.detail?.session_id === activeSessionId
+    ? activeView.detail
+    : null;
+  const composer = activeView.composer;
+  const notesDraft = activeView.notesDraft;
+  const sending = activeView.turnRequest?.status === "submitting";
+  const savingNotes = activeView.notesSaving;
+  const loadingSession = Boolean(activeSessionId) && loadingSessionId === activeSessionId;
+
+  function updateView(sessionId, updater) {
+    const current = sessionViewsRef.current[sessionId] || emptySessionView();
+    const updated = updater(current);
+    const next = { ...sessionViewsRef.current, [sessionId]: updated };
+    sessionViewsRef.current = next;
+    setSessionViews(next);
+    return updated;
+  }
+
+  function applySessionDetail(detail) {
+    if (!detail?.session_id) {
+      return null;
+    }
+    const updated = updateView(detail.session_id, (view) => withSessionDetail(view, detail));
+    if (updated.detail !== detail) {
+      return updated.detail;
+    }
+    setSessions((previous) => previous.map((session) =>
+      session.session_id === detail.session_id
+        ? mergeSessionSummary(session, detail)
+        : session,
+    ));
+    return detail;
+  }
+
+  function selectSession(sessionId) {
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
+  }
+
+  async function refreshSession(sessionId) {
+    const detail = await fetchJson(`/api/sessions/${sessionId}`);
+    return applySessionDetail(detail);
+  }
 
   useEffect(() => {
+    let cancelled = false;
     async function bootstrap() {
       try {
         const health = await fetchJson("/api/health");
+        if (cancelled) {
+          return;
+        }
         const mode = health.workspace_mode === "review" ? "review" : "full";
         setServerMode(mode);
         if (mode === "review") {
@@ -122,6 +173,9 @@ function App() {
           fetchJson("/api/options"),
           fetchJson("/api/sessions"),
         ]);
+        if (cancelled) {
+          return;
+        }
         startTransition(() => {
           setWorkspace("playtest");
           setOptions(optionsPayload);
@@ -143,46 +197,45 @@ function App() {
               optionsPayload.default_semantic_judge_backend,
           }));
           if ((sessionsPayload.sessions || []).length > 0) {
-            setActiveSessionId(sessionsPayload.sessions[0].session_id);
+            selectSession(sessionsPayload.sessions[0].session_id);
           }
         });
         setStatus("Ready");
       } catch (loadError) {
-        setError(loadError.message);
-        setStatus("Failed to load");
+        if (!cancelled) {
+          setError(loadError.message);
+          setStatus("Failed to load");
+        }
       }
     }
     bootstrap();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
     if (!activeSessionId) {
-      setActiveSession(null);
       return;
     }
+    const sessionId = activeSessionId;
     let cancelled = false;
     async function loadSession() {
-      setLoadingSession(true);
-      setError("");
+      setLoadingSessionId(sessionId);
+      updateView(sessionId, (view) => ({ ...view, error: "" }));
       try {
-        const payload = await fetchJson(`/api/sessions/${activeSessionId}`);
+        const payload = await fetchJson(`/api/sessions/${sessionId}`);
         if (cancelled) {
           return;
         }
-        startTransition(() => {
-          setActiveSession(payload);
-          setNotesDraft(payload.notes || "");
-          if (payload.pending_user_text && !composer) {
-            setComposer(payload.pending_user_text);
-          }
-        });
+        applySessionDetail(payload);
       } catch (loadError) {
         if (!cancelled) {
-          setError(loadError.message);
+          updateView(sessionId, (view) => ({ ...view, error: loadError.message }));
         }
       } finally {
         if (!cancelled) {
-          setLoadingSession(false);
+          setLoadingSessionId((current) => current === sessionId ? "" : current);
         }
       }
     }
@@ -192,46 +245,62 @@ function App() {
     };
   }, [activeSessionId]);
 
-  useEffect(() => {
-    if (!activeSession?.session_id) {
+  function scheduleNotesSave(sessionId, delay = 500) {
+    window.clearTimeout(notesTimersRef.current.get(sessionId));
+    const timer = window.setTimeout(() => {
+      notesTimersRef.current.delete(sessionId);
+      void saveNotes(sessionId);
+    }, delay);
+    notesTimersRef.current.set(sessionId, timer);
+  }
+
+  async function saveNotes(sessionId) {
+    const view = sessionViewsRef.current[sessionId];
+    if (!view?.detail || view.notesDraft === view.notesSaved || noteSavesRef.current.has(sessionId)) {
       return;
     }
-    if (deferredNotes === (activeSession.notes || "")) {
-      return;
-    }
-    const timer = window.setTimeout(async () => {
-      try {
-        setSavingNotes(true);
-        const payload = await fetchJson(
-          `/api/sessions/${activeSession.session_id}/notes`,
-          {
-            method: "PUT",
-            body: JSON.stringify({ notes: deferredNotes }),
-          },
-        );
-        startTransition(() => {
-          setActiveSession(payload);
-          setSessions((previous) =>
-            previous.map((session) =>
-              session.session_id === payload.session_id
-                ? { ...session, updated_at: payload.updated_at }
-                : session,
-            ),
-          );
-        });
-      } catch (saveError) {
-        setError(saveError.message);
-      } finally {
-        setSavingNotes(false);
+    const notes = view.notesDraft;
+    noteSavesRef.current.add(sessionId);
+    updateView(sessionId, (current) => ({ ...current, notesSaving: true, notesError: "" }));
+    let succeeded = false;
+    try {
+      const payload = await fetchJson(`/api/sessions/${sessionId}/notes`, {
+        method: "PUT",
+        body: JSON.stringify({ notes }),
+      });
+      applySessionDetail(payload);
+      updateView(sessionId, (current) => ({ ...current, notesSaved: notes }));
+      succeeded = true;
+    } catch (saveError) {
+      updateView(sessionId, (current) => ({ ...current, notesError: saveError.message }));
+    } finally {
+      noteSavesRef.current.delete(sessionId);
+      updateView(sessionId, (current) => ({ ...current, notesSaving: false }));
+      const latest = sessionViewsRef.current[sessionId];
+      if (succeeded && latest.notesDraft !== latest.notesSaved) {
+        scheduleNotesSave(sessionId, 0);
       }
-    }, 500);
-    return () => window.clearTimeout(timer);
-  }, [deferredNotes, activeSession?.session_id, activeSession?.notes]);
+    }
+  }
+
+  function handleNotesChange(value) {
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId || sessionViewsRef.current[sessionId]?.detail?.session_id !== sessionId) {
+      return;
+    }
+    updateView(sessionId, (view) => ({ ...view, notesDraft: value, notesInitialized: true }));
+    scheduleNotesSave(sessionId);
+  }
 
   async function refreshSessions() {
     const payload = await fetchJson("/api/sessions");
     startTransition(() => {
-      setSessions(payload.sessions || []);
+      setSessions((previous) => (payload.sessions || []).map((session) => {
+        const cached = sessionViewsRef.current[session.session_id]?.detail;
+        const fromCache = cached ? mergeSessionSummary(session, cached) : session;
+        const prior = previous.find((item) => item.session_id === session.session_id);
+        return prior ? mergeSessionSummary(fromCache, prior) : fromCache;
+      }));
       setRestoreWarning(
         formatRestoreWarning(payload.load_errors, payload.load_error_count),
       );
@@ -248,10 +317,8 @@ function App() {
         body: JSON.stringify(createForm),
       });
       startTransition(() => {
-        setActiveSession(payload);
-        setActiveSessionId(payload.session_id);
-        setNotesDraft(payload.notes || "");
-        setComposer("");
+        applySessionDetail(payload);
+        selectSession(payload.session_id);
       });
       await refreshSessions();
     } catch (createError) {
@@ -261,37 +328,194 @@ function App() {
     }
   }
 
-  async function handleSendTurn() {
-    if (!activeSession?.session_id || !composer.trim()) {
+  function setTurnRequest(sessionId, request, status, message = "") {
+    updateView(sessionId, (view) => ({
+      ...view,
+      turnRequest: { ...request, status, message },
+      error: "",
+    }));
+  }
+
+  async function acceptCommittedTurn(sessionId, request, payload, committedTurnIndex, serverCurrentIndex, replayed) {
+    const currentIndex = sessionViewsRef.current[sessionId]?.detail?.turn_index ?? 0;
+    const committedIndex = committedTurnIndex ?? payload.turn_index ?? 0;
+    if (replayed || currentIndex > committedIndex ||
+      (serverCurrentIndex ?? 0) > committedIndex) {
+      try {
+        await refreshSession(sessionId);
+      } catch (refreshError) {
+        setTurnRequest(
+          sessionId, request, "committed_refresh_needed",
+          `The turn was committed, but the current session could not be loaded (${refreshError.message}). Check status to refresh it.`,
+        );
+        return;
+      }
+    } else {
+      applySessionDetail(payload);
+    }
+    updateView(sessionId, (view) => withCommittedTurn(view, request));
+    try {
+      await refreshSessions();
+    } catch {
+      // Session detail was updated; a list refresh can be retried on navigation.
+    }
+  }
+
+  async function reconcileTurn(sessionId, request) {
+    if (reconcilingTurnsRef.current.has(sessionId)) {
       return;
     }
-    setSending(true);
-    setError("");
-    const userText = composer;
-    setComposer("");
+    reconcilingTurnsRef.current.add(sessionId);
+    setTurnRequest(sessionId, request, "checking", "Checking whether this turn was saved…");
     try {
-      const payload = await fetchJson(
-        `/api/sessions/${activeSession.session_id}/turn`,
-        {
-          method: "POST",
-          body: JSON.stringify({ user_text: userText }),
-        },
+      const receipt = await fetchJson(
+        `/api/sessions/${sessionId}/turn-requests/${request.requestId}`,
       );
-      startTransition(() => {
-        setActiveSession(payload);
-        setNotesDraft(payload.notes || "");
-      });
-      await refreshSessions();
-    } catch (turnError) {
-      setComposer(userText);
-      setError(turnError.message);
+      if (receipt.status === "committed" && receipt.session) {
+        await acceptCommittedTurn(
+          sessionId, request, receipt.session, receipt.committed_turn_index,
+          receipt.current_turn_index, true,
+        );
+        return;
+      }
+      const messages = {
+        in_progress: "This turn is still running. Check its status before sending another turn.",
+        unknown: "The turn outcome is unknown. A model call may have happened; do not send it again automatically. Start a new session to continue safely.",
+        not_found: "No saved receipt was found. Delivery is uncertain. You can explicitly retry this same request after checking the session state.",
+        failed: "The turn failed. Your draft is still here; you can send a new request after reviewing it.",
+      };
+      let refreshed = null;
+      if (receipt.status !== "in_progress") {
+        try {
+          refreshed = await refreshSession(sessionId);
+        } catch {
+          // The receipt remains visible even if refreshing the session fails.
+        }
+      }
+      if (receipt.status === "failed" && !refreshed) {
+        setTurnRequest(
+          sessionId, request, "unresolved",
+          "The request failed, but the current session could not be loaded. Check status again before sending a new turn.",
+        );
+      } else if (receipt.status === "not_found" && refreshed?.pending_turn_status === "unknown") {
+        setTurnRequest(
+          sessionId, request, "unknown",
+          "This session has an earlier turn with an unknown outcome. Keep it for review and start a new session to continue.",
+        );
+      } else {
+        setTurnRequest(sessionId, request, receipt.status, messages[receipt.status] || "Turn status could not be determined.");
+      }
+    } catch (checkError) {
+      setTurnRequest(
+        sessionId, request, "unresolved",
+        `Could not check this turn (${checkError.message}). Check its status before sending another turn.`,
+      );
     } finally {
-      setSending(false);
+      reconcilingTurnsRef.current.delete(sessionId);
+    }
+  }
+
+  async function submitTurnRequest(sessionId, request) {
+    if (inFlightTurnsRef.current.has(sessionId)) {
+      return;
+    }
+    inFlightTurnsRef.current.add(sessionId);
+    setTurnRequest(sessionId, request, "submitting", "Sending turn…");
+    try {
+      const payload = await fetchJson(`/api/sessions/${sessionId}/turn`, {
+        method: "POST",
+        body: JSON.stringify({
+          user_text: request.userText,
+          request_id: request.requestId,
+          expected_turn_index: request.expectedTurnIndex,
+        }),
+      });
+      await acceptCommittedTurn(
+        sessionId, request, payload, payload.committed_turn_index,
+        payload.current_turn_index, payload.replayed,
+      );
+    } catch (turnError) {
+      const code = turnError.code || turnError.detail?.code;
+      if (turnError.status === 409) {
+        if (code === "turn_outcome_unknown") {
+          setTurnRequest(sessionId, request, "unknown", turnError.message);
+        } else if (code === "turn_in_progress") {
+          setTurnRequest(sessionId, request, "in_progress", turnError.message);
+        } else {
+          setTurnRequest(sessionId, request, "failed", turnError.message);
+        }
+        try {
+          await refreshSession(sessionId);
+        } catch (refreshError) {
+          setTurnRequest(
+            sessionId, request, "unresolved",
+            `${turnError.message} The session could not be reloaded (${refreshError.message}); check status before sending another turn.`,
+          );
+        }
+      } else if (turnError.status && turnError.status >= 400 && turnError.status < 500) {
+        setTurnRequest(sessionId, request, "failed", turnError.message);
+      } else {
+        await reconcileTurn(sessionId, request);
+      }
+    } finally {
+      inFlightTurnsRef.current.delete(sessionId);
+    }
+  }
+
+  function handleSendTurn() {
+    const sessionId = activeSessionIdRef.current;
+    const view = sessionViewsRef.current[sessionId];
+    if (!sessionId || view?.detail?.session_id !== sessionId || !view.composer.trim() ||
+      inFlightTurnsRef.current.has(sessionId) ||
+      ["submitting", "checking", "in_progress", "unknown", "not_found", "unresolved", "committed_refresh_needed"]
+        .includes(view.turnRequest?.status) ||
+      ["in_progress", "unknown"].includes(view.detail.pending_turn_status)) {
+      return;
+    }
+    const request = {
+      requestId: crypto.randomUUID(),
+      userText: view.composer,
+      expectedTurnIndex: view.detail.turn_index ?? 0,
+      composerRevision: view.composerRevision,
+    };
+    void submitTurnRequest(sessionId, request);
+  }
+
+  async function retrySameTurn() {
+    const sessionId = activeSessionIdRef.current;
+    const request = sessionViewsRef.current[sessionId]?.turnRequest;
+    if (!sessionId || request?.status !== "not_found" || inFlightTurnsRef.current.has(sessionId)) {
+      return;
+    }
+    setTurnRequest(sessionId, request, "checking", "Checking the current session before retrying the same request…");
+    try {
+      const detail = await refreshSession(sessionId);
+      if (detail.pending_turn_status === "unknown") {
+        setTurnRequest(sessionId, request, "unknown", "This session has a turn with an unknown outcome. Keep it for review and start a new session to continue.");
+        return;
+      }
+      if (detail.pending_turn_status === "in_progress") {
+        setTurnRequest(sessionId, request, "in_progress", "Another turn is still running. Check status before retrying.");
+        return;
+      }
+      if (detail.turn_index !== request.expectedTurnIndex) {
+        setTurnRequest(sessionId, request, "failed", "The session changed. Review the current turn and your draft before sending again.");
+        return;
+      }
+      void submitTurnRequest(sessionId, request);
+    } catch (retryError) {
+      setTurnRequest(sessionId, request, "unresolved", `Could not verify the session (${retryError.message}). Check status before retrying.`);
     }
   }
 
   function applySeedTurn(text) {
-    setComposer(text);
+    const sessionId = activeSessionIdRef.current;
+    if (sessionId && sessionViewsRef.current[sessionId]?.detail?.session_id === sessionId) {
+      updateView(sessionId, (view) => ({
+        ...view, composer: text, composerInitialized: true,
+        composerRevision: view.composerRevision + 1,
+      }));
+    }
   }
 
   function onComposerKeyDown(event) {
@@ -407,6 +631,16 @@ function App() {
       {workspace === "playtest" && error ? (
         <div className="error-banner" role="alert">
           {error}
+        </div>
+      ) : null}
+      {workspace === "playtest" && (activeView.error || activeView.notesError) ? (
+        <div className="error-banner" role="alert">
+          {activeView.error || activeView.notesError}
+          {activeView.notesError ? (
+            <button className="inline-action" onClick={() => void saveNotes(activeSessionId)} type="button">
+              Retry notes save
+            </button>
+          ) : null}
         </div>
       ) : null}
 
@@ -674,7 +908,7 @@ function App() {
                   className={`session-card ${
                     session.session_id === activeSessionId ? "active" : ""
                   }`}
-                  onClick={() => setActiveSessionId(session.session_id)}
+                  onClick={() => selectSession(session.session_id)}
                   type="button"
                 >
                   <strong>{session.title}</strong>
@@ -714,7 +948,36 @@ function App() {
 
           {activeSession?.pending_user_text ? (
             <div className="recovery-banner">
-              A previous request was saved before completion. The draft is back in the composer.
+              {activeSession.pending_turn_status === "failed"
+                ? "A previous turn failed. Its text was recovered as a draft; review it before sending a new request."
+                : "A previous turn has an unknown outcome. A model call may have happened. Keep this session for review and start a new session to continue."}
+            </div>
+          ) : null}
+
+          {activeView.turnRequest ? (
+            <div className="turn-status-banner" role="status">
+              <strong>Turn request: {activeView.turnRequest.status.replaceAll("_", " ")}</strong>
+              <p>{activeView.turnRequest.message}</p>
+              <div className="turn-status-actions">
+                {["in_progress", "unknown", "not_found", "unresolved", "committed_refresh_needed"].includes(activeView.turnRequest.status) ? (
+                  <button
+                    className="inline-action"
+                    disabled={inFlightTurnsRef.current.has(activeSessionId)}
+                    onClick={() => void reconcileTurn(activeSessionId, activeView.turnRequest)}
+                    type="button"
+                  >
+                    Check status
+                  </button>
+                ) : null}
+                {activeView.turnRequest.status === "not_found" ? (
+                  <button className="inline-action" onClick={() => void retrySameTurn()} type="button">
+                    Retry same request
+                  </button>
+                ) : null}
+              </div>
+              {activeView.turnRequest.status !== "submitting" && activeView.turnRequest.status !== "checking" ? (
+                <p className="muted-copy">Submitted text: {activeView.turnRequest.userText}</p>
+              ) : null}
             </div>
           ) : null}
 
@@ -765,18 +1028,30 @@ function App() {
           <section className="composer">
             <textarea
               value={composer}
-              onChange={(event) => setComposer(event.target.value)}
+              onChange={(event) => {
+                const sessionId = activeSessionIdRef.current;
+                if (sessionId && sessionViewsRef.current[sessionId]?.detail?.session_id === sessionId) {
+                  updateView(sessionId, (view) => ({
+                    ...view, composer: event.target.value, composerInitialized: true,
+                    composerRevision: view.composerRevision + 1,
+                  }));
+                }
+              }}
               onKeyDown={onComposerKeyDown}
               placeholder="Type a user turn. Cmd/Ctrl+Enter sends."
+              disabled={!activeSession}
               rows={7}
             />
             <div className="composer-actions">
               <span className="muted-copy">
-                {composer.length} chars · saved per turn on the backend
+                {composer.length} chars · draft stays with this session
               </span>
               <button
                 className="primary-button"
-                disabled={sending || !activeSession?.session_id || !composer.trim()}
+                disabled={sending || !activeSession || !composer.trim() ||
+                  ["submitting", "checking", "in_progress", "unknown", "not_found", "unresolved", "committed_refresh_needed"]
+                    .includes(activeView.turnRequest?.status) ||
+                  ["in_progress", "unknown"].includes(activeSession?.pending_turn_status)}
                 onClick={handleSendTurn}
                 type="button"
               >
@@ -911,8 +1186,9 @@ function App() {
             <textarea
               className="notes-box"
               value={notesDraft}
-              onChange={(event) => setNotesDraft(event.target.value)}
+              onChange={(event) => handleNotesChange(event.target.value)}
               placeholder="Write qualitative notes: awkward timing, unnatural shortlist, good earned ending, etc."
+              disabled={!activeSession}
               rows={12}
             />
           </section>

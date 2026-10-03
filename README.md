@@ -492,10 +492,24 @@ themselves identify the exact turn at which a conclusion became ready, so that s
 needs an absolute readiness-turn annotation in a later evaluation layer.
 
 Playtest session snapshots are written under `playtest_sessions/` and recover the last pending user draft if
-the server dies mid-turn.
+the server process stops mid-turn.
 If a provider call raises during a turn, the server restores the prior conversation state and
 keeps the draft. It records metadata and available request/usage receipts for discarded events in
 that session's `failed_attempts.jsonl`, without copying event text into the failure audit.
+
+The Playtest turn API takes a client-generated UUID `request_id` and the session's current
+`expected_turn_index` alongside `user_text`. The server records the request before calling a
+provider. Repeating a committed request ID with the same text and expected index returns its
+saved response without creating another turn. A stale index, conflicting reuse of an ID, or an
+unresolved request returns `409`; the client should read the session and reconcile the request ID
+through `GET /api/sessions/{session_id}/turn-requests/{request_id}` before offering another send.
+The lookup reports `committed`, `in_progress`, `failed`, `unknown`, or `not_found`. After a process stop
+between starting and saving a turn, `unknown` means the external provider may already have run;
+the server does not replay that request automatically. These receipts prevent duplicate local
+turns during ordinary retries, but do not guarantee exactly-once execution at the provider.
+An `unknown` session stays readable but cannot accept another turn; start a new session to
+continue while retaining the original trace for inspection. Its event log may contain an
+uncommitted provider tail, which is not a completed dialogue turn.
 
 When `--delayed-mention-diversity-repair on`, the harness will make one compact supplemental probe if
 the first delayed-mention plan fails the non-conclusion or kind-diversity minimums. This keeps the

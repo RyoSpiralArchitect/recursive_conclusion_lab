@@ -8,10 +8,12 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from playtest_server import build_app
+from recursive_conclusion_lab import DummyAdapter
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -38,6 +40,32 @@ class PlaytestServerApiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.client.close()
         self.temporary.cleanup()
+
+    def create_dummy_session(self) -> str:
+        response = self.client.post(
+            "/api/sessions",
+            json={
+                "provider": "dummy",
+                "model": "dummy",
+                "observer_provider": "dummy",
+                "observer_model": "dummy",
+                "script_id": "free_chat",
+                "arm_preset": "static",
+                "semantic_judge_backend": "off",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()["session_id"]
+
+    def restarted_client(self) -> TestClient:
+        return TestClient(
+            build_app(
+                sessions_dir=self.playtest_sessions_dir,
+                allowed_origins=[],
+                eval_sets_dir=self.eval_sets_dir,
+                review_sessions_dir=self.review_sessions_dir,
+            )
+        )
 
     def create_review_session(
         self, rater_id: str = "api-reviewer"
@@ -114,7 +142,11 @@ class PlaytestServerApiTests(unittest.TestCase):
 
         turn = self.client.post(
             f"/api/sessions/{session_id}/turn",
-            json={"user_text": "Help me choose between the two options."},
+            json={
+                "user_text": "Help me choose between the two options.",
+                "request_id": str(uuid4()),
+                "expected_turn_index": 0,
+            },
         )
         self.assertEqual(turn.status_code, 200, turn.text)
         self.assertEqual(turn.json()["turn_index"], 1)
@@ -139,6 +171,146 @@ class PlaytestServerApiTests(unittest.TestCase):
             )
         finally:
             restarted_client.close()
+
+    def test_turn_request_replay_conflicts_and_stale_index(self) -> None:
+        session_id = self.create_dummy_session()
+        first_id = str(uuid4())
+        first_body = {
+            "user_text": "First question",
+            "request_id": first_id,
+            "expected_turn_index": 0,
+        }
+        first = self.client.post(f"/api/sessions/{session_id}/turn", json=first_body)
+        self.assertEqual(first.status_code, 200, first.text)
+        original = first.json()
+        self.assertEqual(original["committed_turn_index"], 1)
+        self.assertFalse(original["replayed"])
+
+        with mock.patch.object(DummyAdapter, "generate", side_effect=AssertionError("provider called")):
+            replay = self.client.post(f"/api/sessions/{session_id}/turn", json=first_body)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), {**original, "replayed": True})
+        self.assertEqual(
+            self.client.get(f"/api/sessions/{session_id}/turn-requests/{first_id}").json()["status"],
+            "committed",
+        )
+
+        for changed in (
+            {**first_body, "user_text": "Changed question"},
+            {**first_body, "expected_turn_index": 1},
+        ):
+            conflict = self.client.post(f"/api/sessions/{session_id}/turn", json=changed)
+            self.assertEqual(conflict.status_code, 409, conflict.text)
+            self.assertEqual(conflict.json()["detail"]["code"], "request_id_conflict")
+
+        stale = self.client.post(
+            f"/api/sessions/{session_id}/turn",
+            json={"user_text": "Stale draft", "request_id": str(uuid4()), "expected_turn_index": 0},
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(stale.json()["detail"]["code"], "stale_turn_index")
+        self.assertEqual(stale.json()["detail"]["current_turn_index"], 1)
+
+        second = self.client.post(
+            f"/api/sessions/{session_id}/turn",
+            json={"user_text": "Second question", "request_id": str(uuid4()), "expected_turn_index": 1},
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["turn_index"], 2)
+        restarted = self.restarted_client()
+        try:
+            with mock.patch.object(DummyAdapter, "generate", side_effect=AssertionError("provider called")):
+                replay_after_restart = restarted.post(
+                    f"/api/sessions/{session_id}/turn", json=first_body
+                )
+            self.assertEqual(replay_after_restart.status_code, 200, replay_after_restart.text)
+            self.assertEqual(replay_after_restart.json(), {**original, "replayed": True})
+            current = restarted.get(f"/api/sessions/{session_id}")
+            self.assertEqual(current.json()["turn_index"], 2)
+            receipt = restarted.get(f"/api/sessions/{session_id}/turn-requests/{first_id}")
+            self.assertEqual(receipt.status_code, 200, receipt.text)
+            self.assertEqual(receipt.json()["committed_turn_index"], 1)
+            self.assertEqual(receipt.json()["session"], original)
+            self.assertEqual(receipt.json()["current_turn_index"], 2)
+        finally:
+            restarted.close()
+
+    def test_interrupted_turn_is_unknown_after_restart_and_blocks_new_turns(self) -> None:
+        session_id = self.create_dummy_session()
+        request_id = str(uuid4())
+        session_json = self.playtest_sessions_dir / session_id / "session.json"
+        saved = json.loads(session_json.read_text(encoding="utf-8"))
+        saved["pending_user_text"] = "Uncertain question"
+        saved["turn_requests"][request_id] = {
+            "status": "in_progress",
+            "expected_turn_index": 0,
+            "user_text": "Uncertain question",
+        }
+        session_json.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+        restarted = self.restarted_client()
+        try:
+            status = restarted.get(f"/api/sessions/{session_id}/turn-requests/{request_id}")
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(status.json()["status"], "unknown")
+            detail = restarted.get(f"/api/sessions/{session_id}").json()
+            self.assertEqual(detail["pending_turn_status"], "unknown")
+            self.assertEqual(detail["turn_index"], 0)
+            self.assertEqual(
+                json.loads(session_json.read_text(encoding="utf-8"))["turn_requests"][request_id]["status"],
+                "unknown",
+            )
+            with mock.patch.object(DummyAdapter, "generate", side_effect=AssertionError("provider called")):
+                replay = restarted.post(
+                    f"/api/sessions/{session_id}/turn",
+                    json={"user_text": "Uncertain question", "request_id": request_id, "expected_turn_index": 0},
+                )
+                fresh = restarted.post(
+                    f"/api/sessions/{session_id}/turn",
+                    json={"user_text": "New question", "request_id": str(uuid4()), "expected_turn_index": 0},
+                )
+            for rejected in (replay, fresh):
+                self.assertEqual(rejected.status_code, 409, rejected.text)
+                self.assertEqual(rejected.json()["detail"]["code"], "turn_outcome_unknown")
+            self.assertEqual(
+                restarted.get(f"/api/sessions/{session_id}/turn-requests/{uuid4()}").json()["status"],
+                "not_found",
+            )
+        finally:
+            restarted.close()
+
+    def test_legacy_pending_failed_and_unknown_migration(self) -> None:
+        for last_error, expected_status in (
+            ("RuntimeError: turn failed", "failed"),
+            ("", "unknown"),
+            ("RuntimeError: failed attempt audit write failed (OSError); event log retained", "unknown"),
+        ):
+            with self.subTest(last_error=last_error):
+                session_id = self.create_dummy_session()
+                session_json = self.playtest_sessions_dir / session_id / "session.json"
+                saved = json.loads(session_json.read_text(encoding="utf-8"))
+                saved["version"] = 2
+                saved.pop("turn_requests")
+                saved.pop("legacy_pending_unknown")
+                saved["pending_user_text"] = "Old draft"
+                saved["last_error"] = last_error
+                session_json.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+                restarted = self.restarted_client()
+                try:
+                    detail = restarted.get(f"/api/sessions/{session_id}")
+                    self.assertEqual(detail.status_code, 200, detail.text)
+                    self.assertEqual(detail.json()["pending_turn_status"], expected_status)
+                    self.assertEqual(json.loads(session_json.read_text())["version"], 3)
+                    submission = restarted.post(
+                        f"/api/sessions/{session_id}/turn",
+                        json={"user_text": "Old draft", "request_id": str(uuid4()), "expected_turn_index": 0},
+                    )
+                    self.assertEqual(
+                        submission.status_code,
+                        200 if expected_status == "failed" else 409,
+                        submission.text,
+                    )
+                finally:
+                    restarted.close()
 
     def test_gpt56_generation_config_survives_keyless_restart(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -171,7 +343,7 @@ class PlaytestServerApiTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(saved_payload["version"], 2)
+            self.assertEqual(saved_payload["version"], 3)
 
             reply_config = created_payload["config"]["reply_config"]
             self.assertEqual(reply_config["temperature"], 0.2)
@@ -290,7 +462,7 @@ class PlaytestServerApiTests(unittest.TestCase):
             restarted_client.close()
 
         migrated = json.loads(session_json.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["version"], 3)
         for label in ("reply_config", "probe_config", "observer_config"):
             self.assertEqual(
                 migrated["config"][label]["model_profile_id"],
@@ -390,7 +562,7 @@ class PlaytestServerApiTests(unittest.TestCase):
             restarted_client.close()
         self.assertEqual(
             json.loads(session_json.read_text(encoding="utf-8"))["version"],
-            2,
+            3,
         )
 
     def test_profile_version_mismatch_is_fail_closed_and_reported(self) -> None:

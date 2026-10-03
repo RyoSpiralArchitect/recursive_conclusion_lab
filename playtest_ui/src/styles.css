@@ -198,6 +198,36 @@ textarea:focus-visible {
   padding: 10px 12px;
 }
 
+.turn-status-banner {
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  margin: 0 16px 12px;
+  overflow-wrap: anywhere;
+  padding: 10px 12px;
+}
+
+.turn-status-banner p {
+  margin: 5px 0;
+}
+
+.turn-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.inline-action {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  margin-left: 8px;
+  padding: 5px 9px;
+}
+
 .layout {
   display: grid;
   gap: 12px;
@@ -434,6 +464,10 @@ textarea:focus-visible {
 .notes-box,
 .review-text-field textarea {
   resize: vertical;
+}
+
+.notes-box {
+  width: 100%;
 }
 
 .composer-actions {
