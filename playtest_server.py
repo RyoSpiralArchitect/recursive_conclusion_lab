@@ -17,6 +17,7 @@ import secrets
 import threading
 import time
 from typing import Any, Optional
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,7 +84,7 @@ DEFAULT_PROVIDER = "openai"
 DEFAULT_MODEL = "gpt-4.1-mini-2025-04-14"
 DEFAULT_EMBEDDING_PROVIDER = "openai"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-large"
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
 PUBLIC_LOAD_ERROR_LIMIT = 20
 
 DEFAULT_ALLOWED_ORIGINS = [
@@ -112,6 +113,13 @@ TOKEN_USAGE_FIELDS = frozenset(
 
 class AmbiguousLegacyProfileError(ModelProfilePinError):
     pass
+
+
+class TurnConflictError(ValueError):
+    def __init__(self, code: str, message: str, current_turn_index: int) -> None:
+        super().__init__(message)
+        self.code = code
+        self.current_turn_index = current_turn_index
 
 
 def json_ready(value: Any) -> Any:
@@ -762,6 +770,8 @@ class PlaytestRecord:
     pending_user_text: str
     last_error: str
     last_result: Optional[dict[str, Any]]
+    turn_requests: dict[str, dict[str, Any]]
+    legacy_pending_unknown: bool
     storage_dir: Path
     log_path: Path
     session: RecursiveConclusionSession
@@ -794,6 +804,8 @@ class CreateSessionRequest(BaseModel):
 
 class TurnRequest(BaseModel):
     user_text: str = Field(min_length=1)
+    request_id: UUID
+    expected_turn_index: int = Field(ge=0)
 
 
 class NotesRequest(BaseModel):
@@ -812,6 +824,42 @@ class SubmitJudgmentRequest(BaseModel):
     evidence: str
     counterevidence: str = ""
     abstain: bool = False
+
+
+def restore_turn_requests(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid turn request ledger in session snapshot.")
+    restored: dict[str, dict[str, Any]] = {}
+    for raw_request_id, raw_receipt in raw.items():
+        try:
+            request_id = str(UUID(str(raw_request_id)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Invalid turn request id in session snapshot.") from exc
+        if request_id != raw_request_id or not isinstance(raw_receipt, dict):
+            raise ValueError("Invalid turn request receipt in session snapshot.")
+        status = raw_receipt.get("status")
+        expected = raw_receipt.get("expected_turn_index")
+        user_text = raw_receipt.get("user_text")
+        if (
+            status not in {"in_progress", "committed", "failed", "unknown"}
+            or type(expected) is not int
+            or expected < 0
+            or not isinstance(user_text, str)
+            or not user_text.strip()
+        ):
+            raise ValueError("Invalid turn request receipt in session snapshot.")
+        receipt = {
+            "status": "unknown" if status == "in_progress" else status,
+            "expected_turn_index": expected,
+            "user_text": user_text,
+        }
+        if status == "committed":
+            response = raw_receipt.get("session")
+            if not isinstance(response, dict) or response.get("turn_index") != expected + 1:
+                raise ValueError("Invalid committed turn response in session snapshot.")
+            receipt["session"] = response
+        restored[request_id] = receipt
+    return restored
 
 
 class SessionManager:
@@ -843,7 +891,12 @@ class SessionManager:
                     session_json.parent,
                     schema_version=schema_version,
                 )
-                if schema_version < SESSION_SCHEMA_VERSION:
+                raw_requests = payload.get("turn_requests")
+                has_interrupted_request = isinstance(raw_requests, dict) and any(
+                    isinstance(item, dict) and item.get("status") == "in_progress"
+                    for item in raw_requests.values()
+                )
+                if schema_version < SESSION_SCHEMA_VERSION or has_interrupted_request:
                     self._save_record(record, touch_updated_at=False)
             except Exception as exc:
                 self._load_errors.append(
@@ -917,7 +970,7 @@ class SessionManager:
         observer_generation_adapter = build_adapter(
             observer_provider, observer_model
         )
-        if schema_version >= SESSION_SCHEMA_VERSION:
+        if schema_version >= 2:
             pinned_configs = {
                 "reply_config": config.reply_config,
                 "probe_config": config.probe_config,
@@ -973,6 +1026,24 @@ class SessionManager:
             log_path=log_path,
         )
         restore_session_state(session, dict(payload.get("session_state") or {}))
+        pending_user_text = str(payload.get("pending_user_text", "") or "")
+        last_error = str(payload.get("last_error", "") or "")
+        turn_requests = restore_turn_requests(payload.get("turn_requests", {}))
+        for request_id, receipt in turn_requests.items():
+            expected = receipt["expected_turn_index"]
+            if expected > session.turn_index:
+                raise ValueError("Turn request index exceeds saved dialogue.")
+            if receipt["status"] == "committed":
+                response = receipt["session"]
+                if (
+                    expected >= session.turn_index
+                    or session.history[expected * 2].content != receipt["user_text"].strip()
+                    or response.get("session_id") != session_id
+                    or response.get("request_id") != request_id
+                    or response.get("committed_turn_index") != expected + 1
+                    or response.get("replayed") is not False
+                ):
+                    raise ValueError("Committed turn receipt does not match saved dialogue.")
         return PlaytestRecord(
             session_id=session_id,
             title=str(payload.get("title", "") or ""),
@@ -990,12 +1061,24 @@ class SessionManager:
                 or "adaptive_kind_aware"
             ),
             notes=str(payload.get("notes", "") or ""),
-            pending_user_text=str(payload.get("pending_user_text", "") or ""),
-            last_error=str(payload.get("last_error", "") or ""),
+            pending_user_text=pending_user_text,
+            last_error=last_error,
             last_result=(
                 dict(payload.get("last_result") or {})
                 if isinstance(payload.get("last_result"), dict)
                 else None
+            ),
+            turn_requests=turn_requests,
+            legacy_pending_unknown=(
+                bool(payload.get("legacy_pending_unknown", False))
+                or (
+                    schema_version < 3
+                    and bool(pending_user_text)
+                    and (
+                        not last_error
+                        or "failed attempt audit write failed" in last_error
+                    )
+                )
             ),
             storage_dir=storage_dir,
             log_path=log_path,
@@ -1026,6 +1109,11 @@ class SessionManager:
             "pending_user_text": record.pending_user_text,
             "last_error": record.last_error,
             "last_result": sanitize_turn_payload(record.last_result),
+            # Full commit responses preserve exact replay semantics across later
+            # turns and restarts. This local harness trades quadratic snapshot
+            # growth for durable, unbounded request-id deduplication.
+            "turn_requests": record.turn_requests,
+            "legacy_pending_unknown": record.legacy_pending_unknown,
             "config": json_ready(record.session.config),
             "session_state": serialize_session_state(record.session),
         }
@@ -1102,6 +1190,10 @@ class SessionManager:
             return record
 
     def session_detail(self, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._session_detail_locked(session_id)
+
+    def _session_detail_locked(self, session_id: str) -> dict[str, Any]:
         record = self.get_record(session_id)
         script = SCRIPT_INDEX.get(record.script_id, SCRIPT_INDEX["free_chat"])
         last_result = sanitize_turn_payload(record.last_result)
@@ -1129,6 +1221,7 @@ class SessionManager:
             "arm_label": ARM_PRESETS.get(record.arm_preset, {}).get("label"),
             "notes": record.notes,
             "pending_user_text": record.pending_user_text,
+            "pending_turn_status": self._pending_turn_status(record),
             "last_error": record.last_error,
             "turn_index": record.session.turn_index,
             "history": build_public_history(record.session),
@@ -1136,6 +1229,21 @@ class SessionManager:
             "config": json_ready(record.session.config),
             "log_path": display_path(record.log_path),
         }
+
+    @staticmethod
+    def _pending_turn_status(record: PlaytestRecord) -> Optional[str]:
+        if record.legacy_pending_unknown or any(
+            receipt["status"] == "unknown" for receipt in record.turn_requests.values()
+        ):
+            return "unknown"
+        if any(
+            receipt["status"] == "in_progress"
+            for receipt in record.turn_requests.values()
+        ):
+            return "in_progress"
+        if record.pending_user_text and record.last_error:
+            return "failed"
+        return None
 
     def create_session(self, request: CreateSessionRequest) -> dict[str, Any]:
         script = SCRIPT_INDEX.get(request.script_id)
@@ -1259,6 +1367,8 @@ class SessionManager:
             pending_user_text="",
             last_error="",
             last_result=None,
+            turn_requests={},
+            legacy_pending_unknown=False,
             storage_dir=storage_dir,
             log_path=log_path,
             session=session,
@@ -1275,27 +1385,117 @@ class SessionManager:
             self._save_record(record)
         return self.session_detail(session_id)
 
-    def append_turn(self, session_id: str, user_text: str) -> dict[str, Any]:
+    def turn_request_status(self, session_id: str, request_id: str) -> dict[str, Any]:
+        with self._lock:
+            record = self.get_record(session_id)
+            receipt = record.turn_requests.get(request_id)
+            if receipt is None:
+                return {
+                    "request_id": request_id,
+                    "status": "not_found",
+                    "current_turn_index": record.session.turn_index,
+                }
+            status = receipt["status"]
+            result = {
+                "request_id": request_id,
+                "status": status,
+                "expected_turn_index": receipt["expected_turn_index"],
+                "current_turn_index": record.session.turn_index,
+            }
+            if status == "committed":
+                result["committed_turn_index"] = receipt["expected_turn_index"] + 1
+                result["session"] = copy.deepcopy(receipt["session"])
+            return result
+
+    def append_turn(
+        self,
+        session_id: str,
+        user_text: str,
+        request_id: str,
+        expected_turn_index: int,
+    ) -> dict[str, Any]:
         cleaned = user_text.strip()
         if not cleaned:
             raise ValueError("user_text must not be empty")
         with self._lock:
             record = self.get_record(session_id)
+            current_turn_index = record.session.turn_index
+            prior = record.turn_requests.get(request_id)
+            if prior is not None:
+                if (
+                    prior["user_text"] != user_text
+                    or prior["expected_turn_index"] != expected_turn_index
+                ):
+                    raise TurnConflictError(
+                        "request_id_conflict",
+                        "request_id was already used with a different turn payload.",
+                        current_turn_index,
+                    )
+                if prior["status"] == "committed":
+                    saved = copy.deepcopy(prior["session"])
+                    saved["replayed"] = True
+                    return saved
+                code = {
+                    "in_progress": "turn_in_progress",
+                    "failed": "request_failed",
+                    "unknown": "turn_outcome_unknown",
+                }[prior["status"]]
+                raise TurnConflictError(
+                    code,
+                    "This request cannot be submitted again; inspect its saved status.",
+                    current_turn_index,
+                )
+            pending_status = self._pending_turn_status(record)
+            if pending_status in {"unknown", "in_progress"}:
+                raise TurnConflictError(
+                    "turn_outcome_unknown" if pending_status == "unknown" else "turn_in_progress",
+                    (
+                        "A prior turn has an unknown outcome; this session cannot advance safely."
+                        if pending_status == "unknown"
+                        else "A turn is still in progress for this session."
+                    ),
+                    current_turn_index,
+                )
+            if expected_turn_index != current_turn_index:
+                raise TurnConflictError(
+                    "stale_turn_index",
+                    "The session has advanced since this turn was composed.",
+                    current_turn_index,
+                )
             state_before = serialize_session_state(record.session)
+            last_result_before = copy.deepcopy(record.last_result)
             log_size_before = record.log_path.stat().st_size if record.log_path.exists() else None
+            prior_pending = record.pending_user_text
+            prior_error = record.last_error
+            prior_updated_at = record.updated_at
+            receipt: dict[str, Any] = {
+                "status": "in_progress",
+                "expected_turn_index": expected_turn_index,
+                "user_text": user_text,
+            }
+            record.turn_requests[request_id] = receipt
             record.pending_user_text = cleaned
             record.last_error = ""
-            self._save_record(record)
+            try:
+                # A persisted in-progress receipt is the boundary before any
+                # provider call. Restart converts it to explicit UNKNOWN.
+                self._save_record(record)
+            except Exception:
+                del record.turn_requests[request_id]
+                record.pending_user_text = prior_pending
+                record.last_error = prior_error
+                record.updated_at = prior_updated_at
+                raise
             try:
                 result = record.session.user_turn(cleaned)
             except Exception as exc:
-                discarded_bytes = b""
-                if record.log_path.exists():
-                    with record.log_path.open("rb") as event_log:
-                        event_log.seek(log_size_before or 0)
-                        discarded_bytes = event_log.read()
-                restore_session_state(record.session, state_before)
                 try:
+                    discarded_bytes = b""
+                    if record.log_path.exists():
+                        with record.log_path.open("rb") as event_log:
+                            event_log.seek(log_size_before or 0)
+                            discarded_bytes = event_log.read()
+                    restore_session_state(record.session, state_before)
                     save_failed_attempt(
                         record,
                         user_text=cleaned,
@@ -1303,26 +1503,59 @@ class SessionManager:
                         error=exc,
                         discarded_bytes=discarded_bytes,
                     )
-                except Exception as audit_error:
-                    record.last_error = (
-                        f"{type(exc).__name__}: failed attempt audit write failed "
-                        f"({type(audit_error).__name__}); event log retained"
-                    )
+                    if log_size_before is None:
+                        record.log_path.unlink(missing_ok=True)
+                    else:
+                        with record.log_path.open("r+b") as event_log:
+                            event_log.truncate(log_size_before)
+                    record.last_error = safe_turn_error(exc)
+                    receipt["status"] = "failed"
                     self._save_record(record)
-                    raise RuntimeError("Failed attempt audit write failed; event log retained") from audit_error
-                if log_size_before is None:
-                    record.log_path.unlink(missing_ok=True)
-                else:
-                    with record.log_path.open("r+b") as event_log:
-                        event_log.truncate(log_size_before)
-                record.last_error = safe_turn_error(exc)
-                self._save_record(record)
+                except Exception as cleanup_error:
+                    # A cleanup failure can leave an unexamined event-log tail
+                    # or an uncertain snapshot. Keep the request blocked. If
+                    # the failed-attempt audit was written, do not write it a
+                    # second time; its receipts remain available for review.
+                    receipt["status"] = "unknown"
+                    record.last_error = "Turn failure cleanup incomplete; outcome unknown."
+                    try:
+                        restore_session_state(record.session, state_before)
+                    except Exception:
+                        # The prior on-disk snapshot still has the in-progress
+                        # receipt, which loads as UNKNOWN after process restart.
+                        pass
+                    else:
+                        record.last_result = last_result_before
+                        try:
+                            self._save_record(record)
+                        except Exception:
+                            pass
+                    raise RuntimeError("Turn failure cleanup incomplete; outcome unknown.") from cleanup_error
                 raise
             record.pending_user_text = ""
             record.last_error = ""
             record.last_result = result
-            self._save_record(record)
-        return self.session_detail(session_id)
+            receipt["status"] = "committed"
+            record.updated_at = time.time()
+            response = self._session_detail_locked(session_id)
+            response["request_id"] = request_id
+            response["committed_turn_index"] = expected_turn_index + 1
+            response["replayed"] = False
+            receipt["session"] = response
+            try:
+                self._save_record(record, touch_updated_at=False)
+            except Exception as exc:
+                # The provider may have answered and the event log may have
+                # advanced. Keep the log tail for later audit, but do not show
+                # the uncommitted reply as a completed dialogue turn.
+                restore_session_state(record.session, state_before)
+                record.last_result = last_result_before
+                receipt["status"] = "unknown"
+                receipt.pop("session", None)
+                record.pending_user_text = cleaned
+                record.last_error = "Turn commit could not be saved."
+                raise RuntimeError("Turn commit could not be saved.") from exc
+            return copy.deepcopy(response)
 
 
 def build_app(
@@ -1419,15 +1652,36 @@ def build_app(
     @app.post("/api/sessions/{session_id}/turn")
     def append_turn(session_id: str, request: TurnRequest) -> dict[str, Any]:
         try:
-            return manager.append_turn(session_id, request.user_text)
+            return manager.append_turn(
+                session_id,
+                request.user_text,
+                str(request.request_id),
+                request.expected_turn_index,
+            )
         except KeyError:
             raise HTTPException(status_code=404, detail="Session not found.") from None
+        except TurnConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": exc.code,
+                    "message": str(exc),
+                    "current_turn_index": exc.current_turn_index,
+                },
+            ) from None
         except ValueError as exc:
             if str(exc) == "user_text must not be empty":
                 raise HTTPException(status_code=400, detail="user_text must not be empty") from None
             raise HTTPException(status_code=500, detail=safe_turn_error(exc)) from None
         except Exception as exc:
             raise HTTPException(status_code=500, detail=safe_turn_error(exc)) from None
+
+    @app.get("/api/sessions/{session_id}/turn-requests/{request_id}")
+    def get_turn_request(session_id: str, request_id: UUID) -> dict[str, Any]:
+        try:
+            return manager.turn_request_status(session_id, str(request_id))
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Session not found.") from None
 
     @app.put("/api/sessions/{session_id}/notes")
     def update_notes(session_id: str, request: NotesRequest) -> dict[str, Any]:
