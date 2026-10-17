@@ -869,6 +869,12 @@ class SessionManager:
         self._records: dict[str, PlaytestRecord] = {}
         self._load_errors: list[dict[str, str]] = []
         self._lock = threading.RLock()
+        # Turn execution/rollback owns _lock. Pollers only read published
+        # snapshots, never the session state being mutated by a provider call.
+        self._turn_status_lock = threading.Lock()
+        self._turn_status_snapshots: dict[
+            str, tuple[int, dict[str, dict[str, Any]]]
+        ] = {}
         self._load_existing()
 
     def _session_dir(self, session_id: str) -> Path:
@@ -904,6 +910,7 @@ class SessionManager:
                 )
                 continue
             self._records[record.session_id] = record
+            self._publish_turn_status(record)
 
     @staticmethod
     def _public_load_error(session_id: str, exc: Exception) -> dict[str, str]:
@@ -1129,6 +1136,21 @@ class SessionManager:
             os.replace(temporary, session_json)
         finally:
             temporary.unlink(missing_ok=True)
+        # Publish only after the atomic save; an unsaved commit must never be
+        # observable as committed by a concurrent status lookup.
+        self._publish_turn_status(record)
+
+    def _publish_turn_status(
+        self, record: PlaytestRecord, *, current_turn_index: Optional[int] = None
+    ) -> None:
+        # Build the detached snapshot outside the pollers' lock. Callers own
+        # _lock (or are loading records before the manager is exposed).
+        snapshot = (
+            record.session.turn_index if current_turn_index is None else current_turn_index,
+            copy.deepcopy(record.turn_requests),
+        )
+        with self._turn_status_lock:
+            self._turn_status_snapshots[record.session_id] = snapshot
 
     def _default_title(self, script_id: str, arm_preset: str) -> str:
         script_label = SCRIPT_INDEX.get(script_id, {}).get("label") or humanize_name(
@@ -1386,26 +1408,29 @@ class SessionManager:
         return self.session_detail(session_id)
 
     def turn_request_status(self, session_id: str, request_id: str) -> dict[str, Any]:
-        with self._lock:
-            record = self.get_record(session_id)
-            receipt = record.turn_requests.get(request_id)
-            if receipt is None:
-                return {
-                    "request_id": request_id,
-                    "status": "not_found",
-                    "current_turn_index": record.session.turn_index,
-                }
-            status = receipt["status"]
-            result = {
+        with self._turn_status_lock:
+            snapshot = self._turn_status_snapshots.get(session_id)
+        if snapshot is None:
+            raise KeyError(session_id)
+        current_turn_index, receipts = snapshot
+        receipt = receipts.get(request_id)
+        if receipt is None:
+            return {
                 "request_id": request_id,
-                "status": status,
-                "expected_turn_index": receipt["expected_turn_index"],
-                "current_turn_index": record.session.turn_index,
+                "status": "not_found",
+                "current_turn_index": current_turn_index,
             }
-            if status == "committed":
-                result["committed_turn_index"] = receipt["expected_turn_index"] + 1
-                result["session"] = copy.deepcopy(receipt["session"])
-            return result
+        status = receipt["status"]
+        result = {
+            "request_id": request_id,
+            "status": status,
+            "expected_turn_index": receipt["expected_turn_index"],
+            "current_turn_index": current_turn_index,
+        }
+        if status == "committed":
+            result["committed_turn_index"] = receipt["expected_turn_index"] + 1
+            result["session"] = copy.deepcopy(receipt["session"])
+        return result
 
     def append_turn(
         self,
@@ -1530,6 +1555,11 @@ class SessionManager:
                             self._save_record(record)
                         except Exception:
                             pass
+                    # Even if cleanup cannot persist or restore, pollers must
+                    # see UNKNOWN and the last committed dialogue index.
+                    self._publish_turn_status(
+                        record, current_turn_index=int(state_before["turn_index"])
+                    )
                     raise RuntimeError("Turn failure cleanup incomplete; outcome unknown.") from cleanup_error
                 raise
             record.pending_user_text = ""
@@ -1554,6 +1584,7 @@ class SessionManager:
                 receipt.pop("session", None)
                 record.pending_user_text = cleaned
                 record.last_error = "Turn commit could not be saved."
+                self._publish_turn_status(record)
                 raise RuntimeError("Turn commit could not be saved.") from exc
             return copy.deepcopy(response)
 

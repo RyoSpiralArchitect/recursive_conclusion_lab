@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import os
 import shutil
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from uuid import uuid4
@@ -66,6 +69,99 @@ class PlaytestServerApiTests(unittest.TestCase):
                 review_sessions_dir=self.review_sessions_dir,
             )
         )
+
+    @contextmanager
+    def blocked_dummy_turn(self, session_id, body):
+        entered = threading.Event()
+        release = threading.Event()
+        generate = DummyAdapter.generate
+
+        def blocked_generate(adapter, **kwargs):
+            entered.set()
+            if not release.wait(10):
+                raise AssertionError("test did not release the dummy provider")
+            return generate(adapter, **kwargs)
+
+        with mock.patch.object(DummyAdapter, "generate", blocked_generate):
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                turn = executor.submit(
+                    self.client.post, f"/api/sessions/{session_id}/turn", json=body
+                )
+                try:
+                    self.assertTrue(entered.wait(5), "dummy provider was not entered")
+                    yield executor, turn, release
+                finally:
+                    # Always release before joining workers, even on assertion failure.
+                    release.set()
+
+    def test_turn_status_polling_while_provider_is_blocked(self) -> None:
+        session_id = self.create_dummy_session()
+        request_id = str(uuid4())
+        body = {"user_text": "Blocked question", "request_id": request_id, "expected_turn_index": 0}
+        with self.blocked_dummy_turn(session_id, body) as (executor, turn, release):
+            saved = json.loads(
+                (self.playtest_sessions_dir / session_id / "session.json").read_text()
+            )
+            self.assertEqual(saved["turn_requests"][request_id]["status"], "in_progress")
+            status = executor.submit(
+                self.client.get, f"/api/sessions/{session_id}/turn-requests/{request_id}"
+            ).result(timeout=2)
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(status.json(), {
+                "request_id": request_id, "status": "in_progress",
+                "expected_turn_index": 0, "current_turn_index": 0,
+            })
+            missing = executor.submit(
+                self.client.get, f"/api/sessions/{session_id}/turn-requests/{uuid4()}"
+            ).result(timeout=2)
+            self.assertEqual(missing.json()["status"], "not_found")
+            self.assertEqual(missing.json()["current_turn_index"], 0)
+            self.assertFalse(turn.done())
+            self.assertFalse(release.is_set())
+            retry = executor.submit(
+                self.client.post, f"/api/sessions/{session_id}/turn", json=body
+            )
+            release.set()
+            committed = turn.result(timeout=5)
+            replay = retry.result(timeout=5)
+        self.assertEqual(committed.status_code, 200, committed.text)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json(), {**committed.json(), "replayed": True})
+        status = self.client.get(f"/api/sessions/{session_id}/turn-requests/{request_id}").json()
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["current_turn_index"], 1)
+        self.assertEqual(status["session"], committed.json())
+        self.assertEqual(len(self.client.get(f"/api/sessions/{session_id}").json()["history"]), 2)
+
+    def test_unrelated_session_status_polling_while_provider_is_blocked(self) -> None:
+        idle_id = self.create_dummy_session()
+        active_id = self.create_dummy_session()
+        # Request IDs are scoped to sessions, even when the statuses differ.
+        request_id = str(uuid4())
+        body = {"user_text": "Independent question", "request_id": request_id, "expected_turn_index": 0}
+        committed = self.client.post(f"/api/sessions/{idle_id}/turn", json=body)
+        self.assertEqual(committed.status_code, 200, committed.text)
+        with self.blocked_dummy_turn(active_id, body) as (executor, turn, release):
+            status = executor.submit(
+                self.client.get, f"/api/sessions/{idle_id}/turn-requests/{request_id}"
+            ).result(timeout=2)
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(status.json()["status"], "committed")
+            self.assertEqual(status.json()["current_turn_index"], 1)
+            self.assertEqual(status.json()["session"], committed.json())
+            missing = executor.submit(
+                self.client.get, f"/api/sessions/{idle_id}/turn-requests/{uuid4()}"
+            ).result(timeout=2)
+            self.assertEqual(missing.json()["status"], "not_found")
+            self.assertEqual(missing.json()["current_turn_index"], 1)
+            absent = executor.submit(
+                self.client.get, f"/api/sessions/no-such-session/turn-requests/{request_id}"
+            ).result(timeout=2)
+            self.assertEqual(absent.status_code, 404, absent.text)
+            self.assertFalse(turn.done())
+            self.assertFalse(release.is_set())
+            release.set()
+            self.assertEqual(turn.result(timeout=5).status_code, 200)
 
     def create_review_session(
         self, rater_id: str = "api-reviewer"

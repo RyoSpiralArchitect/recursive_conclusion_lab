@@ -1,6 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -169,6 +172,79 @@ class PlaytestFailureTests(unittest.TestCase):
             resumed = SessionManager(sessions_dir)
             self.assertEqual(resumed.turn_request_status(record.session_id, request_id)["status"], "unknown")
             self.assertEqual(resumed.session_detail(record.session_id)["turn_index"], 0)
+
+    def test_polling_does_not_expose_a_commit_before_its_atomic_save(self):
+        with TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir)
+            manager, record = self.create_manager_and_session(sessions_dir)
+            request_id = str(uuid4())
+            committing = threading.Event()
+            release = threading.Event()
+            replace = os.replace
+            calls = 0
+
+            def block_commit(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    committing.set()
+                    if not release.wait(10):
+                        raise AssertionError("test did not release the commit")
+                    raise OSError("disk full")
+                return replace(source, destination)
+
+            with patch("playtest_server.os.replace", side_effect=block_commit):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    turn = executor.submit(
+                        manager.append_turn, record.session_id, "question", request_id, 0
+                    )
+                    try:
+                        self.assertTrue(committing.wait(5), "commit was not attempted")
+                        status = executor.submit(
+                            manager.turn_request_status, record.session_id, request_id
+                        ).result(timeout=2)
+                        self.assertEqual(status["status"], "in_progress")
+                        self.assertEqual(status["current_turn_index"], 0)
+                        self.assertNotIn("session", status)
+                        self.assertFalse(turn.done())
+                    finally:
+                        release.set()
+                    with self.assertRaisesRegex(RuntimeError, "Turn commit could not be saved"):
+                        turn.result(timeout=5)
+            status = manager.turn_request_status(record.session_id, request_id)
+            self.assertEqual(status["status"], "unknown")
+            self.assertEqual(status["current_turn_index"], 0)
+            self.assertNotIn("session", status)
+            resumed = SessionManager(sessions_dir)
+            self.assertEqual(resumed.turn_request_status(record.session_id, request_id), status)
+
+    def test_cleanup_save_failure_publishes_unknown_without_a_durable_update(self):
+        with TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir)
+            manager, record = self.create_manager_and_session(sessions_dir)
+            self.fail_after_memory_probe(record)
+            request_id = str(uuid4())
+            save = manager._save_record
+            calls = 0
+
+            def fail_cleanup_save(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise OSError("disk full")
+                return save(*args, **kwargs)
+
+            with patch.object(manager, "_save_record", side_effect=fail_cleanup_save):
+                with self.assertRaisesRegex(RuntimeError, "cleanup incomplete; outcome unknown"):
+                    manager.append_turn(record.session_id, "question", request_id, 0)
+            self.assertEqual(calls, 3)
+            status = manager.turn_request_status(record.session_id, request_id)
+            self.assertEqual(status["status"], "unknown")
+            self.assertEqual(status["current_turn_index"], 0)
+            saved = json.loads(manager._session_json_path(record.session_id).read_text())
+            self.assertEqual(saved["turn_requests"][request_id]["status"], "in_progress")
+            resumed = SessionManager(sessions_dir)
+            self.assertEqual(resumed.turn_request_status(record.session_id, request_id), status)
 
     def test_failed_attempt_cleanup_fault_keeps_audit_and_marks_unknown(self):
         with TemporaryDirectory() as temp_dir:
