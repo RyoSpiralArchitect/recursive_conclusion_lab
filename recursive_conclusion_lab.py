@@ -3937,12 +3937,29 @@ class RecursiveConclusionSession:
             config=generation_config_with_min_tokens(self.config.probe_config, 600),
         )
         error = None
+        validation = None
+        validation_stage = "json_extraction"
         try:
-            state = InquiryState.from_dict(extract_json_value(response.text))
-        except ValueError:
+            value = extract_json_value(response.text)
+            if value is None:
+                raise ValueError("No non-null JSON value was extracted.")
+            validation_stage = "schema"
+            state = InquiryState.from_dict(value)
+        except ValueError as exc:
             # A stale hypothesis must not silently survive a failed revision.
             state = None
             error = "invalid_inquiry_state"
+            # Keep rejected external summaries auditable without logging provider
+            # envelopes or unbounded text. Never feed this diagnostic into replies.
+            validation = {
+                "stage": validation_stage,
+                "code": getattr(exc, "code", "missing_or_null_json"),
+                "field": getattr(exc, "field", None),
+                "response_text": response.text[:4096],
+                "response_text_chars": len(response.text),
+                "response_text_truncated": len(response.text) > 4096,
+                "response_text_sha256": hashlib.sha256(response.text.encode("utf-8")).hexdigest(),
+            }
         self.inquiry_state = state
         self.inquiry_state_turn = self.turn_index if state is not None else None
         self._log(
@@ -3950,6 +3967,7 @@ class RecursiveConclusionSession:
             {
                 "state": state.to_dict() if state else None,
                 "error": error,
+                "validation": validation,
                 "usage": response.usage,
                 "finish_reason": response.finish_reason,
                 "request_id": response.request_id,

@@ -6,6 +6,15 @@ import json
 from typing import Any
 
 
+class InquiryValidationError(ValueError):
+    """Stable diagnostics without echoing generated field values."""
+
+    def __init__(self, message: str, code: str, field: str):
+        super().__init__(message)
+        self.code = code
+        self.field = field
+
+
 @dataclass
 class InquiryState:
     focus: str
@@ -18,32 +27,36 @@ class InquiryState:
     def from_dict(cls, value: Any) -> "InquiryState":
         fields = {"focus", "hypotheses", "open_questions", "next_step", "revision_note"}
         if not isinstance(value, dict) or set(value) != fields:
-            raise ValueError("Inquiry state must contain exactly the workpad fields.")
+            raise InquiryValidationError(
+                "Inquiry state must contain exactly the workpad fields.", "fields", "state"
+            )
 
-        def text(item: Any, *, allow_empty: bool = False) -> str:
+        def text(item: Any, name: str, *, allow_empty: bool = False) -> str:
             if not isinstance(item, str) or len(item) > 400:
-                raise ValueError(
-                    "Inquiry text must be a string of at most 400 characters."
+                raise InquiryValidationError(
+                    "Inquiry text must be a string of at most 400 characters.",
+                    "text_type" if not isinstance(item, str) else "text_length", name,
                 )
             cleaned = " ".join(item.split())
             if not cleaned and not allow_empty:
-                raise ValueError("Inquiry text must not be blank.")
+                raise InquiryValidationError("Inquiry text must not be blank.", "blank_text", name)
             return cleaned
 
         def items(name: str, limit: int) -> list[str]:
             raw = value[name]
             if not isinstance(raw, list) or len(raw) > limit:
-                raise ValueError(
-                    f"Inquiry {name} must be a list of at most {limit} items."
+                raise InquiryValidationError(
+                    f"Inquiry {name} must be a list of at most {limit} items.",
+                    "list_type" if not isinstance(raw, list) else "list_length", name,
                 )
-            return [text(item) for item in raw]
+            return [text(item, f"{name}[{index}]") for index, item in enumerate(raw)]
 
         return cls(
-            focus=text(value["focus"]),
+            focus=text(value["focus"], "focus"),
             hypotheses=items("hypotheses", 3),
             open_questions=items("open_questions", 4),
-            next_step=text(value["next_step"]),
-            revision_note=text(value["revision_note"], allow_empty=True),
+            next_step=text(value["next_step"], "next_step"),
+            revision_note=text(value["revision_note"], "revision_note", allow_empty=True),
         )
 
     def to_dict(self) -> dict[str, Any]:

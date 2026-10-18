@@ -11,6 +11,12 @@ or `repl --provider dummy --model dummy-v1 --conclusion-mode hold --conclusion-e
 Its revisable workpad tracks possibilities, open questions, and a next step.
 It is an experimental mechanism; local tests establish its wiring, not dialogue quality.
 
+The [bounded hold-dialogue pilot](docs/hold_dialogue_pilot.md) records call receipts,
+usage, workpad failures, and full/complete-treatment review subsets. Read the
+[October 18 live result](docs/experiments/2026-10-18-hold-pilot.md) and the
+[next diagnostic experiment](docs/experiments/hold-pilot-next.md) before interpreting
+a successful run as evidence of better dialogue.
+
 Cross-provider experiment harness for observing (and optionally steering) the *time-structure* of LLM dialogue:
 
 - Recursive **memory capsules** (compressed context you can reload every turn)
