@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from uuid import uuid4
 from unittest import mock
 
 from inquiry_state import INQUIRY_PROBE_SYSTEM, InquiryState
@@ -271,7 +272,7 @@ class HoldDialogueTests(unittest.TestCase):
             )
             session_id = detail["session_id"]
             self.assertEqual(detail["config"]["semantic_judge_backend"], "off")
-            manager.append_turn(session_id, "Explore without deciding.")
+            manager.append_turn(session_id, "Explore without deciding.", str(uuid4()), 0)
             record = manager.get_record(session_id)
             before = serialize_session_state(record.session)
             log_before = record.log_path.read_bytes()
@@ -299,7 +300,7 @@ class HoldDialogueTests(unittest.TestCase):
                 record.session.adapter, "generate", side_effect=fail_reply
             ):
                 with self.assertRaisesRegex(RuntimeError, "simulated reply failure"):
-                    manager.append_turn(session_id, "The premise changed.")
+                    manager.append_turn(session_id, "The premise changed.", str(uuid4()), 1)
             self.assertEqual(serialize_session_state(record.session), before)
             self.assertEqual(record.log_path.read_bytes(), log_before)
             resumed_manager = SessionManager(root)
@@ -434,7 +435,7 @@ class HoldDialogueTests(unittest.TestCase):
                 )
             )
             session_id = detail["session_id"]
-            manager.append_turn(session_id, "Explore the room.")
+            manager.append_turn(session_id, "Explore the room.", str(uuid4()), 0)
             snapshot_path = manager._session_json_path(session_id)
             saved = json.loads(snapshot_path.read_text())
             saved["last_result"]["inquiry_state"] = REVISED
