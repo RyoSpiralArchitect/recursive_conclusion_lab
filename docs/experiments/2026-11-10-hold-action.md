@@ -45,3 +45,10 @@ balance or invoice state was not inspected, so this is not a confirmed diagnosis
 of exhausted credit. See [error glossary](https://docs.mistral.ai/resources/error-glossary)
 and [billing documentation](https://docs.mistral.ai/admin/billing-usage/billing).
 The behavioral comparison remains unresolved.
+
+## Separately requested GPT replication
+
+The subsequent OpenAI run completed all 144 generations. See the
+[GPT readout](2026-11-10-hold-action-gpt.md) for validity losses, preserved
+comparisons and unblinded observations. The two Mistral attempts above remain
+unchanged; their missing outcomes are not filled in by the GPT run.
