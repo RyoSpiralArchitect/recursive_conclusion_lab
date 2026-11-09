@@ -142,6 +142,19 @@ class ActionComparisonTests(unittest.TestCase):
             str(experiment.failure_metadata(RuntimeError("SECRET_CANARY"))),
         )
 
+    def test_openai_selection_requires_its_own_key(self):
+        with patch.dict("os.environ", {"MISTRAL_API_KEY": "fixture"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "credential"):
+                experiment.run_comparison(
+                    self.out, live=True, selected_provider="openai"
+                )
+        self.assertFalse(self.out.exists())
+
+    def test_unsupported_provider_has_no_artifacts(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            experiment.run_comparison(self.out, selected_provider="unknown")
+        self.assertFalse(self.out.exists())
+
     def test_missing_credential_fails_before_reservation(self):
         with patch.dict("os.environ", {}, clear=True):
             with self.assertRaises(ValueError):

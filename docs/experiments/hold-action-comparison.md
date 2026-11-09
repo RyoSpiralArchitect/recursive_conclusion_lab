@@ -55,3 +55,13 @@ unknown and must not be retried automatically. Source copies, prompt texts,
 call/event reconciliation, complete and all-pair review packets, and blank
 answer sheets are retained. A `complete` run is execution evidence, not a quality
 claim. The output-token ceilings are not an input-token or monetary cap.
+
+## Explicit OpenAI replication
+
+After Mistral returned HTTP 402, the user requested GPT execution. Select
+`--live --provider openai` to use the exact `gpt-5.6-luna` model, checked against
+OpenAI's authenticated catalog. The existing profile pins reasoning effort none,
+standard mode and current-turn reasoning context. The two arms share these
+settings. Scripts, order, reply/workpad limits, 144-call ceiling and scoring policy
+remain unchanged. This is a separately labelled provider replication, not a
+continuation of the interrupted Mistral run or evidence of a provider ranking.

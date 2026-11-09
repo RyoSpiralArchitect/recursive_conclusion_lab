@@ -81,7 +81,16 @@ def failure_metadata(exc):
     }
 
 
-def preflight(output, live):
+LIVE_MODELS = {"mistral": "mistral-small-2603", "openai": "gpt-5.6-luna"}
+CATALOG_URLS = {
+    "mistral": "https://api.mistral.ai/v1/models",
+    "openai": "https://api.openai.com/v1/models",
+}
+
+
+def preflight(output, live, selected_provider="mistral"):
+    if selected_provider not in LIVE_MODELS:
+        raise ValueError("Unsupported experiment provider")
     if output.exists() or output.is_symlink():
         raise ValueError("Output already exists")
     if (
@@ -95,10 +104,12 @@ def preflight(output, live):
     ):
         raise ValueError("Candidate differs from the frozen proposal")
     provider, model = (
-        ("mistral", "mistral-small-2603") if live else ("dummy", "dummy-v1")
+        (selected_provider, LIVE_MODELS[selected_provider])
+        if live
+        else ("dummy", "dummy-v1")
     )
-    if live and not os.environ.get("MISTRAL_API_KEY", "").strip():
-        raise ValueError("Existing Mistral credential unavailable")
+    if live and not os.environ.get(pilot.KEY_NAMES[provider], "").strip():
+        raise ValueError("Selected provider credential unavailable")
     dirty = bool(
         subprocess.check_output(["git", "diff", "HEAD", "--name-only"], cwd=REPO)
     )
@@ -139,8 +150,10 @@ def preflight(output, live):
         import requests
 
         response = requests.get(
-            "https://api.mistral.ai/v1/models",
-            headers={"Authorization": "Bearer " + os.environ["MISTRAL_API_KEY"]},
+            CATALOG_URLS[provider],
+            headers={
+                "Authorization": "Bearer " + os.environ[pilot.KEY_NAMES[provider]]
+            },
             timeout=30,
         )
         if response.status_code != 200:
@@ -277,9 +290,11 @@ def summarize(output, provider, calls, timings, items, key):
     ), eligible
 
 
-def run_comparison(output, live=False):
+def run_comparison(output, live=False, selected_provider="mistral"):
     output = Path(output).expanduser().resolve()
-    provider, model, planned, sources, dirty, catalog = preflight(output, live)
+    provider, model, planned, sources, dirty, catalog = preflight(
+        output, live, selected_provider
+    )
     output.mkdir(parents=True, exist_ok=False)
     manifest = dict(
         status="running",
@@ -487,11 +502,12 @@ def main():
     mode.add_argument(
         "--live",
         action="store_true",
-        help="Use existing Mistral key and exact mistral-small-2603 model",
+        help="Use the selected provider existing environment credential and fixed model",
     )
+    parser.add_argument("--provider", choices=tuple(LIVE_MODELS), default="mistral")
     args = parser.parse_args()
     try:
-        metrics = run_comparison(args.out, args.live)
+        metrics = run_comparison(args.out, args.live, args.provider)
     except Exception as exc:
         print(f"Stopped ({type(exc).__name__}); preserve receipts, no automatic retry.")
         return 1
