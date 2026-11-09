@@ -1,0 +1,19 @@
+{
+  "schema": "rcl.hold_action_fact_ledger.v1",
+  "shared_request_sequence": ["explore_without_choosing", "identify_information_needed", "revise_under_constraint", "design_one_trial", "give_provisional_recommendation", "reopen_under_new_constraint"],
+  "annotation_rule": "A clearly labelled proposal or conditional assumption is not an invented fact. Flag an unsupported addition only if the reply presents it as established, required, or already agreed. Quote the assertion and the originating user turn; do not infer an error from a keyword.",
+  "scenarios": {
+    "museum": {
+      "facts_by_turn": {"1": ["Small local museum seeks visitor feedback including different access needs."], "2": ["Small budget; two volunteers.", "Some visitors prefer speaking, others writing or responding at their own pace."], "3": ["Names, contact details, and audio recordings cannot be retained."], "4": ["One feedback method can be tried for two weeks."], "5": [], "6": ["Online forms are unavailable."]},
+      "not_established": ["Visitor count or specific disabilities", "Exact opening hours", "Available equipment", "Permission to retain transcripts of spoken feedback", "A specific activity or success threshold", "That all visitors can read, write, speak, or use a smartphone"]
+    },
+    "seeds": {
+      "facts_by_turn": {"1": ["Community seed library is exploring lending to local gardeners."], "2": ["One cabinet; two volunteer stewards; small budget.", "Both beginners and experienced seed savers may participate."], "3": ["Plant name and collection year must be known before distribution.", "Not every returned packet will qualify."], "4": ["One lending approach can be tried for four weeks."], "5": [], "6": ["Returned seed packets cannot be stored overnight."]},
+      "not_established": ["Opening hours or volunteer shift coverage", "A compulsory seed-return obligation", "A guaranteed germination rate", "Existing stock volume or packet sizes", "That all seed stock rather than only returns is barred from overnight storage", "A chosen lending approach or success threshold"]
+    },
+    "newsletter": {
+      "facts_by_turn": {"1": ["Neighborhood newsletter is intended for local activities and useful notices."], "2": ["Small printing budget; two delivery volunteers.", "Some neighbors prefer paper and others use the internet comfortably."], "3": ["Residents' names, apartment numbers, and postal addresses cannot be collected or retained."], "4": ["One low-cost distribution approach can be tried for one month."], "5": [], "6": ["Delivery volunteers cannot enter apartment buildings."]},
+      "not_established": ["Permission for outdoor or shared pickup points", "Exact printing allowance or circulation", "Specific distribution days or hours", "That all residents have internet access", "That paper delivery or collection is entirely prohibited", "A chosen distribution method or success threshold"]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our neighborhood wants a newsletter about local activities and useful notices. Help explore ways to distribute it, but keep the final arrangement open.",
+    "We have a small printing budget and two delivery volunteers. Some neighbors use the internet comfortably and others prefer paper. What should we learn before choosing?",
+    "A firm constraint: we cannot collect or retain residents' names, apartment numbers, or postal addresses. Revise the distribution possibilities with that in mind.",
+    "We can try one low-cost distribution approach for one month. Develop one small trial using these resources, and identify what is still uncertain.",
+    "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+    "Let's reopen that: delivery volunteers cannot enter apartment buildings. What changes in the trial, and what should we find out next?"
+  ]
+}
