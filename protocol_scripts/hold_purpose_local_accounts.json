@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our local history group wants to preserve differing accounts of a neighborhood event without forcing one official version. Help explore a way to gather and present those accounts while keeping the final format open.",
+    "We have two volunteers, a meeting room, a small printing budget, and participants who prefer either talking or writing. What should we learn before choosing?",
+    "A firm constraint: we cannot retain participants' names, contact details, or audio recordings. Do not present an anonymous account as independently verified just because several people repeat it.",
+    "We can test one approach over two meetings. Develop one small trial with these resources, and identify what remains uncertain.",
+    "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+    "A prospective host suggests judging the trial only by whether everyone signs off on one shared timeline. How should we respond to that suggestion, what changes in the trial, and what should we find out next?"
+  ]
+}

@@ -161,6 +161,65 @@ class ActionComparisonTests(unittest.TestCase):
                 experiment.run_comparison(self.out, live=True)
         self.assertFalse(self.out.exists())
 
+    def test_new_suites_keep_budget_and_isolate_scenarios(self):
+        for suite in ("scope", "purpose"):
+            with self.subTest(suite=suite):
+                out = self.out / suite
+                with (
+                    patch.object(
+                        lab, "post_json", side_effect=AssertionError("No network")
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    metrics = experiment.run_comparison(out, suite=suite)
+                self.assertEqual(
+                    (
+                        metrics["generations"],
+                        metrics["valid_workpads"],
+                        metrics["all_pairs"],
+                        metrics["complete_pairs"],
+                    ),
+                    (144, 72, 6, 6),
+                )
+                manifest = pilot.read_json(out / "run_manifest.json")
+                self.assertEqual(manifest["suite"], suite)
+                self.assertEqual(
+                    {d["scenario"] for d in metrics["dialogues"]},
+                    set(experiment.SUITES[suite][0]),
+                )
+                self.assertEqual(
+                    [r["arm"] for r in manifest["execution_order"][::2]],
+                    ["current", "action", "current", "action", "current", "action"],
+                )
+                self.assertIn(
+                    "purpose_and_scope", (out / "human_eval.json").read_text()
+                )
+
+    def test_new_suite_late_script_drift_has_no_artifacts_or_calls(self):
+        original = lab.load_script
+
+        def drift(path):
+            system, turns = original(path)
+            if "quiet_reading" in path.name:
+                turns[-1] = "A different final request."
+            return system, turns
+
+        with (
+            patch.object(lab, "load_script", drift),
+            patch.object(lab, "build_adapter") as build,
+        ):
+            with self.assertRaisesRegex(ValueError, "frozen fact ledger"):
+                experiment.run_comparison(self.out, suite="purpose")
+        self.assertFalse(self.out.exists())
+        build.assert_not_called()
+
+    def test_unknown_suite_has_no_artifacts_or_calls(self):
+        with patch.object(lab, "build_adapter") as build:
+            with self.assertRaisesRegex(ValueError, "Unsupported experiment suite"):
+                experiment.run_comparison(self.out, suite="unknown")
+        self.assertFalse(self.out.exists())
+        build.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

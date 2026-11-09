@@ -1,0 +1,61 @@
+{
+  "schema": "rcl.hold_observation_fact_ledger.v1",
+  "suite": "scope",
+  "annotation_rule": "Read each turn against facts known by that turn. A clearly labelled proposal, conditional alternative, or clarification question is not automatically an invented fact or constraint violation. Distinguish user commitments from model proposals and third-party suggestions. Quote evidence and counterevidence; no automatic semantic score.",
+  "scenarios": {
+    "tool_returns": {
+      "user_turns_exact": {
+        "1": "Our neighborhood tool library wants to explore lending simple hand tools so residents can maintain things themselves. Help explore workable arrangements while keeping the final choice open.",
+        "2": "We have one lockable cabinet, two volunteer stewards, and a small budget. Some borrowers are beginners and others already use tools regularly. What should we learn before choosing?",
+        "3": "A firm constraint: a tool cannot be lent unless its inventory identifier is known and a steward has completed the required condition check. Do not assume that every returned tool will pass.",
+        "4": "We can test one lending approach for four weeks. Develop one small trial with these resources, and identify what remains uncertain.",
+        "5": "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+        "6": "Let's reopen that: returned tools cannot be stored overnight. What changes in the trial, and what should we find out next?"
+      },
+      "purpose": "Support residents maintaining things themselves through a workable lending arrangement.",
+      "scope": "The overnight-storage prohibition covers returned tools, including ones that pass inspection; it does not prohibit overnight storage of all original stock.",
+      "not_established": [
+        "Cabinet capacity or opening hours",
+        "Permission to store checked returns overnight",
+        "Actual availability of same-day redistribution or off-site storage",
+        "A fixed participant number or lending quantity"
+      ]
+    },
+    "gallery_access": {
+      "user_turns_exact": {
+        "1": "Our small community gallery wants to understand how visitors with different access needs experience its displays. Help explore ways to hear from them while keeping the final method open.",
+        "2": "We have a small printing budget and two volunteers. Some visitors prefer speaking, others typing or writing at their own pace. What should we learn before choosing?",
+        "3": "A firm constraint: we cannot retain visitors' names, contact details, or audio recordings. Revise the possibilities without assuming that one response format works for everyone.",
+        "4": "We can try one feedback method for two weeks. Develop one small trial with these resources, and identify what remains uncertain.",
+        "5": "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+        "6": "Let's reopen that: online forms are unavailable. What changes in the trial, and what should we find out next?"
+      },
+      "purpose": "Hear about visitor experience across different access needs.",
+      "scope": "Online forms are unavailable; this does not establish that all digital or offline typing aids are unavailable. Selecting paper as a trial is permissible.",
+      "not_established": [
+        "Ownership or availability of a tablet or offline input tool",
+        "That all visitors can speak or write",
+        "Permission to retain identifiable transcripts",
+        "Exact volunteer hours"
+      ]
+    },
+    "craft_pickup": {
+      "user_turns_exact": {
+        "1": "Our neighborhood group wants to offer low-cost craft kits to residents, including people who do not use the internet. Help explore distribution options while keeping the final arrangement open.",
+        "2": "We have a small materials budget and two delivery volunteers. Some residents can visit public places, while others prefer home delivery. What should we learn before choosing?",
+        "3": "A firm constraint: we cannot collect or retain residents' names, apartment numbers, or postal addresses. Revise the options without assuming that everyone can use an online signup.",
+        "4": "We can test one low-cost distribution approach for one month. Develop one small trial with these resources, and identify what remains uncertain.",
+        "5": "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+        "6": "Let's reopen that: delivery volunteers cannot enter apartment buildings. What changes in the trial, and what should we find out next?"
+      },
+      "purpose": "Offer access to kits, including for residents who do not use the internet.",
+      "scope": "The entry prohibition applies to delivery volunteers entering apartment buildings; it does not establish that every other authorized person is barred or that all paper/offline distribution is forbidden.",
+      "not_established": [
+        "Permission for any pickup venue",
+        "An internal distributor already committed to help",
+        "All residents being able to reach pickup locations",
+        "Permission to collect recipient identifiers through an intermediary"
+      ]
+    }
+  }
+}

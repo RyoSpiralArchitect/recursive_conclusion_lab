@@ -20,6 +20,11 @@ import recursive_conclusion_lab as lab
 
 REPO = Path(__file__).resolve().parent
 SCENARIOS = ("museum", "seeds", "newsletter")
+SUITES = {
+    "original": (SCENARIOS, "hold_action"),
+    "scope": (("tool_returns", "gallery_access", "craft_pickup"), "hold_scope"),
+    "purpose": (("repair_learning", "local_accounts", "quiet_reading"), "hold_purpose"),
+}
 ARMS = ("current", "action")
 ORDER = (
     (0, 1, ARMS),
@@ -50,8 +55,13 @@ SOURCE = (
     "inquiry_state.py",
     "build_human_eval_set.py",
     "analyze_runs.py",
-    "docs/experiments/data/hold_action_facts.json",
-    *(f"protocol_scripts/hold_action_{s}.json" for s in SCENARIOS),
+    "docs/experiments/hold-observation-expansion.md",
+    *(f"docs/experiments/data/{prefix}_facts.json" for _, prefix in SUITES.values()),
+    *(
+        f"protocol_scripts/{prefix}_{s}.json"
+        for scenarios, prefix in SUITES.values()
+        for s in scenarios
+    ),
 )
 SETTINGS = dict(
     window=8,
@@ -88,7 +98,10 @@ CATALOG_URLS = {
 }
 
 
-def preflight(output, live, selected_provider="mistral"):
+def preflight(output, live, selected_provider="mistral", suite="original"):
+    if suite not in SUITES:
+        raise ValueError("Unsupported experiment suite")
+    scenarios, prefix = SUITES[suite]
     if selected_provider not in LIVE_MODELS:
         raise ValueError("Unsupported experiment provider")
     if output.exists() or output.is_symlink():
@@ -119,16 +132,21 @@ def preflight(output, live, selected_provider="mistral"):
     if live and (dirty or not set(SOURCE).issubset(tracked)):
         raise ValueError("Commit experiment sources before live execution")
     sources = {s: pilot.digest(REPO / s) for s in SOURCE}
-    facts = pilot.read_json(REPO / "docs/experiments/data/hold_action_facts.json")
-    if set(facts["scenarios"]) != set(SCENARIOS):
+    facts = pilot.read_json(REPO / f"docs/experiments/data/{prefix}_facts.json")
+    if set(facts["scenarios"]) != set(scenarios):
         raise ValueError("Fact ledger does not match scenarios")
     planned = []
     for index, repeat, arms in ORDER:
-        scenario = SCENARIOS[index]
-        script = REPO / f"protocol_scripts/hold_action_{scenario}.json"
+        scenario = scenarios[index]
+        script = REPO / f"protocol_scripts/{prefix}_{scenario}.json"
         system, turns = lab.load_script(script)
         if len(turns) != 6 or any(not t.strip() for t in turns):
             raise ValueError("Each scenario requires six nonempty turns")
+        frozen_turns = facts["scenarios"][scenario].get("user_turns_exact")
+        if frozen_turns is not None and frozen_turns != {
+            str(i): text for i, text in enumerate(turns, 1)
+        }:
+            raise ValueError("Script differs from the frozen fact ledger")
         for arm in arms:
             config = dict(
                 script=str(script),
@@ -290,16 +308,18 @@ def summarize(output, provider, calls, timings, items, key):
     ), eligible
 
 
-def run_comparison(output, live=False, selected_provider="mistral"):
+def run_comparison(output, live=False, selected_provider="mistral", suite="original"):
     output = Path(output).expanduser().resolve()
     provider, model, planned, sources, dirty, catalog = preflight(
-        output, live, selected_provider
+        output, live, selected_provider, suite
     )
+    scenarios, _ = SUITES[suite]
     output.mkdir(parents=True, exist_ok=False)
     manifest = dict(
         status="running",
         started_at_utc=datetime.now(timezone.utc).isoformat(),
         mode="live" if live else "offline_dummy",
+        suite=suite,
         provider=provider,
         model=model,
         source_commit=subprocess.check_output(
@@ -448,7 +468,7 @@ def run_comparison(output, live=False, selected_provider="mistral"):
                     compare_out_dir=str(output / "compare" / s),
                     arms=list(ARMS),
                 )
-                for s in SCENARIOS
+                for s in scenarios
             ],
             questions=[
                 dict(
@@ -458,6 +478,22 @@ def run_comparison(output, live=False, selected_provider="mistral"):
                 )
             ],
         )
+        if suite != "original":
+            rubric["questions"].append(
+                dict(
+                    id="purpose_and_scope",
+                    prompt=(
+                        "Which dialogue better preserves the user's original purpose "
+                        "and the precise scope of constraints while revising its "
+                        "proposal? Distinguish a suggestion or third-party metric "
+                        "from an explicit user change of goal. A proposed number, "
+                        "conditional alternative, or clarification question is not "
+                        "automatically an invented fact or violation. Quote evidence "
+                        "and counterevidence, or abstain."
+                    ),
+                    choices=["A", "B", "Tie"],
+                )
+            )
         pilot.write_json(output / "human_eval.json", rubric)
         items, key = review.build_items(rubric)
         if len(items) != 6:
@@ -505,9 +541,10 @@ def main():
         help="Use the selected provider existing environment credential and fixed model",
     )
     parser.add_argument("--provider", choices=tuple(LIVE_MODELS), default="mistral")
+    parser.add_argument("--suite", choices=tuple(SUITES), default="original")
     args = parser.parse_args()
     try:
-        metrics = run_comparison(args.out, args.live, args.provider)
+        metrics = run_comparison(args.out, args.live, args.provider, args.suite)
     except Exception as exc:
         print(f"Stopped ({type(exc).__name__}); preserve receipts, no automatic retry.")
         return 1

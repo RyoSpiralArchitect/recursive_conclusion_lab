@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our neighborhood tool library wants to explore lending simple hand tools so residents can maintain things themselves. Help explore workable arrangements while keeping the final choice open.",
+    "We have one lockable cabinet, two volunteer stewards, and a small budget. Some borrowers are beginners and others already use tools regularly. What should we learn before choosing?",
+    "A firm constraint: a tool cannot be lent unless its inventory identifier is known and a steward has completed the required condition check. Do not assume that every returned tool will pass.",
+    "We can test one lending approach for four weeks. Develop one small trial with these resources, and identify what remains uncertain.",
+    "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+    "Let's reopen that: returned tools cannot be stored overnight. What changes in the trial, and what should we find out next?"
+  ]
+}
