@@ -125,6 +125,23 @@ class ActionComparisonTests(unittest.TestCase):
                 self.run_experiment()
         self.assertEqual(len(pilot.read_json(self.out / "generation_receipts.json")), 1)
 
+    def test_failure_metadata_keeps_only_allowlisted_http_status(self):
+        self.assertEqual(
+            experiment.failure_metadata(
+                RuntimeError(
+                    "HTTP 429 from provider endpoint; response details omitted"
+                )
+            )["http_status"],
+            429,
+        )
+        self.assertIsNone(
+            experiment.failure_metadata(RuntimeError("SECRET_CANARY"))["http_status"]
+        )
+        self.assertNotIn(
+            "SECRET_CANARY",
+            str(experiment.failure_metadata(RuntimeError("SECRET_CANARY"))),
+        )
+
     def test_missing_credential_fails_before_reservation(self):
         with patch.dict("os.environ", {}, clear=True):
             with self.assertRaises(ValueError):

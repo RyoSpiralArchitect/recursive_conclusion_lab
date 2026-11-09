@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -66,6 +67,18 @@ SETTINGS = dict(
     probe_max_tokens=600,
     timeout=60,
 )
+
+
+def failure_metadata(exc):
+    """Keep only the known transport status template, never arbitrary exception text."""
+    match = re.fullmatch(
+        r"HTTP ([1-5][0-9]{2}) from provider endpoint; response details omitted",
+        str(exc),
+    )
+    return {
+        "error_type": type(exc).__name__,
+        "http_status": int(match[1]) if match else None,
+    }
 
 
 def preflight(output, live):
@@ -339,7 +352,7 @@ def run_comparison(output, live=False):
                 return response
             except BaseException as exc:
                 entry.update(
-                    status="failed_or_unknown", ok=False, error_type=type(exc).__name__
+                    status="failed_or_unknown", ok=False, **failure_metadata(exc)
                 )
                 raise
             finally:
