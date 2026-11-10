@@ -181,6 +181,7 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
     return ExperimentConfig(
         base_system=str(data.get("base_system", "") or ""),
         recent_window_messages=int(value_or_default(data, "recent_window_messages", 8)),
+        hold_user_replay=data.get("hold_user_replay", False),
         memory_every=int(value_or_default(data, "memory_every", 3)),
         memory_capsule_limit=int(value_or_default(data, "memory_capsule_limit", 4)),
         memory_word_budget=int(value_or_default(data, "memory_word_budget", 140)),
