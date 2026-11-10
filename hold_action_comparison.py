@@ -187,7 +187,9 @@ def preflight(output, live, selected_provider="mistral", suite="original"):
     return provider, model, planned, sources, dirty, catalog
 
 
-def summarize(output, provider, calls, timings, items, key):
+def summarize(
+    output, provider, calls, timings, items, key, *, arms=ARMS, expected_calls=144
+):
     accounting, dialogues = {}, []
     for path in sorted((output / "compare").glob("*/*.jsonl")):
         events = [json.loads(s) for s in path.read_text().splitlines()]
@@ -254,12 +256,12 @@ def summarize(output, provider, calls, timings, items, key):
             raise ValueError("Receipt/event mismatch")
     if (
         signatures != set(accounting)
-        or len(calls) != 144
-        or len(timings) != 72
+        or len(calls) != expected_calls
+        or len(timings) != expected_calls // 2
         or not all(t["ok"] for t in timings)
     ):
         raise ValueError("Incomplete accounting")
-    if len({(t["dialogue_log"], t["turn"]) for t in timings}) != 72:
+    if len({(t["dialogue_log"], t["turn"]) for t in timings}) != expected_calls // 2:
         raise ValueError("Duplicate turn")
     complete = {
         (d["scenario"], d["arm"], d["run"])
@@ -275,7 +277,7 @@ def summarize(output, provider, calls, timings, items, key):
         )
     ]
     groups = []
-    for arm in ARMS:
+    for arm in arms:
         selected = [c for c in calls if c["arm"] == arm]
         usages = [c.get("usage") or {} for c in selected]
         inputs, missing_in = pilot.token_total(
@@ -297,8 +299,8 @@ def summarize(output, provider, calls, timings, items, key):
         )
     return dict(
         generations=len(calls),
-        replies=72,
-        workpads=72,
+        replies=expected_calls // 2,
+        workpads=expected_calls // 2,
         valid_workpads=sum(d["valid_workpads"] for d in dialogues),
         all_pairs=len(items),
         complete_pairs=len(eligible),
