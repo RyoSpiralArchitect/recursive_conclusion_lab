@@ -69,6 +69,7 @@ from recursive_conclusion_lab import (
     load_script,
     model_profile_catalog,
     strip_rcl_state,
+    validate_hold_configuration,
 )
 
 
@@ -181,6 +182,7 @@ def experiment_config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
     return ExperimentConfig(
         base_system=str(data.get("base_system", "") or ""),
         recent_window_messages=int(value_or_default(data, "recent_window_messages", 8)),
+        hold_user_replay=data.get("hold_user_replay", False),
         memory_every=int(value_or_default(data, "memory_every", 3)),
         memory_capsule_limit=int(value_or_default(data, "memory_capsule_limit", 4)),
         memory_word_budget=int(value_or_default(data, "memory_word_budget", 140)),
@@ -913,6 +915,7 @@ class SessionManager:
             or DEFAULT_EMBEDDING_MODEL
         )
         config = experiment_config_from_dict(dict(payload.get("config") or {}))
+        validate_hold_configuration(config)
         generation_adapter = build_adapter(provider, model)
         observer_generation_adapter = build_adapter(
             observer_provider, observer_model

@@ -11,6 +11,14 @@ or `repl --provider dummy --model dummy-v1 --conclusion-mode hold --conclusion-e
 Its revisable workpad tracks possibilities, open questions, and a next step.
 It is an experimental mechanism; local tests establish its wiring, not dialogue quality.
 
+Hold mode can also quote missing historical user messages with the opt-in
+`--hold-user-replay` flag. It keeps whole messages in their original order,
+preferring the origin and then recent missing messages, up to 16 messages and
+12,000 text characters, and discloses omissions. It does not infer which
+constraints remain active. To study this without auxiliary workpad or memory
+generation, also set `--conclusion-every 0 --memory-every 0`.
+See the [workpad cost and source-replay comparison](docs/experiments/hold-source-replay.md).
+
 The [bounded hold-dialogue pilot](docs/hold_dialogue_pilot.md) records call receipts,
 usage, workpad failures, and full/complete-treatment review subsets. Read the
 [October 18 live result](docs/experiments/2026-10-18-hold-pilot.md) and the

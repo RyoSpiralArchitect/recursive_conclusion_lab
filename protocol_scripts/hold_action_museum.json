@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our small local museum wants to learn from visitors, including people with different access needs. Help explore possible ways to collect useful feedback, but keep the final choice open.",
+    "The budget is small and two volunteers can help. Some visitors prefer speaking, while others prefer writing or responding at their own pace. What should we learn before choosing?",
+    "A firm constraint: we cannot retain visitors' names, contact details, or audio recordings. Revise the possibilities while preserving accessibility.",
+    "We can try one feedback method for two weeks. Develop one small trial using the resources described, and identify what is still uncertain.",
+    "Now give a provisional recommendation for that trial, with the assumptions that could change it.",
+    "Let's reopen that: online forms are unavailable. What changes in the trial, and what should we find out next?"
+  ]
+}

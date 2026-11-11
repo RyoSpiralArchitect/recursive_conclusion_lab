@@ -1,0 +1,28 @@
+{
+  "reply_sha256": "dfdc6680fc03ba8d26981c077a183c4022c7ed5c244b921a1d1f6d2f60c0fb70",
+  "probe_sha256": "610fd917ee57533a29b3b1f976e1750daf10d7253dccd2158090ccbe88168332",
+  "settings": {
+    "window": 8,
+    "memory_every": 0,
+    "conclusion_mode": "hold",
+    "conclusion_every": 1,
+    "delayed_mention_every": 0,
+    "deferred_intent_every": 0,
+    "latent_convergence_every": 0,
+    "semantic_judge_backend": "off",
+    "temperature": 0.2,
+    "max_tokens": 900,
+    "probe_max_tokens": 600,
+    "timeout": 60
+  },
+  "script_sha256": {
+    "tool_returns": "b6e3d03fc6f0fb61b0036427328671456a9c00ce42e996f8aa22f8d41a6c25e4",
+    "craft_pickup": "9740731969388fd36246ba893958a8b9b73b66ab0c99339362e3b4ff4cd86a65",
+    "gallery_access": "586608310c65d5670e09af0bcd83ae29e331fb59a8f68eb6a396cb986ce0a96a",
+    "repair_learning": "af1fbb1960b1a8635d97ad98f5f3d3389e495bb86b53adea9b7de4f5ae1db5f5",
+    "camera_returns": "0c7c3ebbc14d4e31f0414c37883219f8cbdee09dce497e947b62d60fc5f777ae",
+    "workshop_learning": "d62f2925f8694e39d4a4b83d515318f489fb2422cf070da0791dcc06cd9ebd11",
+    "storage_revision": "55d6b39ab864435e7f5a5fa6cbf1ce6da299882d6f7ca45acd43782729f63432",
+    "purpose_revision": "5c841d3793a802af011d146f4fbc09288001a327bc1f27add1fbb10bc11b6aa3"
+  }
+}

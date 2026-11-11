@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our neighborhood group wants to offer low-cost craft kits to residents, including people who do not use the internet. Help explore distribution options while keeping the final arrangement open.",
+    "We have a small materials budget and two delivery volunteers. Some residents can visit public places, while others prefer home delivery. What should we learn before choosing?",
+    "A firm constraint: we cannot collect or retain residents' names, apartment numbers, or postal addresses. Revise the options without assuming that everyone can use an online signup.",
+    "We can test one low-cost distribution approach for one month. Develop one small trial with these resources, and identify what remains uncertain.",
+    "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+    "Let's reopen that: delivery volunteers cannot enter apartment buildings. What changes in the trial, and what should we find out next?"
+  ]
+}

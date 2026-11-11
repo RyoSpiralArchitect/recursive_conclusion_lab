@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our neighborhood reading group wants people who are hesitant to speak publicly to have meaningful ways to participate, rather than making confident public speaking the measure of belonging. Help explore formats while keeping the final choice open.",
+    "We have two volunteer facilitators, a small room, a few printed passages, and a small budget. Some people enjoy speaking and others prefer writing or reflecting quietly. What should we learn before choosing?",
+    "A firm constraint: reading aloud and speaking to the whole room must be optional. We cannot publicly rank participants or record audio of the sessions.",
+    "We can test one format for four weekly sessions. Develop one small trial with these resources, and identify what remains uncertain.",
+    "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+    "A prospective organizer suggests judging the trial only by the total number of spoken contributions to the whole group. How should we respond to that suggestion, what changes in the trial, and what should we find out next?"
+  ]
+}

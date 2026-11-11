@@ -102,15 +102,20 @@ INQUIRY_REPLY_SYSTEM = (
 
 
 def inquiry_reply_data(
-    state: InquiryState | None, updated_turn: int | None, memory_capsules: list[str]
+    state: InquiryState | None,
+    updated_turn: int | None,
+    memory_capsules: list[str],
+    *,
+    source_user_history: dict | None = None,
 ) -> str:
     """Serialize generated data separately from trusted system instructions."""
-    return json.dumps(
-        {
-            "context_type": "fallible_generated_inquiry_context",
-            "workpad": state.to_dict() if state else None,
-            "workpad_turn": updated_turn,
-            "memory_capsules": memory_capsules,
-        },
-        ensure_ascii=False,
-    )
+    data = {
+        "context_type": "fallible_generated_inquiry_context",
+        "workpad": state.to_dict() if state else None,
+        "workpad_turn": updated_turn,
+        "memory_capsules": memory_capsules,
+    }
+    if source_user_history is not None:
+        data["context_type"] = "dialogue_context_with_verbatim_user_history"
+        data["source_user_history"] = source_user_history
+    return json.dumps(data, ensure_ascii=False)

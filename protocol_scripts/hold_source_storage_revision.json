@@ -1,0 +1,11 @@
+{
+  "system": "Help explore a question collaboratively. Ground your replies in the conversation.",
+  "turns": [
+    "Our neighborhood tool library wants residents to maintain things themselves through lending simple hand tools. Help explore workable arrangements while keeping the final choice open.",
+    "We have one lockable cabinet, two volunteer stewards, and a small budget. Some borrowers are beginners and others already use tools regularly. What should we learn before choosing?",
+    "A firm constraint: returned tools cannot be stored overnight. Also, a tool cannot be lent unless its inventory identifier is known and a steward has completed the required condition check. Do not assume that every returned tool will pass.",
+    "We can test one lending approach for four weeks. Develop one small trial with these resources, and identify what remains uncertain.",
+    "Now give a provisional recommendation for the trial, with the assumptions that could change it.",
+    "I am explicitly revising the overnight-storage constraint: returned tools that pass the required condition check may now be stored overnight in the lockable cabinet. Failed or unchecked returns still cannot be stored overnight. Keep the identifier and lending-check requirements. What changes in the trial, and what should we find out next?"
+  ]
+}

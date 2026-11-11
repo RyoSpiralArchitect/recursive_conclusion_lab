@@ -481,9 +481,14 @@ class ExperimentConfig:
         )
     )
     observer_config: Optional[GenerationConfig] = None
+    hold_user_replay: bool = False
 
 
 def validate_hold_configuration(config: ExperimentConfig) -> None:
+    if type(config.hold_user_replay) is not bool:
+        raise ValueError("hold_user_replay must be a boolean.")
+    if config.hold_user_replay and config.conclusion_mode != ConclusionMode.HOLD:
+        raise ValueError("hold_user_replay requires conclusion_mode='hold'.")
     if config.conclusion_mode != ConclusionMode.HOLD:
         return
     if (
@@ -3174,15 +3179,17 @@ class RecursiveConclusionSession:
 
     def _reply_messages(self) -> list[ChatMessage]:
         messages = self._recent_window()
+        source = self._source_user_history()
         if self.config.conclusion_mode == ConclusionMode.HOLD and (
-            self.inquiry_state is not None or self.memory_capsules
+            self.inquiry_state is not None or self.memory_capsules or source is not None
         ):
             # Keep model-generated summaries below system/user authority. This
             # synthetic context is not a visible or persistent dialogue turn.
             context = ChatMessage(
                 role="assistant",
                 content=inquiry_reply_data(
-                    self.inquiry_state, self.inquiry_state_turn, self.memory_capsules
+                    self.inquiry_state, self.inquiry_state_turn, self.memory_capsules,
+                    source_user_history=source,
                 ),
             )
             if messages and messages[0].role == "assistant":
@@ -3196,6 +3203,13 @@ class RecursiveConclusionSession:
                 *messages,
             ]
         return messages
+
+    def _source_user_history(self) -> Optional[dict[str, Any]]:
+        if not self.config.hold_user_replay:
+            return None
+        from user_source_context import source_user_history
+
+        return source_user_history(self.history, self.config.recent_window_messages)
 
     def _active_deferred_intents(self) -> list[DeferredIntent]:
         return [intent for intent in self.deferred_intents if intent.status == "active"]
@@ -5304,6 +5318,7 @@ class RecursiveConclusionSession:
 
         self.history.append(ChatMessage(role="user", content=user_text))
         self.turn_index += 1
+        source_user_context = self._source_user_history()
 
         memory_capsule = self._probe_memory_capsule()
         self._probe_inquiry()
@@ -6678,6 +6693,8 @@ class RecursiveConclusionSession:
             "adapter_metadata": reply.adapter_metadata,
             "probe_reply_overlap": overlap,
         }
+        if self.config.hold_user_replay:
+            payload["source_user_history"] = source_user_context
         self._log("assistant_reply", payload)
         return payload
 
@@ -6757,6 +6774,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
     cfg = ExperimentConfig(
         base_system=base,
         recent_window_messages=args.window,
+        hold_user_replay=getattr(args, "hold_user_replay", False),
         memory_every=args.memory_every,
         memory_capsule_limit=args.memory_limit,
         memory_word_budget=args.memory_words,
@@ -6893,10 +6911,10 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
 
 
 def run_repl(args: argparse.Namespace) -> int:
+    cfg = make_experiment_config_from_args(args)
     adapter = build_adapter(args.provider, args.model)
     observer_adapter = build_optional_observer_adapter(args)
     embedding_adapter = build_optional_embedding_adapter(args)
-    cfg = make_experiment_config_from_args(args)
     log_path = Path(args.log) if args.log else None
     session = RecursiveConclusionSession(
         adapter=adapter,
@@ -7353,9 +7371,13 @@ def build_compare_args_from_config(
     base_args = data.get("args") or {}
     if not isinstance(base_args, dict):
         raise ValueError("Field 'args' must be an object if present.")
-    merged_args = dict(base_args)
-    if args_override:
-        merged_args.update(args_override)
+    merged_args = {
+        name.replace("-", "_"): value
+        for layer in (base_args, args_override or {})
+        for name, value in layer.items()
+    }
+    if type(merged_args.get("hold_user_replay", False)) is not bool:
+        raise ValueError("hold_user_replay must be a boolean.")
     if merged_args:
         extend_argv_from_args_dict(argv, merged_args)
 
@@ -7614,6 +7636,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="Optional seed for harness-side stochastic components such as soft-fire sampling.",
         )
         p.add_argument("--window", type=int, default=8, help="How many recent messages to reload each turn; 0 uses full history.")
+        p.add_argument("--hold-user-replay", action="store_true", help="In hold mode, also quote bounded verbatim user messages outside the recent window.")
         p.add_argument("--memory-every", type=int, default=3, help="Create a new memory capsule every N user turns. 0 disables.")
         p.add_argument("--memory-limit", type=int, default=4, help="Maximum number of memory capsules to retain; 0 disables memory probes.")
         p.add_argument("--memory-words", type=int, default=140, help="Soft word budget for each memory capsule; 0 disables memory probes.")
