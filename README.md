@@ -19,6 +19,11 @@ constraints remain active. To study this without auxiliary workpad or memory
 generation, also set `--conclusion-every 0 --memory-every 0`.
 See the [workpad cost and source-replay comparison](docs/experiments/hold-source-replay.md).
 
+Use `--hold-reply-max-words 180` for an opt-in reply target with a versioned
+length diagnostic. Overlong replies retain their full text. The offline
+`analyze_hold_run.py` command also reads interrupted source-replay runs, preserving
+unknown outcomes and unstarted comparisons. See [reply targets and diagnostics](docs/hold_reply_contract.md).
+
 The [bounded hold-dialogue pilot](docs/hold_dialogue_pilot.md) records call receipts,
 usage, workpad failures, and full/complete-treatment review subsets. Read the
 [October 18 live result](docs/experiments/2026-10-18-hold-pilot.md) and the

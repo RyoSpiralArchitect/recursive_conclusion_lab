@@ -38,6 +38,7 @@ SOURCE = (
     "hold_source_comparison.py",
     "user_source_context.py",
     "recursive_conclusion_lab.py",
+    "reply_contract.py",
     "inquiry_state.py",
     "playtest_server.py",
     "hold_dialogue_pilot.py",

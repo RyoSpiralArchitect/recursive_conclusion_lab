@@ -40,6 +40,7 @@ from inquiry_state import (
     InquiryState,
     inquiry_reply_data,
 )
+from reply_contract import budget_instruction, reply_contract, validate_max_words
 
 
 # ----------------------------
@@ -432,6 +433,7 @@ class ExperimentConfig:
     base_system: str = ""
     recent_window_messages: int = 8
     hold_user_replay: bool = False
+    hold_reply_max_words: int = 0
     memory_every: int = 3
     memory_capsule_limit: int = 4
     memory_word_budget: int = 140
@@ -485,6 +487,9 @@ class ExperimentConfig:
 
 
 def validate_hold_configuration(config: ExperimentConfig) -> None:
+    validate_max_words(config.hold_reply_max_words)
+    if config.hold_reply_max_words and config.conclusion_mode != ConclusionMode.HOLD:
+        raise ValueError("hold_reply_max_words requires conclusion_mode='hold'.")
     if type(config.hold_user_replay) is not bool:
         raise ValueError("hold_user_replay must be a boolean.")
     if config.hold_user_replay and config.conclusion_mode != ConclusionMode.HOLD:
@@ -3727,6 +3732,8 @@ class RecursiveConclusionSession:
 
         if self.config.conclusion_mode == ConclusionMode.HOLD:
             parts.append(INQUIRY_REPLY_SYSTEM)
+            if self.config.hold_reply_max_words:
+                parts.append(budget_instruction(self.config.hold_reply_max_words))
 
         if (
             self.config.conclusion_mode == ConclusionMode.SOFT_STEER
@@ -6695,6 +6702,10 @@ class RecursiveConclusionSession:
         }
         if self.config.hold_user_replay:
             payload["source_user_history"] = source_user_context
+        if self.config.hold_reply_max_words:
+            payload["reply_contract"] = reply_contract(
+                assistant_text, self.config.hold_reply_max_words
+            )
         self._log("assistant_reply", payload)
         return payload
 
@@ -6775,6 +6786,7 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
         base_system=base,
         recent_window_messages=args.window,
         hold_user_replay=getattr(args, "hold_user_replay", False),
+        hold_reply_max_words=getattr(args, "hold_reply_max_words", 0),
         memory_every=args.memory_every,
         memory_capsule_limit=args.memory_limit,
         memory_word_budget=args.memory_words,
@@ -7289,6 +7301,7 @@ def execute_compare(
                     "probe_reply_overlap": result["probe_reply_overlap"],
                     "usage": result["usage"],
                     "adapter_metadata": result["adapter_metadata"],
+                    **({"reply_contract": result["reply_contract"]} if "reply_contract" in result else {}),
                 }
             )
             print(
@@ -7374,6 +7387,9 @@ def build_compare_args_from_config(
     merged_args = dict(base_args)
     if args_override:
         merged_args.update(args_override)
+    for name, value in merged_args.items():
+        if name.replace("-", "_") == "hold_reply_max_words":
+            validate_max_words(value)
     if merged_args:
         extend_argv_from_args_dict(argv, merged_args)
 
@@ -7633,6 +7649,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.add_argument("--window", type=int, default=8, help="How many recent messages to reload each turn; 0 uses full history.")
         p.add_argument("--hold-user-replay", action="store_true", help="In hold mode, also quote bounded verbatim user messages outside the recent window.")
+        p.add_argument("--hold-reply-max-words", type=int, default=0, help="Hold-only soft reply target using whitespace_v1, with logged compliance; 0 disables. No truncation or retry.")
         p.add_argument("--memory-every", type=int, default=3, help="Create a new memory capsule every N user turns. 0 disables.")
         p.add_argument("--memory-limit", type=int, default=4, help="Maximum number of memory capsules to retain; 0 disables memory probes.")
         p.add_argument("--memory-words", type=int, default=140, help="Soft word budget for each memory capsule; 0 disables memory probes.")

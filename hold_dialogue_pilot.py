@@ -31,7 +31,7 @@ KEY_NAMES = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
 NORMAL_FINISH = {"dummy": {"stop"}, "mistral": {"stop"}, "hf": {"stop"},
                  "openai": {"completed"}, "anthropic": {"end_turn"}, "gemini": {"STOP"}}
 SOURCE_FILES = (
-    "hold_dialogue_pilot.py", "recursive_conclusion_lab.py", "inquiry_state.py",
+    "hold_dialogue_pilot.py", "recursive_conclusion_lab.py", "inquiry_state.py", "reply_contract.py",
     "analyze_runs.py", "build_human_eval_set.py",
     "protocol_scripts/hold_open_then_revise.json",
     "templates/compare_matrix_hold_dialogue.json", "templates/human_eval_hold_dialogue.json",
