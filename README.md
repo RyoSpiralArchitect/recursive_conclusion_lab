@@ -23,6 +23,8 @@ Use `--hold-reply-max-words 180` for an opt-in reply target with a versioned
 length diagnostic. Overlong replies retain their full text. The offline
 `analyze_hold_run.py` command also reads interrupted source-replay runs, preserving
 unknown outcomes and unstarted comparisons. See [reply targets and diagnostics](docs/hold_reply_contract.md).
+The [recorded-data follow-up](docs/experiments/2026-11-11-hold-followup.md) examines
+turn-specific verbosity, counter differences and where constraint scope narrows.
 
 The [bounded hold-dialogue pilot](docs/hold_dialogue_pilot.md) records call receipts,
 usage, workpad failures, and full/complete-treatment review subsets. Read the
