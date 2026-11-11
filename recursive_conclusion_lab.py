@@ -432,8 +432,6 @@ class DeferredIntentAblation(str, Enum):
 class ExperimentConfig:
     base_system: str = ""
     recent_window_messages: int = 8
-    hold_user_replay: bool = False
-    hold_reply_max_words: int = 0
     memory_every: int = 3
     memory_capsule_limit: int = 4
     memory_word_budget: int = 140
@@ -484,6 +482,8 @@ class ExperimentConfig:
         )
     )
     observer_config: Optional[GenerationConfig] = None
+    hold_user_replay: bool = False
+    hold_reply_max_words: int = 0
 
 
 def validate_hold_configuration(config: ExperimentConfig) -> None:
@@ -6923,10 +6923,10 @@ def make_experiment_config_from_args(args: argparse.Namespace, *, base_system: s
 
 
 def run_repl(args: argparse.Namespace) -> int:
+    cfg = make_experiment_config_from_args(args)
     adapter = build_adapter(args.provider, args.model)
     observer_adapter = build_optional_observer_adapter(args)
     embedding_adapter = build_optional_embedding_adapter(args)
-    cfg = make_experiment_config_from_args(args)
     log_path = Path(args.log) if args.log else None
     session = RecursiveConclusionSession(
         adapter=adapter,
@@ -7384,12 +7384,14 @@ def build_compare_args_from_config(
     base_args = data.get("args") or {}
     if not isinstance(base_args, dict):
         raise ValueError("Field 'args' must be an object if present.")
-    merged_args = dict(base_args)
-    if args_override:
-        merged_args.update(args_override)
-    for name, value in merged_args.items():
-        if name.replace("-", "_") == "hold_reply_max_words":
-            validate_max_words(value)
+    merged_args = {
+        name.replace("-", "_"): value
+        for layer in (base_args, args_override or {})
+        for name, value in layer.items()
+    }
+    if type(merged_args.get("hold_user_replay", False)) is not bool:
+        raise ValueError("hold_user_replay must be a boolean.")
+    validate_max_words(merged_args.get("hold_reply_max_words", 0))
     if merged_args:
         extend_argv_from_args_dict(argv, merged_args)
 

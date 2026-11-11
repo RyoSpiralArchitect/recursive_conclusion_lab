@@ -69,6 +69,7 @@ from recursive_conclusion_lab import (
     load_script,
     model_profile_catalog,
     strip_rcl_state,
+    validate_hold_configuration,
 )
 
 
@@ -915,6 +916,7 @@ class SessionManager:
             or DEFAULT_EMBEDDING_MODEL
         )
         config = experiment_config_from_dict(dict(payload.get("config") or {}))
+        validate_hold_configuration(config)
         generation_adapter = build_adapter(provider, model)
         observer_generation_adapter = build_adapter(
             observer_provider, observer_model
