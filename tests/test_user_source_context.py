@@ -124,6 +124,26 @@ class UserSourceTests(unittest.TestCase):
         self.assertNotIn("source_user_history", result)
         self.assertEqual(session._reply_messages(), session._recent_window())
 
+    def test_compare_config_validates_replay_and_honors_spelling_aliases(self):
+        data = {
+            "script": "script.json",
+            "providers": ["dummy=dummy-v1"],
+            "args": {"conclusion_mode": "hold", "hold_user_replay": True},
+        }
+        self.assertFalse(
+            lab.build_compare_args_from_config(
+                data, args_override={"hold-user-replay": False}
+            ).hold_user_replay
+        )
+        for invalid in (None, "false", 0):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaisesRegex(ValueError, "boolean"),
+            ):
+                lab.build_compare_args_from_config(
+                    data, args_override={"hold-user-replay": invalid}
+                )
+
     def test_nonhold_replay_fails_before_reservation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
