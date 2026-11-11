@@ -72,6 +72,7 @@ SOURCE = (
     "hold_action_comparison.py",
     "hold_dialogue_pilot.py",
     "recursive_conclusion_lab.py",
+    "reply_contract.py",
     "inquiry_state.py",
     "build_human_eval_set.py",
     "analyze_runs.py",

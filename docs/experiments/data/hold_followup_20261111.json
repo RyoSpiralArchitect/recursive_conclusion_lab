@@ -1,0 +1,491 @@
+{
+  "schema": "rcl.hold_followup.v1",
+  "source_commit": "aa13346ac460ad8cb340614969587b647d595d91",
+  "new_provider_calls": 0,
+  "regression_replies": 216,
+  "per_turn": {
+    "1": {
+      "workpad": {
+        "n": 12,
+        "short": 6,
+        "median": 180.0,
+        "mean": 178.25,
+        "headings": 0
+      },
+      "no_workpad": {
+        "n": 12,
+        "short": 3,
+        "median": 189.5,
+        "mean": 190.83333333333334,
+        "headings": 0
+      },
+      "source_replay": {
+        "n": 12,
+        "short": 0,
+        "median": 198.0,
+        "mean": 196.75,
+        "headings": 0
+      }
+    },
+    "2": {
+      "workpad": {
+        "n": 12,
+        "short": 6,
+        "median": 180.5,
+        "mean": 178.66666666666666,
+        "headings": 0
+      },
+      "no_workpad": {
+        "n": 12,
+        "short": 2,
+        "median": 190.5,
+        "mean": 190.91666666666666,
+        "headings": 0
+      },
+      "source_replay": {
+        "n": 12,
+        "short": 1,
+        "median": 195.0,
+        "mean": 192.91666666666666,
+        "headings": 0
+      }
+    },
+    "3": {
+      "workpad": {
+        "n": 12,
+        "short": 4,
+        "median": 184.5,
+        "mean": 183.91666666666666,
+        "headings": 0
+      },
+      "no_workpad": {
+        "n": 12,
+        "short": 1,
+        "median": 193.5,
+        "mean": 193,
+        "headings": 0
+      },
+      "source_replay": {
+        "n": 12,
+        "short": 2,
+        "median": 191.5,
+        "mean": 190.16666666666666,
+        "headings": 0
+      }
+    },
+    "4": {
+      "workpad": {
+        "n": 12,
+        "short": 1,
+        "median": 201.0,
+        "mean": 198,
+        "headings": 7
+      },
+      "no_workpad": {
+        "n": 12,
+        "short": 0,
+        "median": 214.0,
+        "mean": 218.16666666666666,
+        "headings": 11
+      },
+      "source_replay": {
+        "n": 12,
+        "short": 0,
+        "median": 210.5,
+        "mean": 213.25,
+        "headings": 12
+      }
+    },
+    "5": {
+      "workpad": {
+        "n": 12,
+        "short": 6,
+        "median": 180.5,
+        "mean": 176.66666666666666,
+        "headings": 0
+      },
+      "no_workpad": {
+        "n": 12,
+        "short": 7,
+        "median": 173.5,
+        "mean": 177.5,
+        "headings": 0
+      },
+      "source_replay": {
+        "n": 12,
+        "short": 8,
+        "median": 174.5,
+        "mean": 177.08333333333334,
+        "headings": 0
+      }
+    },
+    "6": {
+      "workpad": {
+        "n": 12,
+        "short": 3,
+        "median": 188.5,
+        "mean": 187.25,
+        "headings": 3
+      },
+      "no_workpad": {
+        "n": 12,
+        "short": 1,
+        "median": 197.5,
+        "mean": 196.91666666666666,
+        "headings": 5
+      },
+      "source_replay": {
+        "n": 12,
+        "short": 2,
+        "median": 202.0,
+        "mean": 198.91666666666666,
+        "headings": 5
+      }
+    }
+  },
+  "whitespace_short": 53,
+  "regex_short": 43,
+  "counter_disagreements": [
+    {
+      "scenario": "tool_returns",
+      "arm": "workpad",
+      "run": 1,
+      "turn": 5,
+      "whitespace": 179,
+      "regex": 184
+    },
+    {
+      "scenario": "tool_returns",
+      "arm": "source_replay",
+      "run": 1,
+      "turn": 5,
+      "whitespace": 175,
+      "regex": 186
+    },
+    {
+      "scenario": "craft_pickup",
+      "arm": "source_replay",
+      "run": 1,
+      "turn": 2,
+      "whitespace": 176,
+      "regex": 181
+    },
+    {
+      "scenario": "craft_pickup",
+      "arm": "workpad",
+      "run": 1,
+      "turn": 2,
+      "whitespace": 186,
+      "regex": 175
+    },
+    {
+      "scenario": "gallery_access",
+      "arm": "no_workpad",
+      "run": 1,
+      "turn": 1,
+      "whitespace": 178,
+      "regex": 182
+    },
+    {
+      "scenario": "gallery_access",
+      "arm": "no_workpad",
+      "run": 1,
+      "turn": 5,
+      "whitespace": 181,
+      "regex": 180
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "no_workpad",
+      "run": 1,
+      "turn": 5,
+      "whitespace": 175,
+      "regex": 185
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "source_replay",
+      "run": 1,
+      "turn": 5,
+      "whitespace": 174,
+      "regex": 182
+    },
+    {
+      "scenario": "craft_pickup",
+      "arm": "workpad",
+      "run": 2,
+      "turn": 4,
+      "whitespace": 181,
+      "regex": 175
+    },
+    {
+      "scenario": "gallery_access",
+      "arm": "workpad",
+      "run": 2,
+      "turn": 5,
+      "whitespace": 169,
+      "regex": 181
+    },
+    {
+      "scenario": "gallery_access",
+      "arm": "source_replay",
+      "run": 2,
+      "turn": 6,
+      "whitespace": 179,
+      "regex": 181
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "no_workpad",
+      "run": 2,
+      "turn": 5,
+      "whitespace": 172,
+      "regex": 181
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "source_replay",
+      "run": 2,
+      "turn": 2,
+      "whitespace": 191,
+      "regex": 180
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "source_replay",
+      "run": 2,
+      "turn": 5,
+      "whitespace": 173,
+      "regex": 183
+    },
+    {
+      "scenario": "craft_pickup",
+      "arm": "no_workpad",
+      "run": 3,
+      "turn": 1,
+      "whitespace": 180,
+      "regex": 182
+    },
+    {
+      "scenario": "craft_pickup",
+      "arm": "no_workpad",
+      "run": 3,
+      "turn": 2,
+      "whitespace": 179,
+      "regex": 184
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "workpad",
+      "run": 3,
+      "turn": 2,
+      "whitespace": 179,
+      "regex": 182
+    },
+    {
+      "scenario": "repair_learning",
+      "arm": "workpad",
+      "run": 3,
+      "turn": 4,
+      "whitespace": 180,
+      "regex": 190
+    }
+  ],
+  "t1_no_workpad_vs_source": [
+    {
+      "scenario": "craft_pickup",
+      "run": 1,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "craft_pickup",
+      "run": 2,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "craft_pickup",
+      "run": 3,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "gallery_access",
+      "run": 1,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "gallery_access",
+      "run": 2,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "gallery_access",
+      "run": 3,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "repair_learning",
+      "run": 1,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "repair_learning",
+      "run": 2,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "repair_learning",
+      "run": 3,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "tool_returns",
+      "run": 1,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "tool_returns",
+      "run": 2,
+      "same_request": true,
+      "same_reply": false
+    },
+    {
+      "scenario": "tool_returns",
+      "run": 3,
+      "same_request": true,
+      "same_reply": false
+    }
+  ],
+  "source_context_present_by_turn": {
+    "1": 0,
+    "2": 0,
+    "3": 0,
+    "4": 0,
+    "5": 12,
+    "6": 12
+  },
+  "quality_judgments": "Author reading only; no independent ratings",
+  "analysis_source_commit": "a916015442667c268893b334fadf93797ba3abd8",
+  "analysis_entrypoint": "analyze_hold_run.py",
+  "analysis_entrypoint_sha256": "543ad5f30b7f6b534e399012865ba72a4bb0b4b37f2ea68e9c603a2609ea3682",
+  "constraint_trace_reading": {
+    "method": "Author unblinded reading; no automatic semantic scores",
+    "examples": [
+      {
+        "scenario": "tool_returns",
+        "arm": "workpad",
+        "run": 1,
+        "turn": 6,
+        "user_text": "Let's reopen that: returned tools cannot be stored overnight. What changes in the trial, and what should we find out next?",
+        "raw_log_sha256": "2ceb489c96e9e669cd8d8821e2aa365a5ed20374bf8f083ad6e1bce057799366",
+        "workpad_valid": true,
+        "workpad_field": "hypotheses[0]",
+        "workpad_quote": "all returns occur during a session with enough time for condition checks and disposition.",
+        "reply_quote": "Do not accept a return unless a steward can inspect it and complete its disposition before the facility closes.",
+        "reading": "Counterevidence: the general rule covers every return; a feasible disposition remains unresolved."
+      },
+      {
+        "scenario": "tool_returns",
+        "arm": "workpad",
+        "run": 2,
+        "turn": 6,
+        "user_text": "Let's reopen that: returned tools cannot be stored overnight. What changes in the trial, and what should we find out next?",
+        "raw_log_sha256": "1035c436aa30b1b4d85a933de53479b65a249f3a5882dafd9a7dccf050fff940",
+        "workpad_valid": true,
+        "workpad_field": "hypotheses[1]",
+        "workpad_quote": "tools not cleared cannot remain in the cabinet overnight.",
+        "reply_quote": "Passing tools may be stored and relisted.",
+        "reading": "Scope narrowing is already present in a schema-valid workpad and also appears in the reply. This is a trace observation, not a causal effect estimate."
+      },
+      {
+        "scenario": "tool_returns",
+        "arm": "workpad",
+        "run": 3,
+        "turn": 6,
+        "user_text": "Let's reopen that: returned tools cannot be stored overnight. What changes in the trial, and what should we find out next?",
+        "raw_log_sha256": "612b6a5b611bee8ea379d2dcc124d71caa735dad298654bb0f734b7d8b07ddd0",
+        "workpad_valid": true,
+        "workpad_field": "next_step",
+        "workpad_quote": "tools that cannot be approved immediately",
+        "reply_quote": "A returned tool cannot remain in the cabinet overnight awaiting inspection.",
+        "reading": "The workpad focus states the broader rule, while its next step targets only tools not immediately approved; the reply narrows the overnight condition to awaiting inspection."
+      },
+      {
+        "scenario": "camera_returns",
+        "arm": "source_replay",
+        "run": 1,
+        "turn": 6,
+        "user_text": "Let's reopen that: returned cameras cannot be stored overnight. What changes in the trial, and what should we find out next?",
+        "raw_log_sha256": "6e0860877535fcc708eacb7ba5d9957660cea0d3b8691f8b0d50d27e4c2e63e5",
+        "reply_quote": "A camera that passes may be stored overnight as ready",
+        "reading": "The current user turn forbids overnight storage of returned cameras. Passing inspection does not create an exception; this reply explicitly invents one despite current source availability."
+      }
+    ]
+  },
+  "source_run_evidence": {
+    "regression": {
+      "status": "complete",
+      "evidence_sha256": {
+        "run_manifest.json": "d8cf0d641879e4a56f68a887ad18d11c9c905119cd30f376c44680fbc2ee83f4",
+        "generation_receipts.json": "e8a445b96353bb07959adbbb9fc985e6b0bad8991bde6dd6a7ffa7004262e1af",
+        "turn_timings.json": "b5d86ce9b361e8497f868b87ec24f59f9abef2989d62935eb027737a88ae06f5",
+        "compare/tool_returns/arm_workpad___openai__gpt-5.6-luna__run_001.jsonl": "2ceb489c96e9e669cd8d8821e2aa365a5ed20374bf8f083ad6e1bce057799366",
+        "compare/tool_returns/arm_no_workpad___openai__gpt-5.6-luna__run_001.jsonl": "b359abcb7ff0fc5f8f69d6dafbeee86be00f2df22f021be4aaebffd90311107b",
+        "compare/tool_returns/arm_source_replay___openai__gpt-5.6-luna__run_001.jsonl": "3dd9290d5123aab53e3fa7289d60c66f827d0aeb668b9b6ef2b4ac8383af6924",
+        "compare/craft_pickup/arm_no_workpad___openai__gpt-5.6-luna__run_001.jsonl": "58139198953deb456ee97f8fcc375f6257dc543bbdd51492ba86bbebce98a81f",
+        "compare/craft_pickup/arm_source_replay___openai__gpt-5.6-luna__run_001.jsonl": "91e2404193ce62e2c6c835a42973ba211e3c15cb492cc9e290264a5816ff9748",
+        "compare/craft_pickup/arm_workpad___openai__gpt-5.6-luna__run_001.jsonl": "becce650354e9af3057af051d5e63ae90ac8ca06fd7d3ec868ff209faa35048e",
+        "compare/gallery_access/arm_source_replay___openai__gpt-5.6-luna__run_001.jsonl": "6abfc9848801a4171c4fdc07f70593828b83ede4b47a950659e2bafc44df65aa",
+        "compare/gallery_access/arm_workpad___openai__gpt-5.6-luna__run_001.jsonl": "5862662123e4dc331c38a78479efbf0abc29844b1c65e3a533b49d778a6588ea",
+        "compare/gallery_access/arm_no_workpad___openai__gpt-5.6-luna__run_001.jsonl": "dfa0c432ab69d231a393a1aeadf72c3611acbe6fc91ea0aa121207d21de58730",
+        "compare/repair_learning/arm_workpad___openai__gpt-5.6-luna__run_001.jsonl": "45f16ab893ed00de71e651039aa26e1fd8600e02615df47b67a0d9ebde5676c2",
+        "compare/repair_learning/arm_no_workpad___openai__gpt-5.6-luna__run_001.jsonl": "2901241cec7e0d74c4cfdc514722b43aa96dbb909ce3607139ae6037e93992b0",
+        "compare/repair_learning/arm_source_replay___openai__gpt-5.6-luna__run_001.jsonl": "ed5fedb42f2ae6c373c1dbeac42ada11775ea8aaa1801cbea7847455115f541e",
+        "compare/tool_returns/arm_no_workpad___openai__gpt-5.6-luna__run_002.jsonl": "15c4c6d02c4fd126a5efb56134c12b68a99e21f59d354b9bb8a8bc6ab62f875f",
+        "compare/tool_returns/arm_source_replay___openai__gpt-5.6-luna__run_002.jsonl": "2f3442b5d4057cf24804928e0563a50a17511db2c76b6316ffb258096bab8084",
+        "compare/tool_returns/arm_workpad___openai__gpt-5.6-luna__run_002.jsonl": "1035c436aa30b1b4d85a933de53479b65a249f3a5882dafd9a7dccf050fff940",
+        "compare/craft_pickup/arm_source_replay___openai__gpt-5.6-luna__run_002.jsonl": "f8bbe54a8ec6dab2a9e80063acd47380dbf41cb2f71b6b15b7ec2efd3c0224e4",
+        "compare/craft_pickup/arm_workpad___openai__gpt-5.6-luna__run_002.jsonl": "e5f8b740a3e899642a7f02a5b97b3fd380e64de55a692117cd1ed8ac55ee4fb3",
+        "compare/craft_pickup/arm_no_workpad___openai__gpt-5.6-luna__run_002.jsonl": "c44d036335773e205210a3a7fe7cc122723cad5c878e2506a6f965034a506095",
+        "compare/gallery_access/arm_workpad___openai__gpt-5.6-luna__run_002.jsonl": "eb74a8489259e81b4cd6274dc97854c39b04581e8ef0a5f8c7196dc6bbec2126",
+        "compare/gallery_access/arm_no_workpad___openai__gpt-5.6-luna__run_002.jsonl": "366e5aaa827e664224e7e6e9d7095ec42be55f8ed4b620af436ac0263aa55977",
+        "compare/gallery_access/arm_source_replay___openai__gpt-5.6-luna__run_002.jsonl": "1336c19d9123f5be2d34a2f0f58b599a8cb8192d6ed473362434cd5213bfccbb",
+        "compare/repair_learning/arm_no_workpad___openai__gpt-5.6-luna__run_002.jsonl": "0cd6b955030d10eca441522ac38f7d49bbb841c201f326a26d1589b81819ed96",
+        "compare/repair_learning/arm_source_replay___openai__gpt-5.6-luna__run_002.jsonl": "88dacde383eca626492ecef067ab292930a1423e54cf84f9e55897102c0ae5d3",
+        "compare/repair_learning/arm_workpad___openai__gpt-5.6-luna__run_002.jsonl": "b126324e92d6a5346301c684e8c75cf09745ef59fffd8cea2d0195e723885ea9",
+        "compare/tool_returns/arm_source_replay___openai__gpt-5.6-luna__run_003.jsonl": "f45d2f7c2819e4124b6b283045ab968a3f28fa577e50d0dedf56693cac0ffa64",
+        "compare/tool_returns/arm_workpad___openai__gpt-5.6-luna__run_003.jsonl": "612b6a5b611bee8ea379d2dcc124d71caa735dad298654bb0f734b7d8b07ddd0",
+        "compare/tool_returns/arm_no_workpad___openai__gpt-5.6-luna__run_003.jsonl": "d188a7b288730f3b35a716347ada2ff6e0a8b9bc03dc09f8b98c4afe791e3066",
+        "compare/craft_pickup/arm_workpad___openai__gpt-5.6-luna__run_003.jsonl": "14f60873a0390b204691ae39ed8a8ca3e2b0c9886ca37c3e775612a31566a05f",
+        "compare/craft_pickup/arm_no_workpad___openai__gpt-5.6-luna__run_003.jsonl": "19c5f7607bd5a3b82c18dabdfd4a47c245a05f22fb351c4237d145738349a722",
+        "compare/craft_pickup/arm_source_replay___openai__gpt-5.6-luna__run_003.jsonl": "32a72fa9606c250521d480acf06937c93f413f52b47f15f1856d4d4743d7ee95",
+        "compare/gallery_access/arm_no_workpad___openai__gpt-5.6-luna__run_003.jsonl": "8260e782a3a745c46c1065f87e0a631584f73b2aae253bfa26b44864e80c36bf",
+        "compare/gallery_access/arm_source_replay___openai__gpt-5.6-luna__run_003.jsonl": "e917bb23c0d251aafbe3f1184afc89efe6613cdb594179fa4875072570583653",
+        "compare/gallery_access/arm_workpad___openai__gpt-5.6-luna__run_003.jsonl": "39b10b51405a281ceab5b16171ff167c1ae9d56e115907bb697d7deead118085",
+        "compare/repair_learning/arm_source_replay___openai__gpt-5.6-luna__run_003.jsonl": "30ab3a7749807f360a25285d10903cd34712296b1206d4fcdffb895bc860aa00",
+        "compare/repair_learning/arm_workpad___openai__gpt-5.6-luna__run_003.jsonl": "bed48ad436f41d2ea5a5c699a5b9b181e0cc43b1297f713827a6b01fba0dfefe",
+        "compare/repair_learning/arm_no_workpad___openai__gpt-5.6-luna__run_003.jsonl": "275b13a1d33a6af9e7489a9b6ea00bb98cd420cdfdaf3db502e52c51d8003b04"
+      }
+    },
+    "transfer": {
+      "status": "incomplete",
+      "evidence_sha256": {
+        "run_manifest.json": "fac8e890f9737c7b2ad134ee95106d9346e36b6f5b16b1b402361d1a2807bcaf",
+        "generation_receipts.json": "82c41b6d269e8c81106e2230f3a7a881cafc27dc435a93e1f655cfeb18bef204",
+        "turn_timings.json": "0a655d1337ed0ec0cd75b5feb3455c04feced36a2f11d537dd95201161e506dc",
+        "compare/camera_returns/arm_no_workpad___openai__gpt-5.6-luna__run_001.jsonl": "8d28cfb5ba56c820dd8e6cba114089465ba151f3784c1d8a8317327dcdaa6e7a",
+        "compare/camera_returns/arm_source_replay___openai__gpt-5.6-luna__run_001.jsonl": "6e0860877535fcc708eacb7ba5d9957660cea0d3b8691f8b0d50d27e4c2e63e5",
+        "compare/camera_returns/arm_workpad___openai__gpt-5.6-luna__run_001.jsonl": "bd865734b64bc24c05c97e081c5364745c3d1fbd4204e1308e01e7d482a9a48a"
+      }
+    }
+  }
+}

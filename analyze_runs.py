@@ -9,6 +9,8 @@ import statistics
 from pathlib import Path
 from typing import Any, Iterable
 
+from reply_contract import WORD_COUNTER, count_words, summarize_contracts
+
 
 DEFERRED_REALIZATION_THRESHOLD = 0.10
 CONCLUSION_MENTION_THRESHOLD = 0.10
@@ -741,9 +743,6 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
     seen_terminal_ids: set[str] = set()
 
     for row in assistant_rows:
-        current_turn = None
-        if isinstance(row.get("due_deferred_intents"), list) and row["due_deferred_intents"]:
-            current_turn = row["due_deferred_intents"][0].get("fire_turn")
         for action in row.get("deferred_intent_actions") or []:
             if not isinstance(action, dict):
                 continue
@@ -1777,6 +1776,9 @@ def summarize_log(path: Path, evaluation: dict[str, Any]) -> dict[str, Any]:
         "last_turn_alignment": last_turn_alignment,
         "final_probe_reply_overlap": final_probe_reply_overlap,
         "avg_reply_words": mean_or_none(reply_word_counts),
+        "reply_whitespace_word_counter": WORD_COUNTER,
+        "avg_reply_whitespace_words": mean_or_none(count_words(r.get("assistant", "")) for r in assistant_rows),
+        **summarize_contracts(assistant_rows),
         "avg_input_tokens": mean_or_none([x for x in input_tokens if x > 0]),
         "avg_output_tokens": mean_or_none([x for x in output_tokens if x > 0]),
         "inband_state_error_count": len(inband_state_errors),
