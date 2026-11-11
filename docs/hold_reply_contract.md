@@ -63,13 +63,19 @@ python3 -S analyze_hold_run.py \
 
 This offline command reads the three-arm `hold_source_comparison.py` format,
 including its frozen inputs, execution order, generation receipts, timings and
-JSONL events. Raw run data is local and is not included in the public repository.
+JSONL events. It checks the global call sequence and reconstructs request hashes
+from the frozen script, prompts, recorded replies and workpads. Replay payloads
+must match the reconstructed user history and the planned treatment.
+Raw run data is local and is not included in the public repository.
 The command imports no provider adapters and makes no network requests.
 
 It distinguishes finished, partial and unstarted conversations, including empty
 files reserved for unstarted work. `failed_or_unknown` and write-ahead `started`
-requests retain unknown remote outcomes and usage. Usage totals cover returned
-requests and separately report missing usage. Valid workpads are not required
+requests retain unknown remote outcomes and usage. If the final request returned
+before an interruption prevented its local event from being written, the report
+keeps its usage and identifies the missing event. That dialogue remains partial.
+Usage totals cover returned requests and separately report missing usage.
+Valid workpads are not required
 for the two arms that deliberately make no workpad calls.
 
 All planned pair identities are retained, with available and complete-treatment

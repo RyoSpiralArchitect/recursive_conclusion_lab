@@ -16,12 +16,15 @@ import math
 from pathlib import Path
 import re
 import statistics
+from types import SimpleNamespace
 
-from inquiry_state import InquiryState
+from inquiry_state import InquiryState, inquiry_reply_data
 from reply_contract import WORD_COUNTER, count_words, reply_contract, validate_max_words
+from user_source_context import source_user_history
 
 ARMS = ("workpad", "no_workpad", "source_replay")
 NORMAL_FINISH = {"openai": {"completed"}, "dummy": {"stop"}}
+FROZEN = "docs/experiments/data/hold_source_frozen.json"
 
 
 def require(condition, message):
@@ -44,6 +47,34 @@ def identity(row, repeat_key="run"):
 
 def numeric(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def request_messages(recent, *, probe, state, state_turn, source):
+    if probe:
+        return [
+            dict(
+                role="user",
+                content=json.dumps(
+                    dict(
+                        previous_workpad=state.to_dict() if state else None,
+                        memory_capsules=[],
+                        recent_dialogue=recent,
+                    ),
+                    ensure_ascii=False,
+                ),
+            )
+        ]
+    if state is None and source is None:
+        return recent
+    context = inquiry_reply_data(state, state_turn, [], source_user_history=source)
+    if recent and recent[0]["role"] == "assistant":
+        context += "\n\nEarlier assistant reply:\n" + recent[0]["content"]
+        recent = recent[1:]
+    return [
+        dict(role="user", content="Context carried forward for this dialogue:"),
+        dict(role="assistant", content=context),
+        *recent,
+    ]
 
 
 def usage_total(calls, aliases):
@@ -91,10 +122,14 @@ def analyze_run(root, max_words=180):
     )
     hashes = {}
 
-    def read(relative, jsonl=False):
+    def read_bytes(relative):
         p = inside(root, relative)
         data = p.read_bytes()
         hashes[str(p.relative_to(root))] = hashlib.sha256(data).hexdigest()
+        return data
+
+    def read(relative, jsonl=False):
+        data = read_bytes(relative)
         return (
             [json.loads(line) for line in data.splitlines() if line.strip()]
             if jsonl
@@ -117,13 +152,58 @@ def analyze_run(root, max_words=180):
         "Invalid expected reply count",
     )
     turns = expected // len(plan)
-    for source, digest in manifest["source_files_sha256"].items():
+    sources = manifest["source_files_sha256"]
+    for source, digest in sources.items():
         p = inside(root / "inputs", source)
         require(
             hashlib.sha256(p.read_bytes()).hexdigest() == digest,
             "Frozen input hash mismatch",
         )
         hashes[str(p.relative_to(root))] = digest
+    require(FROZEN in sources, "Frozen comparison config missing")
+    frozen = read("inputs/" + FROZEN)
+    settings = frozen["settings"]
+    window = settings["window"]
+    require(type(window) is int and window >= 0, "Invalid frozen window")
+    prompts = {}
+    for kind in ("reply", "probe"):
+        prompts[kind] = read_bytes(kind + ".txt").decode("utf-8")
+        require(
+            hashes[kind + ".txt"] == frozen[kind + "_sha256"],
+            "Frozen prompt hash mismatch",
+        )
+    scripts = {}
+    for scene in {key[0] for key in plan}:
+        matches = [
+            p
+            for p in sources
+            if p.startswith("protocol_scripts/")
+            and Path(p).name.endswith(f"_{scene}.json")
+        ]
+        require(len(matches) == 1, "Frozen scenario script missing or ambiguous")
+        path = matches[0]
+        require(
+            sources[path] == frozen["script_sha256"].get(scene),
+            "Frozen script hash mismatch",
+        )
+        script = read("inputs/" + path)
+        require(len(script["turns"]) == turns, "Frozen script turn count mismatch")
+        base = re.sub(r"\s+", " ", script.get("system", "")).strip()
+        system = "\n\n".join(filter(None, (base, prompts["reply"])))
+        scripts[scene] = (
+            hashlib.sha256(system.encode()).hexdigest(),
+            [text.strip() for text in script["turns"]],
+        )
+    schedule = [
+        (key, turn, kind)
+        for key in plan
+        for turn in range(1, turns + 1)
+        for kind in (
+            ("inquiry_update", "assistant_reply")
+            if key[1] == "workpad"
+            else ("assistant_reply",)
+        )
+    ]
     calls = (
         []
         if manifest.get("actual_generation_calls") == 0
@@ -149,16 +229,14 @@ def analyze_run(root, max_words=180):
     signatures, paths, used_logs = set(), {}, set()
     for index, c in enumerate(calls, 1):
         key = identity(c)
-        require(key in plan and c["call"] == index, "Unplanned or unordered receipt")
         require(
             type(c["turn"]) is int and 1 <= c["turn"] <= turns, "Invalid receipt turn"
         )
         require(
-            c["kind"] in ("assistant_reply", "inquiry_update"), "Unexpected call kind"
-        )
-        require(
-            c["kind"] != "inquiry_update" or key[1] == "workpad",
-            "Unexpected auxiliary generation",
+            index <= len(schedule)
+            and c["call"] == index
+            and (key, c["turn"], c["kind"]) == schedule[index - 1],
+            "Receipt differs from global execution order",
         )
         status = c["status"]
         require(
@@ -209,23 +287,11 @@ def analyze_run(root, max_words=180):
         )
         timing_signatures.add(sig)
 
-    rows, dialogues = [], []
+    rows, dialogues, unlogged = [], [], []
     for key in plan:
         scene, arm, run = key
+        reply_hash, user_turns = scripts[scene]
         cs = [c for c in calls if identity(c) == key]
-        schedule = [
-            (t, kind)
-            for t in range(1, turns + 1)
-            for kind in (
-                ("inquiry_update", "assistant_reply")
-                if arm == "workpad"
-                else ("assistant_reply",)
-            )
-        ]
-        require(
-            [(c["turn"], c["kind"]) for c in cs] == schedule[: len(cs)],
-            "Dialogue calls differ from planned order",
-        )
         ts = [t for t in timings if identity(t) == key]
         events = read("compare/" + paths[key], jsonl=True) if cs else []
         if cs:
@@ -238,13 +304,67 @@ def analyze_run(root, max_words=180):
         by_event = {(v["turn_index"], v["event_type"]): v for v in relevant}
         require(len(by_event) == len(relevant), "Duplicate generation event")
         returned = [c for c in cs if c["status"] == "returned"]
+        missing_tail = (
+            manifest["status"] == "incomplete"
+            and len(returned) == len(by_event) + 1
+            and returned[-1] is calls[-1]
+            and not any(t["ok"] and t["turn"] == returned[-1]["turn"] for t in ts)
+        )
+        logged = returned[:-1] if missing_tail else returned
         require(
-            [(c["turn"], c["kind"]) for c in returned] == list(by_event),
+            [(c["turn"], c["kind"]) for c in logged] == list(by_event),
             "Receipt/event sequence mismatch",
         )
         exclusions, reply_turns, valid_memos = [], [], 0
-        for c in returned:
-            event = by_event[(c["turn"], c["kind"])]
+        if missing_tail:
+            last = returned[-1]
+            unlogged.append(last["call"])
+            exclusions.append(
+                dict(turn=last["turn"], kind=last["kind"], reason="missing_local_event")
+            )
+        history, state, state_turn = [], None, None
+        for c in cs:
+            turn = c["turn"]
+            user = user_turns[turn - 1]
+            if not history or history[-1]["role"] == "assistant":
+                history.append(dict(role="user", content=user))
+            source = (
+                source_user_history(
+                    [SimpleNamespace(**message) for message in history], window
+                )
+                if arm == "source_replay"
+                else None
+            )
+            probe = c["kind"] == "inquiry_update"
+            messages = request_messages(
+                history[-window:] if window else history,
+                probe=probe,
+                state=state,
+                state_turn=state_turn,
+                source=source,
+            )
+            require(
+                c["prompt_sha256"] == (frozen["probe_sha256"] if probe else reply_hash)
+                and c["output_token_limit"]
+                == (
+                    max(600, settings["probe_max_tokens"])
+                    if probe
+                    else settings["max_tokens"]
+                )
+                and c["temperature"] == (0.0 if probe else settings["temperature"]),
+                "Receipt does not match frozen prompt or generation settings",
+            )
+            require(
+                c["messages_sha256"]
+                == hashlib.sha256(
+                    json.dumps(messages, ensure_ascii=False).encode()
+                ).hexdigest()
+                and c["message_characters"] == sum(len(m["content"]) for m in messages),
+                "Receipt does not match reconstructed request messages",
+            )
+            event = by_event.get((turn, c["kind"]))
+            if event is None:
+                continue
             p = event["payload"]
             require(
                 event["provider"] == provider and event["model"] == manifest["model"],
@@ -258,11 +378,14 @@ def analyze_run(root, max_words=180):
                 "Receipt/event metadata mismatch",
             )
             good_finish = p.get("finish_reason") in normal
-            if c["kind"] == "inquiry_update":
-                valid = False
-                if p.get("state") is not None:
+            if probe:
+                state = (
                     InquiryState.from_dict(p["state"])
-                    valid = True
+                    if p.get("state") is not None
+                    else None
+                )
+                state_turn = turn if state is not None else None
+                valid = state is not None
                 valid_memos += valid
                 if not valid or not good_finish:
                     exclusions.append(
@@ -273,8 +396,17 @@ def analyze_run(root, max_words=180):
                         )
                     )
                 continue
+            require(
+                p.get("user") == user, "Reply user message differs from frozen script"
+            )
+            require(
+                (arm == "source_replay") == ("source_user_history" in p)
+                and p.get("source_user_history") == source,
+                "Reply source replay differs from treatment",
+            )
             text = p["assistant"]
             require(isinstance(text, str), "Reply text must be a string")
+            history.append(dict(role="assistant", content=text))
             diagnostic = reply_contract(text, max_words)
             legacy = len(re.findall(r"\w+", text))
             reply_turns.append(c["turn"])
@@ -414,6 +546,7 @@ def analyze_run(root, max_words=180):
         call_statuses=dict(Counter(c["status"] for c in calls)),
         attempted_calls=len(calls),
         returned_calls=sum(c["status"] == "returned" for c in calls),
+        returned_without_local_event=unlogged,
         replies=len(rows),
         dialogue_statuses=dict(Counter(d["status"] for d in dialogues)),
         planned_dialogues=len(plan),

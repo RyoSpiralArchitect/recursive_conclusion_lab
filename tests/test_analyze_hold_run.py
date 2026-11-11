@@ -4,9 +4,12 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
-from analyze_hold_run import analyze_run, write_report
+from analyze_hold_run import FROZEN, analyze_run, request_messages, write_report
+from inquiry_state import InquiryState
+from user_source_context import source_user_history
 
 VALID = dict(
     focus="Explore",
@@ -22,24 +25,64 @@ def write(path, value):
     path.write_text(json.dumps(value))
 
 
+def digest(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def bind_messages(receipt, messages):
+    receipt.update(
+        messages_sha256=digest(json.dumps(messages, ensure_ascii=False)),
+        message_characters=sum(len(m["content"]) for m in messages),
+    )
+
+
 def fixture(root, *, interrupted=False, started=False):
     root.mkdir()
     source = root / "inputs/fixture.txt"
     source.parent.mkdir()
     source.write_text("frozen input")
+    script_path = "protocol_scripts/hold_test_case.json"
+    users = ["User 1", "User 2"]
+    write(root / "inputs" / script_path, {"system": "Test system", "turns": users})
+    script_hash = digest((root / "inputs" / script_path).read_text())
+    prompts = {"probe": "Probe system", "reply": "Reply system"}
+    for name, prompt in prompts.items():
+        (root / f"{name}.txt").write_text(prompt)
+    write(
+        root / "inputs" / FROZEN,
+        dict(
+            script_sha256={"case": script_hash},
+            settings=dict(
+                window=2, max_tokens=900, probe_max_tokens=600, temperature=0.2
+            ),
+            **{k + "_sha256": digest(v) for k, v in prompts.items()},
+        ),
+    )
+    sources = {
+        "fixture.txt": digest(source.read_text()),
+        script_path: script_hash,
+        FROZEN: digest((root / "inputs" / FROZEN).read_text()),
+    }
     arms = ("no_workpad", "source_replay", "workpad")
     plan = [dict(scenario="case", arm=a, repeat=1) for a in arms]
     calls, timings = [], []
     for arm in arms:
-        events = []
+        events, history, state, state_turn = [], [], None, None
         log = f"case/arm_{arm}___openai__gpt-5.6-luna__run_001.jsonl"
         for turn in (1, 2):
+            history.append(dict(role="user", content=users[turn - 1]))
+            source_context = (
+                source_user_history([SimpleNamespace(**m) for m in history], 2)
+                if arm == "source_replay"
+                else None
+            )
             fail = interrupted and arm == "workpad" and turn == 2
             for kind in (
                 ("inquiry_update", "assistant_reply")
                 if arm == "workpad"
                 else ("assistant_reply",)
             ):
+                probe = kind == "inquiry_update"
                 c = dict(
                     call=len(calls) + 1,
                     scenario="case",
@@ -54,6 +97,21 @@ def fixture(root, *, interrupted=False, started=False):
                     usage=dict(input_tokens=10, output_tokens=2),
                     finish_reason="completed",
                     request_id=f"id_{len(calls)}",
+                    prompt_sha256=digest(
+                        prompts["probe"] if probe else "Test system\n\nReply system"
+                    ),
+                    temperature=0.0 if probe else 0.2,
+                    output_token_limit=600 if probe else 900,
+                )
+                bind_messages(
+                    c,
+                    request_messages(
+                        history[-2:],
+                        probe=probe,
+                        state=state,
+                        state_turn=state_turn,
+                        source=source_context,
+                    ),
                 )
                 if fail:
                     c.update(
@@ -70,12 +128,17 @@ def fixture(root, *, interrupted=False, started=False):
                 p = {k: c[k] for k in ("usage", "finish_reason", "request_id")}
                 if kind == "inquiry_update":
                     p.update(state=copy.deepcopy(VALID), error=None)
+                    state, state_turn = InquiryState.from_dict(VALID), turn
                 else:
+                    p["user"] = users[turn - 1]
                     p["assistant"] = (
                         "## Next\n- stay open"
                         if arm == "no_workpad" and turn == 1
                         else "Keep the condition."
                     )
+                    if arm == "source_replay":
+                        p["source_user_history"] = source_context
+                    history.append(dict(role="assistant", content=p["assistant"]))
                 events.append(
                     dict(
                         provider="openai",
@@ -113,9 +176,7 @@ def fixture(root, *, interrupted=False, started=False):
             generation_call_limit=8,
             actual_generation_calls=len(calls),
             actual_turns=len(timings),
-            source_files_sha256={
-                "fixture.txt": hashlib.sha256(source.read_bytes()).hexdigest()
-            },
+            source_files_sha256=sources,
         ),
     )
     return calls
@@ -221,6 +282,13 @@ class HoldRunAnalysisTests(unittest.TestCase):
         events[-2]["payload"]["state"] = None
         events[-1]["payload"]["finish_reason"] = None
         calls[-1]["finish_reason"] = None
+        bind_messages(
+            calls[-1],
+            [
+                dict(role="assistant", content="Keep the condition."),
+                dict(role="user", content="User 2"),
+            ],
+        )
         target.write_text("\n".join(json.dumps(x) for x in events) + "\n")
         write(calls_path, calls)
         result = analyze_run(self.root)
@@ -237,6 +305,8 @@ class HoldRunAnalysisTests(unittest.TestCase):
             lambda cs: cs[0].update(usage={"input_tokens": 999}),
             lambda cs: cs[0].update(dialogue_log="../../elsewhere.jsonl"),
             lambda cs: cs[0].update(turn=2),
+            lambda cs: cs[0].update(messages_sha256="bad"),
+            lambda cs: cs[0].update(output_token_limit=901),
         ):
             calls = json.loads(original)
             mutate(calls)
@@ -249,6 +319,48 @@ class HoldRunAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
             write_report(self.root, self.out)
         self.assertFalse(self.out.parent.exists())
+
+    def test_global_call_order_rejects_swapped_dialogues(self):
+        calls = fixture(self.root)
+        calls = calls[2:4] + calls[:2] + calls[4:]
+        for index, receipt in enumerate(calls, 1):
+            receipt["call"] = index
+        write(self.root / "generation_receipts.json", calls)
+        with self.assertRaisesRegex(ValueError, "global execution order"):
+            write_report(self.root, self.out)
+        self.assertFalse(self.out.parent.exists())
+
+    def test_replay_payload_must_match_actual_treatment(self):
+        calls = fixture(self.root)
+        for receipt, replacement in ((calls[0], {}), (calls[2], {}), (calls[3], None)):
+            target = self.root / "compare" / receipt["dialogue_log"]
+            original = target.read_text()
+            events = [json.loads(line) for line in original.splitlines()]
+            events[receipt["turn"] - 1]["payload"]["source_user_history"] = replacement
+            target.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+            with self.assertRaisesRegex(ValueError, "source replay"):
+                write_report(self.root, self.out)
+            self.assertFalse(self.out.parent.exists())
+            target.write_text(original)
+
+    def test_trailing_return_without_event_preserves_usage_and_partial_status(self):
+        calls = fixture(self.root)
+        target = self.root / "compare" / calls[-1]["dialogue_log"]
+        target.write_text("\n".join(target.read_text().splitlines()[:-1]) + "\n")
+        manifest_path = self.root / "run_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["status"] = "incomplete"
+        write(manifest_path, manifest)
+        timings_path = self.root / "turn_timings.json"
+        timings = json.loads(timings_path.read_text())
+        timings[-1]["ok"] = False
+        write(timings_path, timings)
+        result = analyze_run(self.root)
+        self.assertEqual(result["returned_without_local_event"], [8])
+        self.assertEqual((result["returned_calls"], result["replies"]), (8, 5))
+        self.assertEqual(result["by_arm"]["workpad"]["returned_input_tokens"], 40)
+        self.assertEqual(result["dialogue_statuses"], {"finished": 2, "partial": 1})
+        self.assertEqual(result["complete_pairs"], 1)
 
     def test_existing_outputs_evidence_mutation_and_running_snapshots_are_rejected(
         self,
