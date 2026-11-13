@@ -1,8 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -62,13 +66,18 @@ class PlaytestFailureTests(unittest.TestCase):
             original_generate = self.fail_after_memory_probe(record)
             before = serialize_session_state(record.session)
             first_attempt = "first attempt"
+            first_request_id = str(uuid4())
 
             with self.assertRaisesRegex(RuntimeError, "simulated reply failure"):
-                manager.append_turn(session_id, first_attempt)
+                manager.append_turn(session_id, first_attempt, first_request_id, 0)
 
             self.assertEqual(serialize_session_state(record.session), before)
             self.assertEqual(record.pending_user_text, first_attempt)
             self.assertEqual(record.last_error, "RuntimeError: turn failed")
+            self.assertEqual(manager.turn_request_status(session_id, first_request_id)["status"], "failed")
+            self.assertEqual(manager.session_detail(session_id)["pending_turn_status"], "failed")
+            with self.assertRaisesRegex(ValueError, "cannot be submitted again"):
+                manager.append_turn(session_id, first_attempt, first_request_id, 0)
             self.assertFalse(record.log_path.exists())
             self.assertNotIn(
                 "sk-test-secret",
@@ -100,7 +109,7 @@ class PlaytestFailureTests(unittest.TestCase):
             self.assertEqual(saved.pending_user_text, first_attempt)
 
             record.session.adapter.generate = original_generate
-            manager.append_turn(session_id, first_attempt)
+            manager.append_turn(session_id, first_attempt, str(uuid4()), 0)
             self.assertEqual(record.session.turn_index, 1)
             self.assertEqual([item.role for item in record.session.history], ["user", "assistant"])
             self.assertEqual(record.pending_user_text, "")
@@ -109,7 +118,7 @@ class PlaytestFailureTests(unittest.TestCase):
             original_generate = self.fail_after_memory_probe(record)
             before = serialize_session_state(record.session)
             with self.assertRaisesRegex(RuntimeError, "simulated reply failure"):
-                manager.append_turn(session_id, "second attempt")
+                manager.append_turn(session_id, "second attempt", str(uuid4()), 1)
 
             self.assertEqual(serialize_session_state(record.session), before)
             self.assertEqual(record.log_path.read_bytes(), previous_log)
@@ -119,6 +128,153 @@ class PlaytestFailureTests(unittest.TestCase):
             self.assertEqual(audits[1]["attempt_turn_index"], 2)
             self.assertGreaterEqual(audits[1]["discarded_event_count"], 1)
             record.session.adapter.generate = original_generate
+
+    def test_pre_provider_save_failure_does_not_call_provider(self):
+        with TemporaryDirectory() as temp_dir:
+            manager, record = self.create_manager_and_session(Path(temp_dir))
+            request_id = str(uuid4())
+            with patch.object(record.session, "user_turn", side_effect=AssertionError("provider called")):
+                with patch.object(manager, "_save_record", side_effect=OSError("disk full")):
+                    with self.assertRaisesRegex(OSError, "disk full"):
+                        manager.append_turn(record.session_id, "question", request_id, 0)
+            self.assertEqual(record.turn_requests, {})
+            self.assertEqual(record.session.turn_index, 0)
+            self.assertEqual(manager.turn_request_status(record.session_id, request_id)["status"], "not_found")
+
+    def test_post_provider_save_failure_is_unknown_after_restart(self):
+        with TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir)
+            manager, record = self.create_manager_and_session(sessions_dir)
+            request_id = str(uuid4())
+            save = manager._save_record
+            calls = 0
+
+            def fail_commit(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("disk full")
+                return save(*args, **kwargs)
+
+            with patch.object(manager, "_save_record", side_effect=fail_commit):
+                with self.assertRaisesRegex(RuntimeError, "Turn commit could not be saved"):
+                    manager.append_turn(record.session_id, "question", request_id, 0)
+            self.assertEqual(calls, 2)
+            self.assertEqual(manager.turn_request_status(record.session_id, request_id)["status"], "unknown")
+            current = manager.session_detail(record.session_id)
+            self.assertEqual(current["pending_turn_status"], "unknown")
+            self.assertEqual(current["turn_index"], 0)
+            self.assertEqual(current["history"], [])
+            self.assertIsNone(current["last_result"])
+            self.assertTrue(record.log_path.exists())
+            with self.assertRaisesRegex(ValueError, "cannot be submitted again"):
+                manager.append_turn(record.session_id, "question", request_id, 0)
+            resumed = SessionManager(sessions_dir)
+            self.assertEqual(resumed.turn_request_status(record.session_id, request_id)["status"], "unknown")
+            self.assertEqual(resumed.session_detail(record.session_id)["turn_index"], 0)
+
+    def test_polling_does_not_expose_a_commit_before_its_atomic_save(self):
+        with TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir)
+            manager, record = self.create_manager_and_session(sessions_dir)
+            request_id = str(uuid4())
+            committing = threading.Event()
+            release = threading.Event()
+            replace = os.replace
+            calls = 0
+
+            def block_commit(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    committing.set()
+                    if not release.wait(10):
+                        raise AssertionError("test did not release the commit")
+                    raise OSError("disk full")
+                return replace(source, destination)
+
+            with patch("playtest_server.os.replace", side_effect=block_commit):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    turn = executor.submit(
+                        manager.append_turn, record.session_id, "question", request_id, 0
+                    )
+                    try:
+                        self.assertTrue(committing.wait(5), "commit was not attempted")
+                        status = executor.submit(
+                            manager.turn_request_status, record.session_id, request_id
+                        ).result(timeout=2)
+                        self.assertEqual(status["status"], "in_progress")
+                        self.assertEqual(status["current_turn_index"], 0)
+                        self.assertNotIn("session", status)
+                        self.assertFalse(turn.done())
+                    finally:
+                        release.set()
+                    with self.assertRaisesRegex(RuntimeError, "Turn commit could not be saved"):
+                        turn.result(timeout=5)
+            status = manager.turn_request_status(record.session_id, request_id)
+            self.assertEqual(status["status"], "unknown")
+            self.assertEqual(status["current_turn_index"], 0)
+            self.assertNotIn("session", status)
+            resumed = SessionManager(sessions_dir)
+            self.assertEqual(resumed.turn_request_status(record.session_id, request_id), status)
+
+    def test_cleanup_save_failure_publishes_unknown_without_a_durable_update(self):
+        with TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir)
+            manager, record = self.create_manager_and_session(sessions_dir)
+            self.fail_after_memory_probe(record)
+            request_id = str(uuid4())
+            save = manager._save_record
+            calls = 0
+
+            def fail_cleanup_save(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise OSError("disk full")
+                return save(*args, **kwargs)
+
+            with patch.object(manager, "_save_record", side_effect=fail_cleanup_save):
+                with self.assertRaisesRegex(RuntimeError, "cleanup incomplete; outcome unknown"):
+                    manager.append_turn(record.session_id, "question", request_id, 0)
+            self.assertEqual(calls, 3)
+            status = manager.turn_request_status(record.session_id, request_id)
+            self.assertEqual(status["status"], "unknown")
+            self.assertEqual(status["current_turn_index"], 0)
+            saved = json.loads(manager._session_json_path(record.session_id).read_text())
+            self.assertEqual(saved["turn_requests"][request_id]["status"], "in_progress")
+            resumed = SessionManager(sessions_dir)
+            self.assertEqual(resumed.turn_request_status(record.session_id, request_id), status)
+
+    def test_failed_attempt_cleanup_fault_keeps_audit_and_marks_unknown(self):
+        with TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir)
+            manager, record = self.create_manager_and_session(sessions_dir)
+            self.fail_after_memory_probe(record)
+            record.log_path.touch()
+            request_id = str(uuid4())
+            before = serialize_session_state(record.session)
+            open_path = Path.open
+
+            def reject_truncate(path, mode="r", *args, **kwargs):
+                if path == record.log_path and mode == "r+b":
+                    raise OSError("truncate unavailable")
+                return open_path(path, mode, *args, **kwargs)
+
+            with patch.object(Path, "open", autospec=True, side_effect=reject_truncate):
+                with self.assertRaisesRegex(RuntimeError, "cleanup incomplete; outcome unknown"):
+                    manager.append_turn(record.session_id, "question", request_id, 0)
+
+            self.assertEqual(serialize_session_state(record.session), before)
+            self.assertEqual(manager.turn_request_status(record.session_id, request_id)["status"], "unknown")
+            self.assertEqual(manager.session_detail(record.session_id)["pending_turn_status"], "unknown")
+            self.assertTrue(record.log_path.exists())
+            self.assertGreater(record.log_path.stat().st_size, 0)
+            audit_path = record.storage_dir / "failed_attempts.jsonl"
+            self.assertEqual(len(audit_path.read_text(encoding="utf-8").splitlines()), 1)
+            resumed = SessionManager(sessions_dir)
+            self.assertEqual(resumed.turn_request_status(record.session_id, request_id)["status"], "unknown")
+            self.assertEqual(resumed.session_detail(record.session_id)["turn_index"], 0)
 
     def test_resume_preserves_explicit_zero_config_values(self):
         with TemporaryDirectory() as temp_dir:
@@ -155,7 +311,7 @@ class PlaytestFailureTests(unittest.TestCase):
                 resumed_manager = SessionManager(sessions_dir)
                 resumed_record = resumed_manager.get_record(record.session_id)
                 self.assertEqual(getattr(resumed_record.session.config, zero_field), 0)
-                result = resumed_manager.append_turn(record.session_id, "one turn")
+                result = resumed_manager.append_turn(record.session_id, "one turn", str(uuid4()), 0)
                 self.assertEqual(result["turn_index"], 1)
                 self.assertEqual(resumed_record.session.memory_capsules, [])
                 events = [
@@ -216,7 +372,14 @@ class PlaytestFailureTests(unittest.TestCase):
                 with self.subTest(error_type=type(error).__name__):
                     with patch.object(SessionManager, "append_turn", side_effect=error):
                         with self.assertRaises(HTTPException) as caught:
-                            endpoint("example", TurnRequest(user_text="hello"))
+                            endpoint(
+                                "example",
+                                TurnRequest(
+                                    user_text="hello",
+                                    request_id=uuid4(),
+                                    expected_turn_index=0,
+                                ),
+                            )
                     public_error = caught.exception
                     self.assertEqual(public_error.status_code, 500)
                     self.assertEqual(public_error.detail, expected_detail)
